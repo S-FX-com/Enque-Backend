@@ -535,9 +535,8 @@ class MicrosoftGraphService:
                         
                         logger.info(f"Created ticket #{task.id} from email {email_id}")
                     
-                    # Mark email as read to avoid processing it again
-                    self._mark_email_as_read(app_token, user_email, email_id)
-                    logger.debug(f"Marked email {email_id} as read")
+                    # No marcamos el email como leído automáticamente
+                    # Solo lo haremos cuando el ticket cambie a estado "Open"
                     
                 except Exception as e:
                     logger.error(f"Error processing email {email_data.get('id', 'unknown')}: {str(e)}")
@@ -972,4 +971,30 @@ class MicrosoftGraphService:
 
 def get_microsoft_service(db: Session) -> MicrosoftGraphService:
     """Get Microsoft Graph service instance"""
-    return MicrosoftGraphService(db) 
+    return MicrosoftGraphService(db)
+
+def mark_email_as_read_by_task_id(db: Session, task_id: int) -> bool:
+    """
+    Mark the email associated with a task as read in Microsoft.
+    This should be called when a task status changes to "Open".
+    """
+    try:
+        # Get the email mapping for this task
+        email_mapping = db.query(EmailTicketMapping).filter(EmailTicketMapping.task_id == task_id).first()
+        if not email_mapping:
+            return False
+            
+        # Get the service
+        service = get_microsoft_service(db)
+        
+        # Get application token
+        app_token = service.get_application_token()
+        
+        # Get authenticated user email
+        user_email = service._get_user_email_for_sync()
+        
+        # Mark the email as read
+        return service._mark_email_as_read(app_token, user_email, email_mapping.email_id)
+    except Exception as e:
+        logger.error(f"Error marking email as read for task #{task_id}: {str(e)}")
+        return False 

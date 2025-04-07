@@ -5,6 +5,8 @@ from datetime import datetime
 from app.models.task import Task
 from app.models.microsoft import EmailTicketMapping
 from app.schemas.task import TaskCreate, TaskUpdate, EmailInfo
+from app.services.microsoft_service import mark_email_as_read_by_task_id
+from app.utils.logger import logger
 
 
 def get_tasks(db: Session, skip: int = 0, limit: int = 100) -> List[Task]:
@@ -63,6 +65,9 @@ def update_task(db: Session, task_id: int, task_in: TaskUpdate) -> Optional[Dict
     if not task:
         return None
     
+    # Store the old status for comparison
+    old_status = task.status
+    
     # Update task attributes
     update_data = task_in.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -75,6 +80,12 @@ def update_task(db: Session, task_id: int, task_in: TaskUpdate) -> Optional[Dict
     email_mapping = db.query(EmailTicketMapping).filter(
         EmailTicketMapping.task_id == task.id
     ).first()
+    
+    # If status changed from "Unread" to "Open" and has email mapping,
+    # mark the email as read in Microsoft
+    if email_mapping and old_status == "Unread" and task.status == "Open":
+        logger.info(f"Marking email as read for ticket #{task.id} due to status change to Open")
+        mark_email_as_read_by_task_id(db, task.id)
     
     task_dict = task.__dict__.copy()
     task_dict['is_from_email'] = email_mapping is not None

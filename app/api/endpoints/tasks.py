@@ -89,7 +89,7 @@ async def read_task(
 
 
 @router.put("/tasks/{task_id}", response_model=TaskSchema)
-async def update_task(
+async def update_task_endpoint(
     task_id: int,
     task_in: TaskUpdate,
     db: Session = Depends(get_db),
@@ -98,40 +98,13 @@ async def update_task(
     """
     Update a task
     """
-    task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
-    if not task:
+    # Use the service function which handles email marking as read logic
+    task_dict = update_task(db, task_id, task_in)
+    if not task_dict:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
-    
-    # Update task attributes
-    update_data = task_in.dict(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(task, field, value)
-    
-    db.commit()
-    db.refresh(task)
-    
-    # Check if task has email mapping
-    email_mapping = db.query(EmailTicketMapping).filter(
-        EmailTicketMapping.task_id == task.id
-    ).first()
-    
-    task_dict = task.__dict__.copy()
-    task_dict['is_from_email'] = email_mapping is not None
-    
-    if email_mapping:
-        task_dict['email_info'] = EmailInfo(
-            id=email_mapping.id,
-            email_id=email_mapping.email_id,
-            email_conversation_id=email_mapping.email_conversation_id,
-            email_subject=email_mapping.email_subject,
-            email_sender=email_mapping.email_sender,
-            email_received_at=email_mapping.email_received_at
-        )
-    else:
-        task_dict['email_info'] = None
     
     return task_dict
 

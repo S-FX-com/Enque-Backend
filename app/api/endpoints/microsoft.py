@@ -1,5 +1,5 @@
 from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status
 from sqlalchemy.orm import Session
 from app.api.dependencies import get_db, get_current_active_user
 from app.models.agent import Agent
@@ -422,16 +422,4 @@ def update_email_sync_config(
     db.commit()
     db.refresh(existing)
     
-    return existing
-
-
-@router.get("/email-config/{config_id}", response_model=EmailSyncConfigSchema)
-def get_email_sync_config(
-    config_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get a single email sync configuration by ID"""
-    config = db.query(EmailSyncConfig).filter(EmailSyncConfig.id == config_id).first()
-    if not config:
-        raise HTTPException(status_code=404, detail="Email sync configuration not found")
-    return config 
+    return existing 
