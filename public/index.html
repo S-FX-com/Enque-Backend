@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ObieDesk API Documentation</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f6f8fa;
+            color: #24292e;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            text-align: center;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+            width: 90%;
+            max-width: 600px;
+        }
+        h1 {
+            color: #0366d6;
+            margin-bottom: 20px;
+        }
+        p {
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+        .buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+        .button {
+            background-color: #0366d6;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background-color 0.3s;
+        }
+        .button:hover {
+            background-color: #0257ba;
+        }
+        .health-button {
+            background-color: #2ea44f;
+        }
+        .health-button:hover {
+            background-color: #22863a;
+        }
+    </style>
+    <script>
+        // Automatically redirect to /docs after 3 seconds
+        setTimeout(function() {
+            window.location.href = "/docs";
+        }, 3000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>ObieDesk API</h1>
+        <p>Welcome to the ObieDesk Backend, a ticket management system.</p>
+        <p>You will be automatically redirected to the API documentation in a few seconds...</p>
+        <div class="buttons">
+            <a href="/docs" class="button">Swagger UI</a>
+            <a href="/redoc" class="button">ReDoc</a>
+            <a href="/api/health" class="button health-button">Health Check</a>
+        </div>
+    </div>
+</body>
+</html> 
