@@ -1,7 +1,7 @@
-import os
-from typing import List, Union, Optional
+from typing import List, Union
 from pydantic_settings import BaseSettings
 from pydantic import validator
+import re
 
 
 class Settings(BaseSettings):
@@ -15,6 +15,20 @@ class Settings(BaseSettings):
         elif isinstance(v, (list, str)):
             return v
         raise ValueError(v)
+
+    def get_cors_regex(self) -> str:
+        # Convierte las origins a regex para permitir subdominios
+        patterns = []
+        for origin in self.BACKEND_CORS_ORIGINS:
+            parsed = re.match(r"^(https?://)([^:/]+)(:\d+)?$", origin)
+            if parsed:
+                scheme, domain, port = parsed.groups()
+                escaped_domain = re.escape(domain)
+                subdomain_pattern = rf"{scheme}([a-zA-Z0-9\-]+\.)*{escaped_domain}"
+                if port:
+                    subdomain_pattern += re.escape(port)
+                patterns.append(subdomain_pattern)
+        return "|".join(patterns)
 
     # JWT Configuration
     JWT_SECRET: str

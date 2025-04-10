@@ -29,3 +29,4 @@ class Ticket(Base):
     user = relationship("User", foreign_keys=[user_id])
     sent_from = relationship("Agent", foreign_keys=[sent_from_id])
     sent_to = relationship("Agent", foreign_keys=[sent_to_id])
+    email_mappings = relationship("EmailTicketMapping", back_populates="ticket")

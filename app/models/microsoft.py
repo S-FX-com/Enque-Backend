@@ -58,7 +58,7 @@ class EmailTicketMapping(Base):
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
     # Relationships
-    ticket = relationship("Task", back_populates="email_mappings")
+    ticket = relationship("Ticket", back_populates="email_mappings")
 
     # Indexes (already defined in the SQL but included here for completeness)
     __table_args__ = (

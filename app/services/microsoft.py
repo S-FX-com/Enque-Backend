@@ -404,6 +404,8 @@ class MicrosoftGraphService:
             
             # Get the application token
             app_token = self.get_application_token()
+
+            print("Ok")
             
             # Determine user email to use
             user_email = self._get_user_email_for_sync()

@@ -256,7 +256,7 @@ def create_sync_config(
     current_agent: Agent = Depends(get_current_active_user)
 ) -> Any:
     """Create email synchronization configuration"""
-    if not current_agent.is_admin:
+    if not current_agent.role == "Admin":
         raise HTTPException(status_code=403, detail="Not enough permissions")
         
     # Check if integration exists

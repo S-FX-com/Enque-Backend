@@ -6,6 +6,7 @@ from app.schemas.workspace import WorkspaceResponse
 
 class AgentRole(str, Enum):
     agent = "Agent"
+    admin = "Admin"
 
 class AgentBase(BaseModel):
     name: str

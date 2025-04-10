@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, DateTime, func
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, DateTime, func, Enum
 from sqlalchemy.orm import relationship
 
 from app.libs.database import Base
@@ -9,7 +9,7 @@ class Agent(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     email = Column(String(100), unique=True, nullable=False)
-    role = Column(String(20), nullable=False, default="Agent")
+    role = Column(Enum("Agent", "Admin", name="agent_role"), nullable=False, default="Agent")
     is_active = Column(Boolean, default=True)
     hashed_password = Column(String(100))
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)

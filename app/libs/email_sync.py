@@ -11,13 +11,13 @@ from app.utils.logger import logger
 
 def sync_emails_job():
     logger.info("Starting email sync job")
-    db = get_db()
+    db = next(get_db())
     
     try:
         # Get all active sync configurations
         configs = db.query(EmailSyncConfig).filter(
             EmailSyncConfig.is_active == True
-        ).all()
+        ).all() 
         
         if not configs:
             logger.info("No active email sync configurations found")
@@ -71,7 +71,7 @@ def refresh_tokens_job():
     Background job to check and renew Microsoft tokens before they expire
     """
     logger.info("Starting token refresh job")
-    db = get_db()
+    db = next(get_db())
     
     try:
         # Initialize service
@@ -91,11 +91,13 @@ def start_scheduler():
     """
     Start the background scheduler for email sync
     """ 
+    # Schedule job to refresh tokens every 4 hours
+    # schedule.every(4).hours.do(refresh_tokens_job)
+    schedule.every(1).minutes.do(refresh_tokens_job)
+
+
     # Schedule job to run every minute
     schedule.every(1).minutes.do(sync_emails_job)
-    
-    # Schedule job to refresh tokens every 4 hours
-    schedule.every(4).hours.do(refresh_tokens_job)
     
     # Run in a separate thread
     def run_scheduler():
