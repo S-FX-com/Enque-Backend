@@ -92,8 +92,8 @@ def start_scheduler():
     Start the background scheduler for email sync
     """ 
     # Schedule job to refresh tokens every 4 hours
-    # schedule.every(4).hours.do(refresh_tokens_job)
-    schedule.every(1).minutes.do(refresh_tokens_job)
+    schedule.every(4).hours.do(refresh_tokens_job)
+    # schedule.every(1).minutes.do(refresh_tokens_job)
 
 
     # Schedule job to run every minute
