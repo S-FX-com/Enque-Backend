@@ -17,6 +17,7 @@ from app.models.workspace import Workspace
 from app.services.user import get_or_create_user
 from app.utils.logger import logger, log_important
 from fastapi import HTTPException, status
+from app.core.security import get_password_hash
 
 
 class MicrosoftGraphService:
@@ -225,19 +226,20 @@ class MicrosoftGraphService:
                 self.db.commit()
                 self.db.refresh(self.integration)
                 logger.info(f"Created new integration with ID: {self.integration.id}")
+
+            email = user_info.get("mail") or user_info["userPrincipalName"].split("#EXT#")[0].replace("_", "@")
             
             # Find agent by email
-            agent = self.db.query(Agent).filter(Agent.email == user_info.get("mail")).first()
+            agent = self.db.query(Agent).filter(Agent.email == email).first()
             
             if not agent:
-                logger.warning(f"No agent found with email {user_info.get('mail')}, creating one")
+                logger.warning(f"No agent found with email {email}, creating one")
                 # If there is no agent, we create one
                 agent = Agent(
                     name=user_info.get("displayName", "Microsoft User"),
-                    email=user_info.get("mail", ""),
-                    role="agent",
-                    # We generate a random password that can be changed later
-                    password=hashlib.sha256(secrets.token_bytes(32)).hexdigest()[:20]
+                    email=email,
+                    hashed_password=get_password_hash(secrets.token_bytes(32)),
+                    workspace_id=1
                 )
                 self.db.add(agent)
                 self.db.commit()
@@ -956,10 +958,11 @@ class MicrosoftGraphService:
             # Try to get user info from the token
             try:
                 user_info = self._get_user_info(recent_token.access_token)
-                if user_info and user_info.get('mail'):
-                    user_email = user_info.get('mail')
-                    logger.info(f"Using authenticated user's email: {user_email}")
-                    return user_email
+                if user_info:
+                    email = user_info.get("mail") or user_info["userPrincipalName"].split("#EXT#")[0].replace("_", "@")
+                    if email:
+                        logger.info(f"Using authenticated user's email: {email}")
+                        return email
             except Exception as e:
                 logger.warning(f"Could not get user info from token: {str(e)}")
         
