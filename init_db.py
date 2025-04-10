@@ -10,6 +10,16 @@ from app.models.company import Base as CompanyBase
 from app.models.microsoft import Base as MicrosoftBase
 
 def init_db():
+    WorkspaceBase.metadata.drop_all(bind=engine)
+    AgentBase.metadata.drop_all(bind=engine)
+    TicketBase.metadata.drop_all(bind=engine)
+    TeamBase.metadata.drop_all(bind=engine)
+    CommentBase.metadata.drop_all(bind=engine)
+    ActivityBase.metadata.drop_all(bind=engine)
+    UserBase.metadata.drop_all(bind=engine)
+    CompanyBase.metadata.drop_all(bind=engine)
+    MicrosoftBase.metadata.drop_all(bind=engine)
+
     WorkspaceBase.metadata.create_all(bind=engine)
     AgentBase.metadata.create_all(bind=engine)
     TicketBase.metadata.create_all(bind=engine)
