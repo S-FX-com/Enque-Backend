@@ -110,9 +110,9 @@ class MicrosoftGraphService:
             logger.info("No active integration found, using default values for auth URL")
             
             # Minimum values required for authorization
-            tenant_id = getattr(settings, "MICROSOFT_TENANT_ID", "76d9eabb-931c-452b-9e08-058b058b6581")
-            client_id = getattr(settings, "MICROSOFT_CLIENT_ID", "")
-            scope = "offline_access User.Read Mail.Read Mail.ReadWrite"
+            tenant_id = getattr(settings, "MICROSOFT_TENANT_ID")
+            client_id = getattr(settings, "MICROSOFT_CLIENT_ID")
+            scope = getattr(settings, "MICROSOFT_SCOPE")
             
             # If there is no client_id in the configuration, we cannot continue
             if not client_id:
@@ -127,7 +127,7 @@ class MicrosoftGraphService:
             scope = self.integration.scope
             
         # Use provided redirect URI or default one
-        redirect = redirect_uri or getattr(settings, "MICROSOFT_REDIRECT_URI", "")
+        redirect = redirect_uri or getattr(settings, "MICROSOFT_REDIRECT_URI")
         if not redirect:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -154,10 +154,10 @@ class MicrosoftGraphService:
         needs_integration = not self.integration
         
         # Default values if we need to create an integration
-        tenant_id = "76d9eabb-931c-452b-9e08-058b058b6581"  # Tenant ID specific to the organization
-        client_id = getattr(settings, "MICROSOFT_CLIENT_ID", "")
-        client_secret = getattr(settings, "MICROSOFT_CLIENT_SECRET", "")
-        scope = "offline_access User.Read Mail.Read Mail.ReadWrite"
+        tenant_id = getattr(settings, "MICROSOFT_TENANT_ID")
+        client_id = getattr(settings, "MICROSOFT_CLIENT_ID")
+        client_secret = getattr(settings, "MICROSOFT_CLIENT_SECRET")
+        scope = getattr(settings, "MICROSOFT_SCOPE")
         
         if needs_integration:
             logger.info("No active integration found, will create one after successful token exchange")
@@ -210,7 +210,7 @@ class MicrosoftGraphService:
             if needs_integration:
                 logger.info("Creating new Microsoft integration")
                 # Use the tenant ID specific to the organization
-                tenant_id = "76d9eabb-931c-452b-9e08-058b058b6581"
+                tenant_id = getattr(settings, "MICROSOFT_TENANT_ID")
                 
                 # Create new integration
                 self.integration = MicrosoftIntegration(

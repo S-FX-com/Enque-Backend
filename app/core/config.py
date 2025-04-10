@@ -39,11 +39,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str
 
     # Microsoft Graph API Configuration
-    MICROSOFT_CLIENT_ID: str = "9793e065-fc8e-4920-a72e-12eee326e783"
-    MICROSOFT_CLIENT_SECRET: str = "BvH8Q~zwL6XzPTWwkW1ryLaq4bfbi7u-KYq5NcXe"
-    MICROSOFT_TENANT_ID: str = "76d9eabb-931c-452b-9e08-058b058b6581"
-    MICROSOFT_REDIRECT_URI: str = "https://obiedesk-backend-production.up.railway.app/v1/microsoft/auth/callback"
-    MICROSOFT_SCOPE: str = "offline_access Mail.Read Mail.ReadWrite"
+    MICROSOFT_CLIENT_ID: str
+    MICROSOFT_CLIENT_SECRET: str
+    MICROSOFT_TENANT_ID: str
+    MICROSOFT_REDIRECT_URI: str
+    MICROSOFT_SCOPE: str
     
     # Microsoft Graph API URLs
     MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
