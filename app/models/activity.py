@@ -1,29 +1,27 @@
-from sqlalchemy import Column, ForeignKey, Integer, String, DateTime, Enum
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func, Enum
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from app.libs.database import Base
-import enum
-
-
-class ActivitySourceTypes(enum.Enum):
-    workspace = "Workspace"
-    ticket = "Ticket"
-    team = "Team"
-    company = "Company"
-    user = "User"
-
+from app.database.base_class import Base
 
 class Activity(Base):
     __tablename__ = "activities"
-
-    id = Column(Integer, primary_key=True, index=True)
-    action = Column(String(255), nullable=False)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
-    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
-    source_type = Column(Enum(ActivitySourceTypes), nullable=False)
+    action = Column(String(255), nullable=False)
+    source_type = Column(Enum('Workspace', 'Ticket', 'Team', 'Company', 'User', name='activity_source_type'), nullable=False)
     source_id = Column(Integer, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
-
-    agent = relationship("Agent", foreign_keys=[agent_id])
-    workspace = relationship("Workspace", foreign_keys=[workspace_id])
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    
+    # Relationships
+    agent = relationship("Agent", back_populates="activities")
+    workspace = relationship("Workspace", back_populates="activities")
+    
+    # Helper method to get ticket
+    def get_ticket(self, db):
+        """Get the ticket associated with this activity if source_type is 'Ticket'"""
+        if self.source_type == 'Ticket':
+            from app.models.task import Task
+            return db.query(Task).filter(Task.id == self.source_id).first()
+        return None

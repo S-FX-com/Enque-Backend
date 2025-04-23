@@ -1,1 +1,1 @@
-web: python init_db.py && uvicorn app.main:app
+web: python migrations/create_mailbox_model.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT 

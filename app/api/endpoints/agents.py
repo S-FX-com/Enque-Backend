@@ -1,82 +1,184 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.orm import Session
-from typing import List
+from typing import Any, List
 
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
+from app.database.session import get_db
 from app.models.agent import Agent
-from app.schemas.agent import AgentCreate, AgentResponse, AgentUpdate
-from app.core.security import get_current_active_user
-from app.libs.database import get_db
-from app.services.agent import (
-    create_agent,
-    get_agents,
-    get_agent_by_id,
-    update_agent,
-    delete_agent
-)
+from app.models.team import Team, TeamMember 
+from app.models.workspace import Workspace
+from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate
+from app.schemas.team import Team as TeamSchema 
+from app.core.security import get_password_hash
 
 router = APIRouter()
 
 
-@router.post("/", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
-def create_agent_route(
-    agent: AgentCreate,
-    db: Session = Depends(get_db)
-):
-    try:
-        return create_agent(db, agent)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/", response_model=List[AgentResponse])
-def get_agents_route(
-    request: Request,
+@router.get("/", response_model=List[AgentSchema])
+async def read_agents(
+    db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 100,
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Retrieve all agents
+    """
+    agents = db.query(Agent).filter(
+        Agent.workspace_id == current_workspace.id
+    ).order_by(Agent.name).offset(skip).limit(limit).all()
+    return agents
+
+
+@router.post("/", response_model=AgentSchema)
+async def create_agent(
+    agent_in: AgentCreate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user)
-):
-    filters = {
-        key[7:-1]: value
-        for key, value in request.query_params.items()
-        if key.startswith("filter[") and key.endswith("]")
-    }
+    current_user: Agent = Depends(get_current_active_admin),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Create a new agent (admin only)
+    """
+    agent = db.query(Agent).filter(
+        Agent.email == agent_in.email,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    if agent:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered in this workspace",
+        )
 
-    return get_agents(db=db, filters=filters, skip=skip, limit=limit)
-
-
-@router.get("/{agent_id}", response_model=AgentResponse)
-def get_agent_route(
-    agent_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user)
-):
-    agent = get_agent_by_id(db, agent_id)
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = Agent(
+        name=agent_in.name,
+        email=agent_in.email,
+        password=get_password_hash(agent_in.password),
+        role=agent_in.role,
+        workspace_id=current_workspace.id,
+        is_active=True
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    
     return agent
 
 
-@router.put("/{agent_id}", response_model=AgentResponse)
-def update_agent_route(
-    agent_id: int,
-    agent: AgentUpdate,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user)
-):
-    updated = update_agent(db, agent_id, agent)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return updated
-
-
-@router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_agent_route(
+@router.get("/{agent_id}", response_model=AgentSchema)
+async def read_agent(
     agent_id: int,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user)
-):
-    success = delete_agent(db, agent_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return None
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Get agent by ID
+    """
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+    return agent
+
+
+@router.put("/{agent_id}", response_model=AgentSchema)
+async def update_agent(
+    agent_id: int,
+    agent_in: AgentUpdate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_admin),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Update an agent (admin only)
+    """
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+    
+    # Update agent attributes
+    update_data = agent_in.dict(exclude_unset=True)
+    
+    # Hash password if it's being updated
+    if "password" in update_data and update_data["password"]:
+        update_data["password"] = get_password_hash(update_data["password"])
+    
+    for field, value in update_data.items():
+        setattr(agent, field, value)
+    
+    db.commit()
+    db.refresh(agent)
+    
+    return agent
+
+
+@router.delete("/{agent_id}", response_model=AgentSchema)
+async def delete_agent(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_admin),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Delete an agent (admin only)
+    """
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+    if agent.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete your own account",
+        )
+    
+    db.delete(agent)
+    db.commit()
+    
+    return agent
+
+
+@router.get("/{agent_id}/teams", response_model=List[TeamSchema])
+async def read_agent_teams(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user), # Ensure user is active
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Retrieve teams that a specific agent belongs to within the current workspace.
+    """
+    target_agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    if not target_agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found in this workspace",
+        )
+    teams = db.query(Team).join(TeamMember).filter(
+        TeamMember.agent_id == agent_id,
+        Team.workspace_id == current_workspace.id 
+    ).all()
+
+    return teams

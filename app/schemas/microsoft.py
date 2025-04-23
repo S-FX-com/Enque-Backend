@@ -44,6 +44,7 @@ class MicrosoftIntegration(MicrosoftIntegrationInDB):
 class MicrosoftTokenBase(BaseModel):
     integration_id: int = Field(..., description="Reference to microsoft_integration table")
     agent_id: Optional[int] = Field(None, description="Reference to the agent who owns this token")
+    mailbox_connection_id: int = Field(..., description="Reference to the mailbox connection")
     access_token: str = Field(..., description="OAuth access token")
     refresh_token: str = Field(..., description="OAuth refresh token")
     token_type: str = Field("Bearer", description="Token type, typically Bearer")
@@ -55,6 +56,7 @@ class MicrosoftTokenBase(BaseModel):
 class MicrosoftTokenCreate(BaseModel):
     integration_id: int = Field(..., description="Reference to microsoft_integration table")
     agent_id: Optional[int] = Field(None, description="Reference to the agent who owns this token")
+    mailbox_connection_id: int = Field(..., description="Reference to the mailbox connection")
     access_token: str = Field(..., description="OAuth access token")
     refresh_token: str = Field(..., description="OAuth refresh token")
     token_type: str = Field("Bearer", description="Token type, typically Bearer")
@@ -123,6 +125,7 @@ class EmailTicketMapping(EmailTicketMappingBase):
 # Email Sync Config Schemas
 class EmailSyncConfigBase(BaseModel):
     integration_id: int = Field(..., description="Reference to microsoft_integration table")
+    mailbox_connection_id: int = Field(..., description="Reference to the mailbox connection")
     folder_name: str = Field("Inbox", description="Email folder to monitor")
     sync_interval: int = Field(5, description="Interval in minutes between syncs")
     last_sync_time: Optional[datetime] = Field(None, description="Last successful sync time")
@@ -195,9 +198,15 @@ class EmailAttachment(BaseModel):
     size: int
     content: Optional[bytes] = None
     is_inline: bool = False
+    # Use exact names from Graph API, remove alias
+    contentId: Optional[str] = None # Changed name to match Graph API
+    contentBytes: Optional[str] = None # Changed name to match Graph API
 
     class Config:
         from_attributes = True
+        # Allow population by field name (needed when not using alias)
+        populate_by_name = True
+        allow_population_by_field_name = True # Explicitly add for v1/v2 compatibility?
 
 class EmailAddress(BaseModel):
     name: Optional[str] = None
@@ -245,4 +254,37 @@ class EmailInfo(BaseModel):
     email_received_at: Optional[datetime] = None
 
     class Config:
-        from_attributes = True 
+        from_attributes = True
+
+# Mailbox Connection Schemas
+class MailboxConnectionBase(BaseModel):
+    email: EmailStr = Field(..., description="Email address of the connected mailbox")
+    display_name: Optional[str] = Field(None, description="Display name for the mailbox")
+    workspace_id: int = Field(..., description="ID of the workspace this mailbox belongs to")
+    created_by_agent_id: int = Field(..., description="ID of the agent who created this connection")
+    is_active: bool = Field(True, description="Whether this mailbox connection is active")
+    
+    class Config:
+        from_attributes = True
+
+class MailboxConnectionCreate(MailboxConnectionBase):
+    pass
+    
+class MailboxConnectionUpdate(BaseModel):
+    display_name: Optional[str] = None
+    is_active: Optional[bool] = None
+    
+    class Config:
+        from_attributes = True
+
+class MailboxConnectionInDB(MailboxConnectionBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class MailboxConnection(MailboxConnectionInDB):
+    class Config:
+        from_attributes = True

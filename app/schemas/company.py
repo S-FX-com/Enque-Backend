@@ -1,32 +1,50 @@
-from pydantic import BaseModel, HttpUrl
-from typing import Optional
+from typing import Optional, List, ForwardRef
+from pydantic import BaseModel
 from datetime import datetime
-from app.schemas.workspace import WorkspaceResponse
+
+# Forward references
+WorkspaceRef = ForwardRef("Workspace")
 
 class CompanyBase(BaseModel):
     name: str
     description: Optional[str] = None
-    logo_url: Optional[HttpUrl] = None
-    email_domain: str
+    email_domain: Optional[str] = None
+    logo_url: Optional[str] = None
 
 
 class CompanyCreate(CompanyBase):
     workspace_id: int
-    pass
 
 
 class CompanyUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
-    logo_url: Optional[HttpUrl] = None
     email_domain: Optional[str] = None
+    logo_url: Optional[str] = None
 
 
-class CompanyResponse(CompanyBase):
+class CompanyInDBBase(CompanyBase):
     id: int
-    workspace: WorkspaceResponse
+    workspace_id: int
     created_at: datetime
     updated_at: datetime
-
+    
     class Config:
         from_attributes = True
+
+
+class Company(CompanyInDBBase):
+    pass
+
+
+class CompanyWithDetails(Company):
+    workspace: WorkspaceRef
+    
+    class Config:
+        from_attributes = True
+
+
+# Update forward references
+from app.schemas.workspace import Workspace
+
+CompanyWithDetails.update_forward_refs() 
