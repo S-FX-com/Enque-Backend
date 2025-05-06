@@ -22,6 +22,7 @@ class UserUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
+    company_id: Optional[int] = None # Allow updating company_id (set to None to unassign)
 
 
 class UserInDBBase(UserBase):
@@ -56,11 +57,12 @@ class UnassignedUserBase(BaseModel):
 
 
 class UnassignedUserCreate(UnassignedUserBase):
-    pass
+    workspace_id: Optional[int] = None # Add workspace_id
 
 
 class UnassignedUserInDBBase(UnassignedUserBase):
     id: int
+    workspace_id: Optional[int] = None # Add workspace_id
     created_at: datetime
     
     class Config:

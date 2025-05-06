@@ -7,6 +7,7 @@ from pydantic import validator
 class Settings(BaseSettings):
     API_V1_STR: str = "/v1"
     PROJECT_NAME: str = "Enque API"
+    FRONTEND_URL: str = "https://app.enque.cc" # Default Frontend URL (should be overridden by env var in production/dev)
     
     # CORS Configuration
     BACKEND_CORS_ORIGINS: Union[List[str], str] = ["https://app.enque.cc", "https://*.enque.cc"]
@@ -85,4 +86,4 @@ class Settings(BaseSettings):
         case_sensitive = True
 
 
-settings = Settings() 
+settings = Settings()

@@ -9,15 +9,17 @@ from app.api.dependencies import get_current_active_user, get_current_active_adm
 from app.database.session import get_db
 from app.models.task import Task
 from app.models.agent import Agent
+from app.models.user import User # Import User model
 from app.models.team import TeamMember # Import TeamMember for filtering
-from app.models.microsoft import EmailTicketMapping
+from app.models.microsoft import EmailTicketMapping, MailboxConnection # Import MailboxConnection
 from app.models.activity import Activity # Import Activity model
 # Use TaskWithDetails and the renamed TicketCreate/TicketUpdate schemas
 from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema
 # Import logger if needed for activity logging errors
 from app.utils.logger import logger
-# Import update_task service function
+# Import update_task service function and Microsoft service
 from app.services.task_service import update_task # Assuming update_task is here
+from app.services.microsoft_service import MicrosoftGraphService # Import the service
 
 router = APIRouter()
 
@@ -35,6 +37,7 @@ async def read_tasks(
     team_id: Optional[int] = Query(None, description="Filter by assigned team ID"),
     assignee_id: Optional[int] = Query(None, description="Filter by assigned agent ID"),
     priority: Optional[str] = Query(None, description="Filter by priority (e.g., Low, Medium, High)"),
+    category_id: Optional[int] = Query(None, description="Filter by category ID"), # Add category filter
 ) -> Any:
     """
     Retrieve tasks based on user role and optional filters:
@@ -82,6 +85,8 @@ async def read_tasks(
         query = query.filter(Task.assignee_id == assignee_id)
     if priority:
         query = query.filter(Task.priority == priority)
+    if category_id: # Add category filter logic
+        query = query.filter(Task.category_id == category_id)
 
     # Apply eager loading options to the final filtered query
     query = query.options(
@@ -90,7 +95,8 @@ async def read_tasks(
         joinedload(Task.assignee),
         joinedload(Task.user),
         joinedload(Task.team),
-        joinedload(Task.company)
+        joinedload(Task.company),
+        joinedload(Task.category) # Eager load category
     )
 
     # Apply ordering, offset, and limit
@@ -116,7 +122,9 @@ async def create_task(
     if not hasattr(task_in, 'workspace_id') or not task_in.workspace_id:
          task_in.workspace_id = current_user.workspace_id
 
-    task = Task(**task_in.dict())
+    # Pass category_id if present in task_in
+    task_data = task_in.dict()
+    task = Task(**task_data)
     db.add(task)
     db.commit()
     db.refresh(task)
@@ -137,6 +145,50 @@ async def create_task(
         logger.error(f"Failed to log activity for ticket creation {task.id}: {str(e)}")
         db.rollback() # Rollback activity commit if it failed
     # --- End Log Activity ---
+
+    # --- Send Email for Manually Created Ticket ---
+    if task.description and task.user: # Check if description exists and user is loaded
+        try:
+            # Get recipient email
+            recipient_email = task.user.email
+            if not recipient_email:
+                 logger.warning(f"Cannot send email for ticket {task.id}: User {task.user_id} has no email address.") # Corrected indentation
+            else:
+                 # Find an active mailbox connection for the workspace to use as sender
+                 mailbox = db.query(MailboxConnection).filter(
+                     MailboxConnection.workspace_id == task.workspace_id,
+                     MailboxConnection.is_active == True
+                 ).first()
+
+                 if not mailbox:
+                     logger.warning(f"Cannot send email for ticket {task.id}: No active MailboxConnection found for workspace {task.workspace_id}.")
+                 else:
+                     sender_mailbox = mailbox.email
+                     # Prepare email content - Use only the task title as the subject
+                     subject = task.title
+                     # Use the description as the HTML body (assuming it's HTML from Tiptap)
+                     html_body = task.description
+
+                     # Get Microsoft Service instance
+                     microsoft_service = MicrosoftGraphService(db=db)
+
+                     # Send the email
+                     logger.info(f"Attempting to send new ticket email for task {task.id} from {sender_mailbox} to {recipient_email}")
+                     email_sent = microsoft_service.send_new_email(
+                         mailbox_email=sender_mailbox,
+                         recipient_email=recipient_email,
+                         subject=subject,
+                         html_body=html_body
+                     )
+                     if not email_sent:
+                         logger.error(f"Failed to send new ticket email for task {task.id}")
+                     else:
+                         logger.info(f"Successfully sent new ticket email for task {task.id}")
+
+        except Exception as email_error:
+            logger.error(f"Error trying to send email for newly created ticket {task.id}: {str(email_error)}", exc_info=True)
+            # Do not raise an exception here, ticket creation succeeded, email is secondary
+    # --- End Send Email ---
 
     return task
 
@@ -161,6 +213,7 @@ async def read_task(
         joinedload(Task.sent_from),
         joinedload(Task.sent_to),
         joinedload(Task.assignee),
+        joinedload(Task.category), # Eager load category
         joinedload(Task.body) # Eager load the body
     ).filter(
         Task.id == task_id,
@@ -225,10 +278,10 @@ async def update_task_endpoint(
 
 
     # Use the service function which handles the actual update logic
-    # Pass the fetched task object to avoid re-fetching and ensure correct object is updated
-    updated_task_obj = update_task(db=db, task_id=task_id, task_in=task_in, task_obj=task) # Pass task_obj
+    # Remove the task_obj argument as the service function fetches it
+    updated_task_obj = update_task(db=db, task_id=task_id, task_in=task_in)
 
-    if not updated_task_obj: # Service function should return the updated object or None/raise error
+    if not updated_task_obj: # Service function returns the updated ORM object or None
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
             detail="Task update failed", # Or more specific error from service
@@ -309,14 +362,14 @@ async def read_assigned_tasks(
     """
     Retrieve tasks assigned to a specific agent WITHIN the current user's workspace, with optional filters.
     """
-     # Base query for assigned tasks in the correct workspace
+     # Base query for assigned tasks
     query = db.query(Task).options(
         joinedload(Task.user) # Eager load the user relationship
-    ).filter(
-        Task.assignee_id == agent_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
     )
+    # Apply mandatory filters sequentially
+    query = query.filter(Task.assignee_id == agent_id)
+    query = query.filter(Task.workspace_id == current_user.workspace_id)
+    query = query.filter(Task.is_deleted == False)
 
     # Apply optional filters
     if subject:

@@ -1,3 +1,4 @@
+# backend/app/schemas/agent.py
 from typing import Optional, List, ForwardRef
 from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime
@@ -11,7 +12,10 @@ class AgentBase(BaseModel):
     email: EmailStr
     role: str = "agent"
     is_active: bool = True
-    
+    job_title: Optional[str] = None
+    phone_number: Optional[str] = None
+    email_signature: Optional[str] = None # Add email_signature
+
     @validator("role")
     def validate_role(cls, v):
         allowed_roles = ["admin", "agent", "manager"] # Add manager
@@ -36,7 +40,10 @@ class AgentUpdate(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
     is_active: Optional[bool] = None
-    
+    job_title: Optional[str] = None
+    phone_number: Optional[str] = None
+    email_signature: Optional[str] = None # Add email_signature
+
     @validator("role")
     def validate_role(cls, v):
         if v is not None:
@@ -68,7 +75,7 @@ class Agent(AgentInDBBase):
 # Schema for returning agent with all details including relationships
 class AgentWithDetails(Agent):
     workspace: WorkspaceRef
-    
+
     class Config:
         from_attributes = True
 

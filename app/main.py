@@ -1,9 +1,11 @@
+# backend/app/main.py
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from fastapi.staticfiles import StaticFiles
+from fastapi.staticfiles import StaticFiles # Import StaticFiles
+from pathlib import Path # Import Path
 import os
 import re
 
@@ -31,6 +33,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Define static files directory relative to main.py
+# Assuming main.py is in backend/app/
+STATIC_DIR = Path(__file__).parent.parent / "static"
+# Create static directory if it doesn't exist (especially for uploads)
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+(STATIC_DIR / "uploads" / "images").mkdir(parents=True, exist_ok=True) # Ensure uploads path exists
+
+# Mount static files directory
+# This will serve files from backend/static/ at the /static URL path
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 # Permitir todos los orígenes con el dominio enque.cc
 def allow_origin_regex(origin: str):
     allowed_patterns = [
@@ -38,7 +52,7 @@ def allow_origin_regex(origin: str):
         r"^https://[a-zA-Z0-9-]+\.enque\.cc$",
         r"^http://localhost:\d+$"  # Para desarrollo local
     ]
-    
+
     for pattern in allowed_patterns:
         if re.match(pattern, origin):
             return True
@@ -60,11 +74,11 @@ app.add_middleware(
 async def cors_middleware(request, call_next):
     origin = request.headers.get("origin", "")
     response = await call_next(request)
-    
+
     # Si el origen cumple con nuestros patrones, permitirlo
     if allow_origin_regex(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
-    
+
     return response
 
 # Include API router
@@ -92,20 +106,20 @@ def init_microsoft_integration():
     try:
         # Obtener sesión de BD
         db = next(get_db())
-        
+
         # Verificar si ya existe una integración de Microsoft
         integration = db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
-        
+
         # Si ya existe una integración activa, no hacer nada
         if integration:
             logger.info("Microsoft integration already exists, skipping initialization")
             return
-        
+
         # Verificar si las variables de entorno necesarias están configuradas
         if not (settings.MICROSOFT_CLIENT_ID and settings.MICROSOFT_CLIENT_SECRET and settings.MICROSOFT_TENANT_ID):
             logger.warning("Microsoft integration environment variables missing, skipping initialization")
             return
-        
+
         # Crear nueva integración con valores de las variables de entorno
         new_integration = MicrosoftIntegration(
             tenant_id=settings.MICROSOFT_TENANT_ID,
@@ -115,10 +129,10 @@ def init_microsoft_integration():
             scope=settings.MICROSOFT_SCOPE,
             is_active=True
         )
-        
+
         db.add(new_integration)
         db.commit()
-        
+
         logger.info("Microsoft integration initialized successfully from environment variables")
     except Exception as e:
         logger.error(f"Error initializing Microsoft integration: {e}")
@@ -132,7 +146,7 @@ def startup_events():
         # Inicializar integración de Microsoft
         if engine:
             init_microsoft_integration()
-            
+
         if has_scheduler and engine:  # Solo iniciar el scheduler si hay BD configurada
             # Start background email sync scheduler
             start_scheduler()
@@ -145,4 +159,4 @@ if __name__ == "__main__":
     import uvicorn
     # Usar el puerto proporcionado por Railway (PORT) o el 8000 por defecto
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port) 
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)

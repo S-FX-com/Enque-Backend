@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig, MailboxConnection
 from app.schemas.microsoft import EmailData, EmailAddress, EmailAttachment, MicrosoftTokenCreate, EmailTicketMappingCreate
+from app.schemas.task import TaskStatus # Import TaskStatus Enum
 from app.models.task import Task
 from app.models.agent import Agent
 from app.models.user import User
@@ -16,6 +17,7 @@ from app.models.task import Task, TicketBody
 from app.services.utils import get_or_create_user
 from app.utils.logger import logger, log_important
 import base64
+import json # Ensure json is imported
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
 # Removed unused import: get_current_active_user
@@ -78,31 +80,60 @@ class MicrosoftGraphService:
             logger.error(f"Failed to get application token: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get application token: {str(e)}")
 
-    def get_auth_url(self, redirect_uri: str = None) -> str:
-        """Get the URL for Microsoft OAuth authentication flow"""
+    def get_auth_url(
+        self,
+        redirect_uri: Optional[str] = None,
+        scopes: Optional[List[str]] = None,
+        state: Optional[str] = None,
+        prompt: Optional[str] = "consent" # Default prompt
+    ) -> str:
+        """Get the URL for Microsoft OAuth authentication flow, allowing custom redirect URI, scopes, state and prompt."""
         if not self.integration and not self.has_env_config:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft integration not configured")
 
         tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
         client_id = self.integration.client_id if self.integration else settings.MICROSOFT_CLIENT_ID
-        correct_redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
-        scope = "offline_access Mail.Read Mail.ReadWrite Mail.ReadWrite.Shared Mail.Send Mail.Send.Shared User.Read"
-        auth_url = self.auth_url.replace("{tenant}", tenant_id)
+
+        # Use provided redirect_uri or default to the one in settings/integration
+        final_redirect_uri = redirect_uri or (self.integration.redirect_uri if self.integration else settings.MICROSOFT_REDIRECT_URI)
+        if not final_redirect_uri:
+             # Fallback if neither provided nor configured (should ideally not happen)
+             final_redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
+             logger.warning(f"No redirect_uri provided or configured, falling back to default: {final_redirect_uri}")
+
+        # Use provided scopes or default to standard ones + User.Read
+        default_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
+        final_scopes = scopes if scopes else default_scopes
+        scope_string = " ".join(final_scopes)
+
+        auth_endpoint = self.auth_url.replace("{tenant}", tenant_id)
 
         params = {
-            "client_id": client_id, "response_type": "code", "redirect_uri": correct_redirect_uri,
-            "scope": scope, "response_mode": "query", "prompt": "consent"
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": final_redirect_uri,
+            "scope": scope_string,
+            "response_mode": "query",
         }
-        admin_params = params.copy()
-        admin_params["prompt"] = "admin_consent"
+        if prompt:
+            params["prompt"] = prompt
+        if state:
+            params["state"] = state
 
-        is_admin_consent = redirect_uri and "admin_consent=true" in redirect_uri
-        final_params = admin_params if is_admin_consent else params
-        return f"{auth_url}?{urlencode(final_params)}"
+        logger.info(f"Generated Microsoft Auth URL with redirect_uri: {final_redirect_uri}, scopes: '{scope_string}', prompt: {prompt}, state: {state}")
+        return f"{auth_endpoint}?{urlencode(params)}"
 
-    def exchange_code_for_token(self, code: str, redirect_uri: str) -> MicrosoftToken:
-        """Exchange authorization code for access token"""
-        needs_integration = not self.integration
+
+    # --- Función exchange_code_for_agent_login_token eliminada ---
+
+
+    def exchange_code_for_token(self, code: str, redirect_uri: str, state: Optional[str] = None) -> MicrosoftToken:
+        """
+        Exchange authorization code for access token for Mailbox Sync.
+        Uses the 'state' parameter to determine the correct workspace and initiating agent.
+        A separate function might be needed for agent login flow if token storage differs.
+        """
+        needs_integration = not self.integration # Check if integration exists in DB
 
         tenant_id = settings.MICROSOFT_TENANT_ID
         client_id = settings.MICROSOFT_CLIENT_ID
@@ -138,15 +169,61 @@ class MicrosoftGraphService:
             if not mailbox_email:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not get email address from Microsoft user info")
 
-            # Find agent (assuming context is not available, fallback)
-            current_agent = self.db.query(Agent).filter(Agent.role == "admin").first() or self.db.query(Agent).first()
-            if not current_agent: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No agent found")
+            # --- Parse Base64 encoded state to get workspace_id and agent_id ---
+            workspace_id: Optional[int] = None
+            agent_id: Optional[int] = None
+            state_data: Optional[dict] = None
+            if state:
+                try:
+                    # Add padding if necessary before decoding Base64 URL-safe string
+                    missing_padding = len(state) % 4
+                    if missing_padding:
+                        state += '=' * (4 - missing_padding)
+                    logger.debug(f"Attempting to decode Base64 state in service (with padding added if needed): {state}")
+                    decoded_state_bytes = base64.urlsafe_b64decode(state)
+                    # Decode bytes to JSON string
+                    decoded_state_json = decoded_state_bytes.decode('utf-8')
+                    # Parse JSON string into dictionary
+                    state_data = json.loads(decoded_state_json)
 
-            # Find workspace (assuming single workspace)
-            workspace = self.db.query(Workspace).first()
-            if not workspace: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No workspace found")
+                    ws_id_str = state_data.get('workspace_id')
+                    ag_id_str = state_data.get('agent_id')
 
-            # Create integration if needed
+                    if ws_id_str: workspace_id = int(ws_id_str)
+                    if ag_id_str: agent_id = int(ag_id_str)
+
+                    logger.info(f"Extracted from Base64 state: workspace_id={workspace_id}, agent_id={agent_id}")
+
+                except Exception as decode_err:
+                    logger.error(f"Failed to decode/parse Base64 state parameter '{state}' in exchange_code_for_token: {decode_err}")
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state parameter format.")
+            else:
+                 # Handle missing state if it's absolutely required
+                 logger.error("State parameter is missing in exchange_code_for_token.")
+                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="State parameter is required.")
+
+
+            if not workspace_id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID missing or invalid in state parameter.")
+            if not agent_id:
+                 # Fallback: Try to get current agent if not in state? Risky without context.
+                 # For now, require agent_id in state.
+                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter.")
+
+            # Find the specific agent and workspace based on state
+            current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
+            if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+
+            workspace = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
+            if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
+            # Ensure the agent belongs to the workspace (optional but good practice)
+            if current_agent.workspace_id != workspace.id:
+                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+            # --- End State Parsing ---
+
+
+            # Create integration if needed (This part might need review - should integration be global or per workspace?)
+            # Assuming global integration for now.
             if needs_integration:
                 self.integration = MicrosoftIntegration(
                     tenant_id=tenant_id, client_id=client_id, client_secret=client_secret,
@@ -156,35 +233,52 @@ class MicrosoftGraphService:
                 self.db.commit()
                 self.db.refresh(self.integration)
 
-            # Get or create MailboxConnection
-            mailbox_connection = self.db.query(MailboxConnection).filter(MailboxConnection.email == mailbox_email).first()
+            # Get or create MailboxConnection - Ensure it uses the correct workspace_id from state
+            mailbox_connection = self.db.query(MailboxConnection).filter(
+                MailboxConnection.email == mailbox_email,
+                MailboxConnection.workspace_id == workspace.id # Check workspace too
+            ).first()
             if not mailbox_connection:
                 mailbox_connection = MailboxConnection(
-                    email=mailbox_email, display_name=user_info.get("displayName", "Microsoft User"),
-                    workspace_id=workspace.id, created_by_agent_id=current_agent.id, is_active=True
+                    email=mailbox_email,
+                    display_name=user_info.get("displayName", "Microsoft User"),
+                    workspace_id=workspace.id, # Use workspace ID from state
+                    created_by_agent_id=current_agent.id, # Use agent ID from state
+                    is_active=True
                 )
                 self.db.add(mailbox_connection)
                 self.db.commit()
                 self.db.refresh(mailbox_connection)
 
-            # Create MicrosoftToken
+            # Create MicrosoftToken - Use agent_id from state
             token = MicrosoftToken(
-                integration_id=self.integration.id, agent_id=current_agent.id,
-                mailbox_connection_id=mailbox_connection.id, access_token=token_data["access_token"],
-                refresh_token=refresh_token_val, token_type=token_data["token_type"],
+                integration_id=self.integration.id,
+                agent_id=current_agent.id, # Use agent ID from state
+                mailbox_connection_id=mailbox_connection.id,
+                access_token=token_data["access_token"],
+                refresh_token=refresh_token_val,
+                token_type=token_data["token_type"],
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
             )
             self.db.add(token)
             self.db.commit()
             self.db.refresh(token)
 
-            # Create EmailSyncConfig if needed
-            existing_config = self.db.query(EmailSyncConfig).filter(EmailSyncConfig.mailbox_connection_id == mailbox_connection.id).first()
+            # Create EmailSyncConfig if needed - Ensure it uses the correct workspace_id from state
+            existing_config = self.db.query(EmailSyncConfig).filter(
+                EmailSyncConfig.mailbox_connection_id == mailbox_connection.id,
+                EmailSyncConfig.workspace_id == workspace.id # Check workspace too
+                ).first()
             if not existing_config:
                 new_config = EmailSyncConfig(
-                    integration_id=self.integration.id, mailbox_connection_id=mailbox_connection.id,
-                    folder_name="Inbox", sync_interval=1, default_priority="Medium",
-                    auto_assign=False, workspace_id=workspace.id, is_active=True
+                    integration_id=self.integration.id,
+                    mailbox_connection_id=mailbox_connection.id,
+                    folder_name="Inbox",
+                    sync_interval=1,
+                    default_priority="Medium",
+                    auto_assign=False,
+                    workspace_id=workspace.id, # Use workspace ID from state
+                    is_active=True
                 )
                 self.db.add(new_config)
                 self.db.commit()
@@ -357,7 +451,21 @@ class MicrosoftGraphService:
                             email_received_at=email.received_at, is_processed=True
                         )
                         self.db.add(reply_email_mapping)
-                        self.db.commit() # Commit comment and new mapping
+
+                        # --- Automatic Status Update Logic for User Reply ---
+                        # Get the ticket associated with the conversation
+                        ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
+                        if ticket_to_update and ticket_to_update.status == TaskStatus.WITH_USER:
+                             logger.info(f"[MAIL SYNC] User replied to Ticket ID {ticket_to_update.id} (status: {ticket_to_update.status}). Updating status to '{TaskStatus.IN_PROGRESS}'.")
+                             ticket_to_update.status = TaskStatus.IN_PROGRESS
+                             self.db.add(ticket_to_update) # Add the updated task to the session
+                        elif ticket_to_update:
+                             logger.info(f"[MAIL SYNC] User replied to Ticket ID {ticket_to_update.id}. Status is '{ticket_to_update.status}', no automatic update needed.")
+                        else:
+                             logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
+                        # --- End Status Update Logic ---
+
+                        self.db.commit() # Commit comment, new mapping, and potential status update
                         added_comments_count += 1
                         logger.info(f"[MAIL SYNC] Added comment to Ticket ID {existing_mapping_by_conv.ticket_id} from reply email ID {email.id}.")
 
@@ -454,8 +562,16 @@ class MicrosoftGraphService:
             if email.importance == "high": priority = "High"
             elif email.importance == "low": priority = "Low"
 
-            user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown")
-            if not user: logger.error(f"Could not get or create user for email: {email.sender.address}"); return None
+            # Get workspace_id from the sync config
+            workspace_id = config.workspace_id
+            if not workspace_id:
+                logger.error(f"Missing workspace_id in sync config {config.id}. Cannot create user/task.")
+                return None
+
+            # Pass workspace_id to get_or_create_user
+            user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+            if not user: logger.error(f"Could not get or create user for email: {email.sender.address} in workspace {workspace_id}"); return None
+            # company_id is now correctly None if the user was just created
             company_id = user.company_id
 
             assigned_agent = None
@@ -670,12 +786,18 @@ class MicrosoftGraphService:
         logger.info(f"Found original message ID '{original_message_id}' for reply to task {task_id}")
 
         # 4. Construct Reply Payload
-        html_body = f"""
-        <html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 1em 0; }} .signature {{ color: #555555; font-size: 9pt; }}</style></head>
-        <body><p>{reply_content}</p><br><p class="signature">--</p><p class="signature">Regards,</p><p class="signature">{agent.name or agent.email}</p><p class="signature"><i>{mailbox_connection.display_name or mailbox_connection.email}</i></p></body></html>
-        """
+        # Use the reply_content directly, as it should already contain the signature from Tiptap
+        # Add basic HTML structure if reply_content doesn't already have it (Tiptap usually provides it)
+        if not reply_content.strip().lower().startswith('<html'):
+             html_body = f"""
+             <html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 1em 0; }}</style></head>
+             <body>{reply_content}</body></html>
+             """
+        else:
+             html_body = reply_content # Assume Tiptap provided full HTML
+
         # Payload for /reply endpoint requires 'comment' field
-        reply_payload = {"comment": html_body}
+        reply_payload = {"comment": html_body} # Use the (potentially wrapped) reply_content
 
         # 5. Send Reply via Graph API
         try:
@@ -704,6 +826,66 @@ class MicrosoftGraphService:
         except Exception as e:
             logger.error(f"An unexpected error occurred while sending email reply for task_id: {task_id}. Error: {str(e)}", exc_info=True)
             return False
+
+    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str) -> bool:
+        """Send a new email message using Microsoft Graph API"""
+        logger.info(f"Attempting to send new email from: {mailbox_email} to: {recipient_email} with subject: {subject}")
+
+        # 1. Get Application Token
+        try:
+            app_token = self.get_application_token()
+        except Exception as e:
+            logger.error(f"Failed to get application token for sending new email: {e}")
+            return False
+
+        # 2. Construct Email Payload for sendMail endpoint
+        email_payload = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "HTML",
+                    "content": html_body
+                },
+                "toRecipients": [
+                    {
+                        "emailAddress": {
+                            "address": recipient_email
+                        }
+                    }
+                ]
+                # 'from' and 'sender' are usually set automatically based on the mailbox_email used in the URL
+            },
+            "saveToSentItems": "true" # Save a copy in the sender's Sent Items folder
+        }
+
+        # 3. Send Email via Graph API using /sendMail
+        try:
+            send_mail_endpoint = f"{self.graph_url}/users/{mailbox_email}/sendMail"
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            logger.debug(f"Sending new email via endpoint: {send_mail_endpoint}")
+            response = requests.post(send_mail_endpoint, headers=headers, json=email_payload)
+
+            if response.status_code not in [200, 202]: # sendMail returns 202 Accepted
+                error_details = "No details available"
+                try: error_details = response.json()
+                except ValueError: error_details = response.text
+                logger.error(f"Failed to send new email from {mailbox_email} to {recipient_email}. Status Code: {response.status_code}. Details: {error_details}")
+                response.raise_for_status() # Raise exception for bad status
+
+            logger.info(f"Successfully sent new email from {mailbox_email} to {recipient_email} (via /sendMail endpoint)")
+            return True
+        except requests.exceptions.RequestException as e:
+            error_details = "No details available"; status_code = 'N/A'
+            if e.response is not None:
+                status_code = e.response.status_code
+                try: error_details = e.response.json()
+                except ValueError: error_details = e.response.text
+            logger.error(f"Failed to send new email from {mailbox_email} to {recipient_email}. Status Code: {status_code}. Details: {error_details}. Error: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while sending new email from {mailbox_email} to {recipient_email}. Error: {str(e)}", exc_info=True)
+            return False
+
 
 def get_microsoft_service(db: Session) -> MicrosoftGraphService:
     """Utility function to get a new Microsoft service instance"""

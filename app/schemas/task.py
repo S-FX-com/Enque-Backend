@@ -9,12 +9,15 @@ AgentRef = ForwardRef("Agent")
 TeamRef = ForwardRef("Team")
 UserRef = ForwardRef("User")
 CompanyRef = ForwardRef("Company")
+CategoryRef = ForwardRef("Category") # Add CategoryRef
 # Forward reference for the new body schema
-TicketBodyRef = ForwardRef("TicketBodySchema") 
+TicketBodyRef = ForwardRef("TicketBodySchema")
 
 class TaskStatus(str, PyEnum):
     UNREAD = "Unread"
     OPEN = "Open"
+    WITH_USER = "With User" # Added
+    IN_PROGRESS = "In Progress" # Added
     CLOSED = "Closed"
 
 
@@ -22,6 +25,7 @@ class TaskPriority(str, PyEnum):
     LOW = "Low"
     MEDIUM = "Medium"
     HIGH = "High"
+    CRITICAL = "Critical" # Added Critical
 
 
 class TaskBase(BaseModel):
@@ -38,27 +42,28 @@ class TaskBase(BaseModel):
     user_id: Optional[int] = None
     company_id: Optional[int] = None
     workspace_id: Optional[int] = None
+    category_id: Optional[int] = None # Add category_id
     
     @validator("status")
     def validate_status(cls, v):
-        allowed_statuses = ["Unread", "Open", "Closed"]
-        if v not in allowed_statuses:
-            raise ValueError(f"Status must be one of {allowed_statuses}")
+        # Use the Enum members for validation
+        if v not in TaskStatus.__members__.values():
+             raise ValueError(f"Status must be one of {list(TaskStatus.__members__.values())}")
         return v
     
     @validator("priority")
     def validate_priority(cls, v):
-        allowed_priorities = ["Low", "Medium", "High"]
-        if v not in allowed_priorities:
-            raise ValueError(f"Priority must be one of {allowed_priorities}")
+        # Use the Enum members for validation
+        if v not in TaskPriority.__members__.values():
+             raise ValueError(f"Priority must be one of {list(TaskPriority.__members__.values())}")
         return v
 
 
-# TicketCreate might not need description if it's only from email body
-class TicketCreate(BaseModel): 
+# TicketCreate needs description for manually created tickets
+class TicketCreate(BaseModel):
     title: str
-    # Remove description if it's only populated from email
-    # description: Optional[str] = None 
+    # Add description back, make it optional
+    description: Optional[str] = None
     status: TaskStatus = TaskStatus.UNREAD
     priority: TaskPriority = TaskPriority.MEDIUM
     assignee_id: Optional[int] = None
@@ -69,6 +74,7 @@ class TicketCreate(BaseModel):
     user_id: int # User who originally sent the email/request
     company_id: Optional[int] = None
     workspace_id: int
+    category_id: Optional[int] = None # Add category_id
 
 
 # TicketUpdate can still update the manual description
@@ -88,21 +94,22 @@ class TicketUpdate(BaseModel):
     # user_id: Optional[int] = None # Duplicate removed, and likely shouldn't be updated here
     # sent_from_id: Optional[int] = None # Duplicate removed
     # sent_to_id: Optional[int] = None # Duplicate removed
+    category_id: Optional[int] = None # Add category_id
     
     @validator("status")
     def validate_status(cls, v):
         if v is not None:
-            allowed_statuses = ["Unread", "Open", "Closed"]
-            if v not in allowed_statuses:
-                raise ValueError(f"Status must be one of {allowed_statuses}")
+            # Use the Enum members for validation
+            if v not in TaskStatus.__members__.values():
+                 raise ValueError(f"Status must be one of {list(TaskStatus.__members__.values())}")
         return v
     
     @validator("priority")
     def validate_priority(cls, v):
         if v is not None:
-            allowed_priorities = ["Low", "Medium", "High"]
-            if v not in allowed_priorities:
-                raise ValueError(f"Priority must be one of {allowed_priorities}")
+            # Use the Enum members for validation
+            if v not in TaskPriority.__members__.values():
+                 raise ValueError(f"Priority must be one of {list(TaskPriority.__members__.values())}")
         return v
 
 
@@ -139,6 +146,7 @@ class TicketInDBBase(BaseModel):
     user_id: int
     sent_from_id: Optional[int] = None
     sent_to_id: Optional[int] = None
+    category_id: Optional[int] = None # Add category_id
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime] = None
@@ -166,9 +174,10 @@ class TicketWithDetails(Ticket):
     workspace: WorkspaceRef
     team: Optional[TeamRef] = None
     company: Optional[CompanyRef] = None
-    user: UserRef
+    user: Optional[UserRef] = None # Make user optional
     sent_from: Optional[AgentRef] = None # Agent who created/processed
     sent_to: Optional[AgentRef] = None
+    category: Optional[CategoryRef] = None # Add category object
     body: Optional[TicketBodyRef] = None # Include the related body object
     
     class Config:
@@ -181,6 +190,7 @@ from app.schemas.agent import Agent
 from app.schemas.team import Team
 from app.schemas.user import User
 from app.schemas.company import Company
+from app.schemas.category import Category # Import Category schema
 
 # Update refs for all models in this module that use ForwardRefs
 # Call without arguments for Pydantic v2 compatibility

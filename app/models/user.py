@@ -15,7 +15,8 @@ class User(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     
     # Relationships
-    company = relationship("Company", back_populates="users")
+    # Specify foreign_keys to resolve ambiguity with Company.primary_contact_id
+    company = relationship("Company", foreign_keys=[company_id], back_populates="users")
     workspace = relationship("Workspace", back_populates="users")
     tasks = relationship("Task", back_populates="user")
 
@@ -27,4 +28,8 @@ class UnassignedUser(Base):
     name = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, unique=True, index=True)
     phone = Column(String(50), nullable=True)
-    created_at = Column(DateTime, default=func.now()) 
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True) # Add workspace_id (nullable for now)
+    created_at = Column(DateTime, default=func.now())
+
+    # Optional: Add relationship back to workspace if needed
+    # workspace = relationship("Workspace")

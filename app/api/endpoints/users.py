@@ -1,3 +1,4 @@
+# backend/app/api/endpoints/users.py
 from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -24,7 +25,7 @@ async def read_users(
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Retrieve all users
+    Retrieve all users for the current workspace.
     """
     users = db.query(User).filter(User.workspace_id == current_workspace.id).order_by(User.name).offset(skip).limit(limit).all()
     return users
@@ -38,57 +39,83 @@ async def create_user(
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Create a new user
+    Create a new user within the current workspace.
     """
     # Check if email already exists in this workspace
-    user = db.query(User).filter(
+    existing_user = db.query(User).filter(
         User.email == user_in.email,
         User.workspace_id == current_workspace.id
     ).first()
-    if user:
+    if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered in this workspace",
         )
-    
+
     # Treat company_id=0 as None/null
-    if user_in.company_id == 0:
-        user_in.company_id = None
-    
+    company_id = user_in.company_id if user_in.company_id != 0 else None
+
     # Validate company_id if provided
-    if user_in.company_id is not None:
+    if company_id is not None:
         company = db.query(Company).filter(
-            Company.id == user_in.company_id,
+            Company.id == company_id,
             Company.workspace_id == current_workspace.id
         ).first()
         if not company:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Company with ID {user_in.company_id} does not exist in this workspace",
+                detail=f"Company with ID {company_id} does not exist in this workspace",
             )
-    
+
     # Create new user with the current workspace
-    user_data = user_in.dict()
+    user_data = user_in.dict(exclude={'company_id'}) # Exclude potentially modified company_id
     user_data["workspace_id"] = current_workspace.id
+    user_data["company_id"] = company_id # Use the processed company_id
     user = User(**user_data)
     db.add(user)
     db.commit()
     db.refresh(user)
-    
-    # If user has no company, add to unassigned_users
+
+    # If user has no company, add to unassigned_users for this workspace
     if user.company_id is None:
-        # Check if already exists in unassigned_users
-        unassigned_user = db.query(UnassignedUser).filter(UnassignedUser.email == user.email).first()
+        # Check if already exists in unassigned_users for this workspace
+        unassigned_user = db.query(UnassignedUser).filter(
+            UnassignedUser.email == user.email,
+            UnassignedUser.workspace_id == current_workspace.id # Check workspace
+        ).first()
         if not unassigned_user:
-            unassigned_user = UnassignedUser(
+            unassigned_user_entry = UnassignedUser(
                 name=user.name,
                 email=user.email,
-                phone=user.phone
+                phone=user.phone,
+                workspace_id=current_workspace.id # Assign workspace_id
             )
-            db.add(unassigned_user)
+            db.add(unassigned_user_entry)
             db.commit()
-    
+
     return user
+
+
+# --- Endpoint to get unassigned users ---
+# Changed response_model to UserSchema as we'll fetch from the main User table
+@router.get("/unassigned", response_model=List[UserSchema])
+async def read_unassigned_users(
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100,
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Retrieve users from the main User table who are not assigned to a company
+    within the current workspace.
+    """
+    # Query the main User table for users in the current workspace with no company_id
+    unassigned_users = db.query(User).filter(
+        User.workspace_id == current_workspace.id,
+        User.company_id == None # Use SQLAlchemy's way to check for NULL
+    ).order_by(User.name).offset(skip).limit(limit).all()
+    return unassigned_users
 
 
 @router.get("/{user_id}", response_model=UserSchema)
@@ -99,7 +126,7 @@ async def read_user(
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Get user by ID
+    Get user by ID within the current workspace.
     """
     user = db.query(User).filter(
         User.id == user_id,
@@ -122,7 +149,7 @@ async def update_user(
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Update a user
+    Update a user within the current workspace.
     """
     user = db.query(User).filter(
         User.id == user_id,
@@ -133,53 +160,88 @@ async def update_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-    
-    # Treat company_id=0 as None/null
-    if user_in.company_id == 0:
-        user_in.company_id = None
-    
-    # Validate company_id if provided
-    if user_in.company_id is not None:
-        company = db.query(Company).filter(
-            Company.id == user_in.company_id,
-            Company.workspace_id == current_workspace.id
-        ).first()
-        if not company:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Company with ID {user_in.company_id} does not exist in this workspace",
-            )
-    
-    # Store the old company_id for comparison
-    old_company_id = user.company_id
-    
-    # Update user attributes
+
+    print(f"--- Updating User ID: {user_id} ---") # Log start
     update_data = user_in.dict(exclude_unset=True)
+    print(f"Received update data: {update_data}") # Log received payload
+
+    # Process company_id specifically
+    new_company_id = update_data.get("company_id") # Get potential new company_id
+    if "company_id" in update_data: # Check if company_id was explicitly passed
+        if new_company_id == 0:
+            new_company_id = None # Treat 0 as None
+            update_data["company_id"] = None # Ensure update_data reflects this
+
+        # Validate company_id if it's not None
+        if new_company_id is not None:
+            company = db.query(Company).filter(
+                Company.id == new_company_id,
+                Company.workspace_id == current_workspace.id
+            ).first()
+            if not company:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Company with ID {new_company_id} does not exist in this workspace",
+                )
+    else:
+        # If company_id wasn't in the input, keep the existing one
+        new_company_id = user.company_id
+
+    # Store the old company_id for comparison *before* updating the user object
+    old_company_id = user.company_id
+    print(f"Old company_id: {old_company_id}") # Log old value
+
+    # Update user attributes from update_data
+    print("Attempting to set attributes...")
     for field, value in update_data.items():
+        print(f"Setting {field} = {value}") # Log each attribute set
         setattr(user, field, value)
-    
-    db.commit()
-    db.refresh(user)
-    
-    # Handle unassigned users synchronization
-    if old_company_id is None and user.company_id is not None:
-        # User was assigned to a company, remove from unassigned_users
-        unassigned_user = db.query(UnassignedUser).filter(UnassignedUser.email == user.email).first()
+
+    print(f"User object before commit: company_id={user.company_id}, name={user.name}") # Log state before commit
+
+    try:
+        db.commit()
+        print("Commit successful.") # Log commit success
+        db.refresh(user)
+        print(f"User object after refresh: company_id={user.company_id}") # Log state after refresh
+    except Exception as e:
+        print(f"Error during commit: {e}") # Log commit error
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database commit failed")
+
+    # Handle unassigned users synchronization based on the change in company_id
+    if old_company_id is None and new_company_id is not None:
+        # User was assigned to a company, remove from unassigned_users for this workspace
+        unassigned_user = db.query(UnassignedUser).filter(
+            UnassignedUser.email == user.email,
+            UnassignedUser.workspace_id == current_workspace.id # Check workspace
+        ).first()
         if unassigned_user:
+            print(f"Removing user {user.email} from unassigned.")
             db.delete(unassigned_user)
-            db.commit()
-    elif old_company_id is not None and user.company_id is None:
-        # User was removed from a company, add to unassigned_users
-        unassigned_user = db.query(UnassignedUser).filter(UnassignedUser.email == user.email).first()
+            db.commit() # Commit this change specifically
+    elif old_company_id is not None and new_company_id is None:
+        print(f"Adding user {user.email} to unassigned.")
+        # User was removed from a company, add to unassigned_users for this workspace
+        unassigned_user = db.query(UnassignedUser).filter(
+            UnassignedUser.email == user.email,
+            UnassignedUser.workspace_id == current_workspace.id # Check workspace
+        ).first()
         if not unassigned_user:
-            unassigned_user = UnassignedUser(
+            unassigned_user_entry = UnassignedUser(
                 name=user.name,
                 email=user.email,
-                phone=user.phone
+                phone=user.phone,
+                workspace_id=current_workspace.id # Assign workspace_id
             )
-            db.add(unassigned_user)
-            db.commit()
-    
+            db.add(unassigned_user_entry)
+            db.commit() # Commit this change specifically
+    # If company_id didn't change or changed between two companies, do nothing with unassigned_users
+    else:
+         print(f"No change needed for unassigned_users table (old: {old_company_id}, new: {new_company_id}).")
+
+
+    print(f"--- Update User ID: {user_id} Finished ---") # Log end
     return user
 
 
@@ -191,7 +253,7 @@ async def delete_user(
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Delete a user
+    Delete a user within the current workspace.
     """
     user = db.query(User).filter(
         User.id == user_id,
@@ -202,28 +264,18 @@ async def delete_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-    
-    # First remove from unassigned_users if exists
-    unassigned_user = db.query(UnassignedUser).filter(UnassignedUser.email == user.email).first()
+
+    # First remove from unassigned_users if exists (within the same workspace)
+    unassigned_user = db.query(UnassignedUser).filter(
+        UnassignedUser.email == user.email,
+        UnassignedUser.workspace_id == current_workspace.id # Check workspace
+    ).first()
     if unassigned_user:
         db.delete(unassigned_user)
-    
+        # Commit this deletion separately or ensure it's part of the final commit
+
+    # Now delete the main user record
     db.delete(user)
-    db.commit()
-    
+    db.commit() # Commit both deletions
+
     return user
-
-
-@router.get("/unassigned", response_model=List[UnassignedUserSchema])
-async def read_unassigned_users(
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-    current_workspace: Workspace = Depends(get_current_workspace),
-) -> Any:
-    """
-    Retrieve all unassigned users
-    """
-    unassigned_users = db.query(UnassignedUser).order_by(UnassignedUser.name).offset(skip).limit(limit).all()
-    return unassigned_users 

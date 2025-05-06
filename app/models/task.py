@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, Enum, Boolean, F
 from sqlalchemy.dialects.mysql import LONGTEXT # Import LONGTEXT
 from sqlalchemy.orm import relationship
 from app.database.base_class import Base
+from .category import Category # Import Category model
 
 class TicketBody(Base):
     """Stores the potentially large body content of tickets, especially those from emails."""
@@ -22,9 +23,11 @@ class Task(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     title = Column(String(255), nullable=False)
     # Description can now be used for manual descriptions or summaries
-    description = Column(Text, nullable=True) 
-    status = Column(Enum('Unread', 'Open', 'Closed', name='ticket_status'), default='Unread', nullable=False)
-    priority = Column(Enum('Low', 'Medium', 'High', name='ticket_priority'), default='Medium', nullable=False)
+    description = Column(Text, nullable=True)
+    # Add 'With User' and 'In Progress' to status Enum
+    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', name='ticket_status'), default='Unread', nullable=False)
+    # Add 'Critical' to the Enum definition
+    priority = Column(Enum('Low', 'Medium', 'High', 'Critical', name='ticket_priority'), default='Medium', nullable=False)
     assignee_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
     due_date = Column(DateTime, nullable=True)
@@ -39,6 +42,7 @@ class Task(Base):
     deleted_at = Column(DateTime, nullable=True)
     is_read = Column(Boolean, default=False)
     mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) # Added for email replies
+    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) # Added category foreign key
 
     # Relationships
     workspace = relationship("Workspace", back_populates="tasks")
@@ -48,14 +52,15 @@ class Task(Base):
     team = relationship("Team", back_populates="tasks")
     user = relationship("User", back_populates="tasks")
     company = relationship("Company", back_populates="tasks")
-    comments = relationship("Comment", back_populates="ticket")
-    
+    comments = relationship("Comment", back_populates="ticket", cascade="all, delete-orphan") # Cascade comment deletes
+
     # Relación con los emails (Microsoft 365 integration)
     email_mappings = relationship("EmailTicketMapping", back_populates="ticket", cascade="all, delete-orphan")
     
     # Relationship to the separate body content
     body = relationship("TicketBody", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
     mailbox_connection = relationship("MailboxConnection", back_populates="tasks") # Added for email replies
+    category = relationship("Category", back_populates="tasks") # Added relationship to Category
 
     # Helper para verificar si el ticket se creó a partir de un email
     @property

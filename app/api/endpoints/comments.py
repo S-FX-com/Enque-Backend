@@ -8,9 +8,11 @@ from app.database.session import get_db
 # Use aliases for clarity if needed, or use original names
 from app.models.agent import Agent as AgentModel
 from app.models.comment import Comment as CommentModel
-from app.models.task import Task as TaskModel
+from app.models.task import Task as TaskModel # Keep TaskModel alias
+from app.models.microsoft import MailboxConnection # Import MailboxConnection
 # CommentSchema now includes the agent object due to previous edit
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
+from app.schemas.task import TaskStatus # Import TaskStatus Enum
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
 from app.utils.logger import logger
 
@@ -109,23 +111,88 @@ async def create_comment(
     )
     db.add(comment)
     db.commit()
-    db.refresh(comment)
+    db.refresh(comment) # Refresh comment to get ID etc.
 
-    # Attempt to send the comment as an email reply if the task originated from email
+    # --- Automatic Status and Assignment Update Logic ---
+    if not comment.is_private and current_user.role in ["agent", "admin", "manager"]: # Check roles allowed to auto-assign/update status
+        needs_commit = False # Flag to track if DB commit is needed
+
+        # 1. Auto-Assignment Logic
+        if task.assignee_id is None:
+            logger.info(f"Task {task_id} is unassigned. Assigning to agent {current_user.id} ({current_user.email}) who commented.")
+            task.assignee_id = current_user.id
+            db.add(task) # Add task to session for assignment update
+            needs_commit = True
+
+        # 2. Status Update Logic
+        if task.status in [TaskStatus.OPEN, TaskStatus.IN_PROGRESS]:
+            logger.info(f"Agent {current_user.id} commented on task {task_id} (status: {task.status}). Updating status to '{TaskStatus.WITH_USER}'.")
+            task.status = TaskStatus.WITH_USER
+            if not needs_commit: # Add task to session if not already added for assignment
+                 db.add(task)
+            needs_commit = True
+        else:
+             logger.info(f"Agent {current_user.id} commented on task {task_id}. Status is '{task.status}', no automatic status update needed.")
+
+        # Commit if any changes were made (assignment or status)
+        if needs_commit:
+            db.commit()
+            db.refresh(task) # Refresh task to get updated data
+
+    # --- Email Notification Logic ---
+    # Attempt to send email notification for non-private comments
     if not comment.is_private:
         try:
-            logger.info(f"Attempting to send comment ID {comment.id} as email reply for task ID {task_id}")
-            microsoft_service = get_microsoft_service(db)
-            # Pass the agent object (current_user)
-            # The send_reply_email function handles its own logging for success, failure, or non-applicability.
-            # It returns True if successful OR if not applicable (e.g., task not from email).
-            # It returns False only if an actual error occurred during the sending attempt.
-            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment.content, agent=current_user)
-            # No need for additional logging here as the service function logs appropriately.
+            # Re-fetch task with user relationship loaded to get recipient email if needed
+            task_with_user = db.query(TaskModel).options(
+                joinedload(TaskModel.user)
+            ).filter(TaskModel.id == task_id).first()
+
+            if not task_with_user:
+                logger.error(f"Task {task_id} not found when attempting to send email for comment {comment.id}.")
+            elif task_with_user.mailbox_connection_id:
+                # Task originated from email, send a reply
+                logger.info(f"Task {task_id} originated from email. Attempting to send comment ID {comment.id} as reply.")
+                microsoft_service = get_microsoft_service(db)
+                microsoft_service.send_reply_email(task_id=task_id, reply_content=comment.content, agent=current_user)
+            else:
+                # Task was created manually, send a new email notification
+                logger.info(f"Task {task_id} was manual. Attempting to send comment ID {comment.id} as new email notification.")
+                if not task_with_user.user or not task_with_user.user.email:
+                    logger.warning(f"Cannot send notification for comment {comment.id} on task {task_id}: Task user or user email is missing.")
+                else:
+                    recipient_email = task_with_user.user.email
+                    # Find an active mailbox for the workspace to send from
+                    sender_mailbox_conn = db.query(MailboxConnection).filter(
+                        MailboxConnection.workspace_id == task_with_user.workspace_id,
+                        MailboxConnection.is_active == True
+                    ).first()
+
+                    if not sender_mailbox_conn:
+                        logger.warning(f"Cannot send notification for comment {comment.id} on task {task_id}: No active sender mailbox found for workspace {task_with_user.workspace_id}.")
+                    else:
+                        sender_mailbox = sender_mailbox_conn.email
+                        subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
+                        # Prepare HTML body - maybe add context?
+                        # For now, just the comment content. Consider adding agent name.
+                        html_body = f"<p><strong>{current_user.name} commented:</strong></p>{comment.content}" # Added agent name
+
+                        microsoft_service = get_microsoft_service(db)
+                        logger.info(f"Sending new email notification for comment {comment.id} from {sender_mailbox} to {recipient_email}")
+                        email_sent = microsoft_service.send_new_email(
+                            mailbox_email=sender_mailbox,
+                            recipient_email=recipient_email,
+                            subject=subject,
+                            html_body=html_body
+                        )
+                        if not email_sent:
+                            logger.error(f"Failed to send new email notification for comment {comment.id} on task {task_id}")
+                        else:
+                            logger.info(f"Successfully sent new email notification for comment {comment.id}")
 
         except Exception as e:
             # Catch unexpected errors during the email sending process
-            logger.error(f"Unexpected error trying to send email reply for comment ID {comment.id}, task ID {task_id}: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error trying to send email for comment ID {comment.id}, task ID {task_id}: {str(e)}", exc_info=True)
             # Do not re-raise, as the primary operation (saving comment) succeeded.
 
     return comment

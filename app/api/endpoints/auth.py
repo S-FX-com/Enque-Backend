@@ -1,13 +1,16 @@
 from datetime import timedelta
 from typing import Any, Optional, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Header
+from datetime import timedelta
+from typing import Any, Optional, Dict, List # Added List
+
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Header, Query # Added Query
+from fastapi.responses import RedirectResponse # Added RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
-
-# Import Workspace model if needed for validation (though not strictly required for this logic change)
-# from app.models.workspace import Workspace 
+# Import Workspace model if needed for validation
+from app.models.workspace import Workspace
 
 from app.core.config import settings
 from app.core.security import create_access_token, verify_password, get_password_hash
@@ -16,7 +19,13 @@ from app.models.agent import Agent
 from app.schemas.token import Token
 from app.schemas.agent import Agent as AgentSchema, AgentCreate
 from app.api.dependencies import get_current_active_user
+# Removed MS Service imports as they are no longer needed here
+# from app.services.microsoft_service import MicrosoftGraphService, get_microsoft_service 
 import logging # Import logging
+# Removed uuid import as it's likely only used for state which is removed
+# import uuid 
+import json # Added json import
+import base64 # Added base64 import
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +94,13 @@ async def login_access_token(
         "email": user.email,
         "name": user.name,
         "role": user.role,
-        "workspace_id": user.workspace_id # user.workspace_id and requested_workspace_id are guaranteed to be the same here
+        "workspace_id": user.workspace_id, # user.workspace_id and requested_workspace_id are guaranteed to be the same here
+        # Add new fields to token payload
+        "job_title": user.job_title,
+        "phone_number": user.phone_number,
+        "email_signature": user.email_signature # Add email_signature
     }
-    
+
     token = create_access_token(
         subject=str(user.id), # Ensure subject is string
         expires_delta=access_token_expires,
@@ -111,6 +124,9 @@ async def get_current_user(
     Get currently authenticated user
     """
     return current_user
+
+
+# --- Rutas de autenticación de Microsoft eliminadas ---
 
 
 @router.post("/register/agent", response_model=AgentSchema)

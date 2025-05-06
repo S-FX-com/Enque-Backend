@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload # Import joinedload
 from datetime import datetime
 import threading
 
@@ -15,7 +15,8 @@ from app.database.session import SessionLocal # Import SessionLocal
 
 def get_tasks(db: Session, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get all tasks"""
-    return db.query(Task).filter(Task.is_deleted == False).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    # Add joinedload for the user relationship
+    return db.query(Task).options(joinedload(Task.user)).filter(Task.is_deleted == False).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
 
 def get_task_by_id(db: Session, task_id: int) -> Optional[Dict[str, Any]]:
@@ -58,7 +59,10 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
     task = Task(**task_data)
     db.add(task)
     db.commit()
-    db.refresh(task)
+    # Refresh the task object to load all attributes from the DB, including description
+    db.refresh(task) 
+    # Explicitly load the user relationship as well, as refresh might not load relationships by default
+    db.refresh(task, attribute_names=['user']) 
     
     # --- Removed Activity Logging Logic ---
     # Activity logging should happen in the endpoint that calls this,
@@ -117,7 +121,7 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate) -> Optional[Di
 
     # Explicitly reload relationships needed by TaskWithDetails after refresh
     # to ensure they are present in the returned object for serialization.
-    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body'])
+    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) # Added 'category'
 
     # Check if task has email mapping
     email_mapping = db.query(EmailTicketMapping).filter(

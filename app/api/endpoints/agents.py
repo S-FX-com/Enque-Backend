@@ -1,34 +1,37 @@
-from typing import Any, List
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Any, List, Optional 
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func 
 
 from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
 from app.database.session import get_db
 from app.models.agent import Agent
-from app.models.team import Team, TeamMember 
+from app.models.team import Team, TeamMember
+from app.models.task import Task 
 from app.models.workspace import Workspace
 from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate
-from app.schemas.team import Team as TeamSchema 
+from app.schemas.team import Team as TeamSchema
 from app.core.security import get_password_hash
+from app.utils.logger import logger 
 
 router = APIRouter()
-
 
 @router.get("/", response_model=List[AgentSchema])
 async def read_agents(
     db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(0, ge=0), 
+    limit: int = Query(100, ge=1, le=200), 
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Retrieve all agents
+    Retrieve agents for the current workspace with pagination.
     """
+    logger.info(f"Fetching agents for workspace {current_workspace.id} with skip={skip}, limit={limit}")
     agents = db.query(Agent).filter(
         Agent.workspace_id == current_workspace.id
     ).order_by(Agent.name).offset(skip).limit(limit).all()
+    logger.info(f"Retrieved {len(agents)} agents.")
     return agents
 
 
@@ -58,12 +61,15 @@ async def create_agent(
         password=get_password_hash(agent_in.password),
         role=agent_in.role,
         workspace_id=current_workspace.id,
-        is_active=True
+        is_active=True,
+        job_title=agent_in.job_title,
+        phone_number=agent_in.phone_number,
+        email_signature=agent_in.email_signature
     )
     db.add(agent)
     db.commit()
     db.refresh(agent)
-    
+
     return agent
 
 
@@ -109,20 +115,21 @@ async def update_agent(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
-    
-    # Update agent attributes
+
     update_data = agent_in.dict(exclude_unset=True)
-    
-    # Hash password if it's being updated
+
     if "password" in update_data and update_data["password"]:
         update_data["password"] = get_password_hash(update_data["password"])
-    
+    elif "password" in update_data:
+         del update_data["password"]
+
+
     for field, value in update_data.items():
         setattr(agent, field, value)
-    
+
     db.commit()
     db.refresh(agent)
-    
+
     return agent
 
 
@@ -150,10 +157,10 @@ async def delete_agent(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account",
         )
-    
+
     db.delete(agent)
     db.commit()
-    
+
     return agent
 
 
@@ -161,7 +168,7 @@ async def delete_agent(
 async def read_agent_teams(
     agent_id: int,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user), # Ensure user is active
+    current_user: Agent = Depends(get_current_active_user), 
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
@@ -176,9 +183,21 @@ async def read_agent_teams(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found in this workspace",
         )
-    teams = db.query(Team).join(TeamMember).filter(
+    teams_query = db.query(Team).join(TeamMember).filter(
         TeamMember.agent_id == agent_id,
-        Team.workspace_id == current_workspace.id 
+        Team.workspace_id == current_workspace.id
     ).all()
 
-    return teams
+    teams_with_counts = []
+    for team_model in teams_query:
+
+        ticket_count = db.query(func.count(Task.id)).filter(
+            Task.team_id == team_model.id,
+            Task.status.notin_(['Closed', 'Resolved']) 
+        ).scalar() or 0
+        
+        team_schema = TeamSchema.from_orm(team_model)
+        team_schema.ticket_count = ticket_count
+        teams_with_counts.append(team_schema)
+        
+    return teams_with_counts
