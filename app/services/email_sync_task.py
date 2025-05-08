@@ -48,12 +48,6 @@ def sync_emails_job():
             return
             
         for config in configs:
-            if config.last_sync_time:
-                next_sync_time = config.last_sync_time + timedelta(minutes=config.sync_interval)
-                if datetime.utcnow() < next_sync_time:
-                    logger.info(f"Skipping sync for config #{config.id} - not yet time")
-                    continue
-                
             integration = db.query(MicrosoftIntegration).filter(
                 MicrosoftIntegration.id == config.integration_id,
                 MicrosoftIntegration.is_active == True
@@ -108,7 +102,7 @@ def start_scheduler():
     if not scheduler_available:
         logger.warning("Schedule library is not available. Email synchronization scheduler will not run.")
         return
-    schedule.every(20).seconds.do(sync_emails_job)
+    schedule.every(30).seconds.do(sync_emails_job)
     schedule.every(4).hours.do(refresh_tokens_job)
     
     # Run in a separate thread
@@ -121,4 +115,4 @@ def start_scheduler():
     scheduler_thread.daemon = True
     scheduler_thread.start()
     
-    logger.info("Email sync and token refresh scheduler started")
+    logger.info("Email sync (every 30s) and token refresh scheduler started")

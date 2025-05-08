@@ -1,7 +1,5 @@
-# backend/app/api/api.py
 from fastapi import APIRouter, Response
 
-# Add uploads, categories, and reports to the import
 from app.api.endpoints import auth, users, agents, tasks, teams, companies, microsoft, profile, workspaces, comments, activities, uploads, categories, reports
 
 api_router = APIRouter()
@@ -15,12 +13,11 @@ api_router.include_router(microsoft.router, prefix="/microsoft", tags=["microsof
 api_router.include_router(profile.router, tags=["profile"])
 api_router.include_router(workspaces.router, prefix="/workspaces", tags=["workspaces"])
 api_router.include_router(comments.router, tags=["comments"])
-api_router.include_router(activities.router, tags=["activities"]) # Include activities router
-api_router.include_router(uploads.router, prefix="/uploads", tags=["uploads"]) # Include uploads router
-api_router.include_router(categories.router, prefix="/categories", tags=["categories"]) # Include categories router
-api_router.include_router(reports.router, prefix="/reports", tags=["reports"]) # Include reports router
+api_router.include_router(activities.router, tags=["activities"])
+api_router.include_router(uploads.router, prefix="/uploads", tags=["uploads"])
+api_router.include_router(categories.router, prefix="/categories", tags=["categories"])
+api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 
-# Simple health check endpoint directly in the main router
 @api_router.get("/health", tags=["health"])
 async def health_check():
     """

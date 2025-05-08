@@ -24,8 +24,8 @@ class Task(Base):
     title = Column(String(255), nullable=False)
     # Description can now be used for manual descriptions or summaries
     description = Column(Text, nullable=True)
-    # Add 'With User' and 'In Progress' to status Enum
-    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', name='ticket_status'), default='Unread', nullable=False)
+    # Add 'With User', 'In Progress', and 'Resolved' to status Enum
+    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', 'Resolved', name='ticket_status'), default='Unread', nullable=False) # Added 'Resolved'
     # Add 'Critical' to the Enum definition
     priority = Column(Enum('Low', 'Medium', 'High', 'Critical', name='ticket_priority'), default='Medium', nullable=False)
     assignee_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
@@ -33,6 +33,7 @@ class Task(Base):
     due_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+    last_update = Column(DateTime, nullable=True)
     sent_from_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     sent_to_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)

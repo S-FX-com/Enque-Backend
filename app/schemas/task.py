@@ -19,6 +19,7 @@ class TaskStatus(str, PyEnum):
     WITH_USER = "With User" # Added
     IN_PROGRESS = "In Progress" # Added
     CLOSED = "Closed"
+    RESOLVED = "Resolved" # Added Resolved
 
 
 class TaskPriority(str, PyEnum):
@@ -134,21 +135,22 @@ class TicketInDBBase(BaseModel):
     status: TaskStatus
     priority: TaskPriority
     assignee_id: Optional[int] = None
-    team_id: Optional[int] = None
+    # team_id is defined once below
     due_date: Optional[datetime] = None
-    sent_from_id: Optional[int] = None
-    sent_to_id: Optional[int] = None
-    user_id: int
-    company_id: Optional[int] = None
-    workspace_id: int
+    # sent_from_id is defined once below
+    # sent_to_id is defined once below
+    user_id: Optional[int] = None # Changed to Optional
+    # company_id is defined once below
+    workspace_id: int # workspace_id should probably be Optional[int] = None if it can be None
     team_id: Optional[int] = None
     company_id: Optional[int] = None
-    user_id: int
+    # user_id: int # Duplicate removed
     sent_from_id: Optional[int] = None
     sent_to_id: Optional[int] = None
     category_id: Optional[int] = None # Add category_id
     created_at: datetime
     updated_at: datetime
+    last_update: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     
     class Config:

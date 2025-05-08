@@ -1,4 +1,5 @@
 from typing import Any, List
+from datetime import datetime # Import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload # Re-import joinedload
@@ -76,33 +77,38 @@ async def create_comment(
     """
     Create a new comment for a task
     """
-    # Verificar que la tarea existe (using model alias)
-    task = db.query(TaskModel).filter(TaskModel.id == task_id, TaskModel.is_deleted == False).first()
+    # Verify task exists and belongs to the workspace
+    task = db.query(TaskModel).filter(
+        TaskModel.id == task_id, 
+        TaskModel.workspace_id == current_user.workspace_id, 
+        TaskModel.is_deleted == False
+    ).first()
     if not task:
-        # Ensure the task belongs to the agent's workspace before allowing comment creation
-        # This check might be redundant if task creation enforces workspace, but good practice.
-        if task.workspace_id != current_user.workspace_id:
-             logger.error(f"Attempt to create comment on task {task_id} from different workspace ({task.workspace_id}) by agent {current_user.id} in workspace {current_user.workspace_id}.")
-             raise HTTPException(
-                 status_code=status.HTTP_403_FORBIDDEN,
-                 detail="Cannot comment on tasks outside your workspace.",
-             )
+        # Check workspace first for security
+        task_check = db.query(TaskModel.id, TaskModel.workspace_id).filter(TaskModel.id == task_id).first()
+        if task_check and task_check.workspace_id != current_user.workspace_id:
+            logger.error(f"Attempt to create comment on task {task_id} from different workspace by agent {current_user.id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot comment on tasks outside your workspace.",
+            )
+        # If task doesn't exist or belongs to workspace but is deleted
+        logger.error(f"Task {task_id} not found or is deleted in workspace {current_user.workspace_id} when creating comment.")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
     
-    # Crear el comentario
-    # Ensure workspace_id is available on the current_user (Agent) object
-    if not hasattr(current_user, 'workspace_id') or not current_user.workspace_id:
-         # Log an error and potentially raise an exception if workspace_id is missing
+    # Check agent workspace_id
+    if not current_user.workspace_id:
          logger.error(f"Agent {current_user.id} ({current_user.email}) is missing workspace_id. Cannot create comment.")
          raise HTTPException(
              status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
              detail="Agent configuration error: Missing workspace ID.",
          )
 
-    comment = CommentModel( # Use model alias
+    # Create the comment
+    comment = CommentModel(
         ticket_id=task_id,
         agent_id=current_user.id,
         workspace_id=current_user.workspace_id,
@@ -110,8 +116,12 @@ async def create_comment(
         is_private=comment_in.is_private
     )
     db.add(comment)
+    task.last_update = datetime.utcnow()
+    db.add(task)
     db.commit()
-    db.refresh(comment) # Refresh comment to get ID etc.
+    db.refresh(comment)
+    db.refresh(task)
+    logger.info(f"Comment {comment.id} created for task {task_id}. Task last_update set to {task.last_update}.")
 
     # --- Automatic Status and Assignment Update Logic ---
     if not comment.is_private and current_user.role in ["agent", "admin", "manager"]: # Check roles allowed to auto-assign/update status

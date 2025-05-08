@@ -20,6 +20,7 @@ from app.utils.logger import logger
 # Import update_task service function and Microsoft service
 from app.services.task_service import update_task # Assuming update_task is here
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
+from datetime import datetime # Import datetime
 
 router = APIRouter()
 
@@ -128,6 +129,12 @@ async def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
+    
+    task.last_update = task.created_at 
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    logger.info(f"Task {task.id} created. Initial last_update set to {task.last_update}.")
 
     # --- Log Activity ---
     try:
@@ -316,7 +323,6 @@ async def delete_task(
         )
 
     # Soft delete (mark as deleted)
-    from datetime import datetime
     task.is_deleted = True
     task.deleted_at = datetime.utcnow()
 
