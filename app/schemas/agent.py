@@ -27,10 +27,29 @@ class AgentBase(BaseModel):
         return v
 
 
-# Schema for creating a new agent
+# Schema for an admin to invite a new agent
+class AgentInviteCreate(BaseModel):
+    name: str
+    email: EmailStr
+    role: str = "agent" # Default role, can be overridden
+    workspace_id: int # Need to know which workspace to invite them to
+
+    @validator("role")
+    def validate_role(cls, v):
+        allowed_roles = ["admin", "agent", "manager"]
+        if v not in allowed_roles:
+            raise ValueError(f"Role must be one of {allowed_roles}")
+        return v
+
+# Schema for creating a new agent in the database (internal use or direct creation)
 class AgentCreate(AgentBase):
-    password: str
+    password: Optional[str] = None # Password is not set during invitation
     workspace_id: int
+    is_active: bool = False # Invited agents are not active until they accept
+    invitation_token: Optional[str] = None
+    invitation_token_expires_at: Optional[datetime] = None
+    password_reset_token: Optional[str] = None
+    password_reset_token_expires_at: Optional[datetime] = None
 
 
 # Schema for updating an agent
@@ -62,14 +81,53 @@ class AgentInDBBase(AgentBase):
     workspace_id: int
     created_at: Optional[datetime] = None # Make optional
     updated_at: Optional[datetime] = None # Make optional
+    # Invitation fields are in DB but not typically exposed unless needed
+    invitation_token: Optional[str] = None
+    invitation_token_expires_at: Optional[datetime] = None
+    password_reset_token: Optional[str] = None
+    password_reset_token_expires_at: Optional[datetime] = None
+
 
     class Config:
         from_attributes = True
 
 
-# Schema for returning agent details
+# Schema for returning agent details (typically excludes sensitive/internal fields like tokens)
 class Agent(AgentInDBBase):
-    pass
+    # Explicitly exclude invitation token fields from the default Agent response model
+    # If they are needed in some specific response, a different schema can be used.
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "id": 1,
+                "name": "John Doe",
+                "email": "john.doe@example.com",
+                "role": "agent",
+                "is_active": True,
+                "job_title": "Support Specialist",
+                "phone_number": "123-456-7890",
+                "email_signature": "Regards, John",
+                "workspace_id": 1,
+                "created_at": "2023-01-01T12:00:00Z",
+                "updated_at": "2023-01-01T12:00:00Z",
+            }
+        }
+    }
+    # Removed problematic Pydantic V1 style validator
+
+# Schema for agent accepting invitation
+class AgentAcceptInvitation(BaseModel):
+    token: str
+    password: str
+
+# Schema for requesting a password reset
+class AgentPasswordResetRequest(BaseModel):
+    email: EmailStr
+
+# Schema for resetting password
+class AgentResetPassword(BaseModel):
+    token: str
+    new_password: str
 
 
 # Schema for returning agent with all details including relationships

@@ -17,7 +17,8 @@ class Team(Base):
     workspace = relationship("Workspace", back_populates="teams")
     # Add cascade="all, delete-orphan" to automatically delete members when a team is deleted
     members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
-    tasks = relationship("Task", back_populates="team")
+    # Add cascade to delete tasks associated with the team
+    tasks = relationship("Task", back_populates="team", cascade="all, delete-orphan")
 
 
 class TeamMember(Base):

@@ -7,7 +7,7 @@ from sqlalchemy import or_ # Import 'or_' for OR condition
 # Import dependencies
 from app.api.dependencies import get_current_active_user, get_current_active_admin_or_manager
 from app.database.session import get_db
-from app.models.task import Task
+from app.models.task import Task, TicketBody
 from app.models.agent import Agent
 from app.models.user import User # Import User model
 from app.models.team import TeamMember # Import TeamMember for filtering
@@ -50,31 +50,14 @@ async def read_tasks(
         Task.is_deleted == False
     )
 
-    # Apply role-based filtering first
-    if current_user.role in ["admin", "manager"]:
-        # Admins and Managers see all tasks in the workspace
-        query = base_query
-    elif current_user.role == "agent":
-        # Agents see tasks assigned to them OR their teams
-        # Get IDs of teams the agent belongs to
-        agent_team_ids = db.query(TeamMember.team_id).filter(
-            TeamMember.agent_id == current_user.id
-        ).distinct().all()
-        # Extract just the IDs
-        team_ids = [t[0] for t in agent_team_ids]
+    # For "All Tickets" view, all authenticated users in the workspace can see all tickets.
+    # Specific filtering for "My Tickets" (e.g., assigned to self or team) should be handled by a different endpoint or query parameters.
+    # The current dependency get_current_active_user already ensures the user is active and belongs to a workspace.
+    # The base_query already filters by current_user.workspace_id.
+    
+    query = base_query # All active users in the workspace see all tasks of that workspace.
 
-        # Filter tasks: assigned to agent OR assigned to one of the agent's teams
-        query = base_query.filter(
-            or_(
-                Task.assignee_id == current_user.id,
-                Task.team_id.in_(team_ids) # Check if task's team_id is in the agent's team list
-            )
-        )
-    else:
-        # Should not happen with current roles, but handle defensively
-        raise HTTPException(status_code=403, detail="User role not recognized for task access.")
-
-    # Apply optional filters to the role-filtered query
+    # Apply optional filters to the query
     if subject:
         # Use ilike for case-insensitive contains search
         query = query.filter(Task.title.ilike(f"%{subject}%"))
@@ -104,6 +87,57 @@ async def read_tasks(
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
     return tasks
+
+
+# Endpoint for ticket search - MOVED BEFORE /{task_id} endpoint
+@router.get("/search", response_model=List[TaskWithDetails])
+async def search_tickets(
+    q: str = Query(..., description="Search term to find in ticket title, description or body"),
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 50,
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Search for tickets containing the search term in title, description or body.
+    """
+    # Base query for tickets in current workspace and not deleted
+    base_query = db.query(Task).filter(
+        Task.workspace_id == current_user.workspace_id,
+        Task.is_deleted == False
+    )
+    
+    # Apply search on title, description and body
+    search_term = f"%{q}%"  # Search term with wildcards for LIKE
+    
+    # Use join and OR condition to search across related tables
+    query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
+        or_(
+            Task.title.ilike(search_term),
+            Task.description.ilike(search_term),
+            TicketBody.email_body.ilike(search_term)
+        )
+    )
+    
+    # Load relationships with eager loading
+    query = query.options(
+        joinedload(Task.sent_from),
+        joinedload(Task.sent_to),
+        joinedload(Task.assignee),
+        joinedload(Task.user),
+        joinedload(Task.team),
+        joinedload(Task.company),
+        joinedload(Task.category),
+        joinedload(Task.body)
+    )
+    
+    # Order by creation date and apply pagination
+    tickets = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    
+    # Log the search
+    logger.info(f"Ticket search: term='{q}', results={len(tickets)}, user_id={current_user.id}")
+    
+    return tickets
 
 
 @router.post("/", response_model=TaskSchema)

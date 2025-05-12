@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "temporarysecret"  # Valor predeterminado temporal
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    AGENT_INVITATION_TOKEN_EXPIRE_HOURS: int = 72 # Agent invitation token validity in hours
+    PASSWORD_RESET_TOKEN_EXPIRE_HOURS: int = 2 # Password reset token validity in hours
+
 
     # Database Configuration
     MYSQL_HOST: Optional[str] = None
@@ -76,7 +79,10 @@ class Settings(BaseSettings):
     
     # Base URL for API
     API_BASE_URL: str = "https://enque-backend-production.up.railway.app"
-    
+
+    # System Email Sender
+    SYSTEM_SENDER_EMAIL: str = "noreply@enque.cc" # Default system sender email, ensure this mailbox exists or app has send-as permission
+
     # Token Management
     CLEANUP_OLD_TOKENS: bool = True  # Limpiar tokens antiguos excepto los 5 más recientes
 

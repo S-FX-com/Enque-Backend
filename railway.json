@@ -12,4 +12,4 @@
     "restartPolicyMaxRetries": 5,
     "numReplicas": 1
   }
-}
+} 
