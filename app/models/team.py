@@ -9,7 +9,9 @@ class Team(Base):
     name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
     logo_url = Column(String(255), nullable=True)
+    icon_name = Column(String(50), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    manager_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     
@@ -19,6 +21,7 @@ class Team(Base):
     members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
     # Add cascade to delete tasks associated with the team
     tasks = relationship("Task", back_populates="team", cascade="all, delete-orphan")
+    manager = relationship("Agent", foreign_keys=[manager_id])
 
 
 class TeamMember(Base):

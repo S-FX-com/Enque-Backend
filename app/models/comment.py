@@ -1,7 +1,6 @@
 from sqlalchemy import Column, Integer, Text, DateTime, ForeignKey, func, Boolean
 from sqlalchemy.orm import relationship
 from app.database.base_class import Base
-
 class Comment(Base):
     __tablename__ = "comments"
 
@@ -18,3 +17,4 @@ class Comment(Base):
     ticket = relationship("Task", back_populates="comments")
     agent = relationship("Agent", back_populates="comments")
     workspace = relationship("Workspace", back_populates="comments")
+    attachments = relationship("TicketAttachment", back_populates="comment", cascade="all, delete-orphan")

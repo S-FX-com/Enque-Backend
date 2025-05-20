@@ -2,6 +2,7 @@ from app.core.config import settings
 from app.services.microsoft_service import MicrosoftGraphService # Assuming this service can send mail
 from app.utils.logger import logger
 from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB session
+from typing import Optional
 
 # Placeholder for a more sophisticated HTML email template system
 def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url: str) -> str:
@@ -264,4 +265,139 @@ async def send_password_reset_email( # Changed to async
             return False
     except Exception as e:
         logger.error(f"Exception in send_password_reset_email for {to_email} from {sender_mailbox_email}: {e}", exc_info=True)
+        return False
+
+def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_title: str, ticket_link: str) -> str:
+    """
+    Generates an HTML content for the ticket assignment notification email.
+    """
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>New Ticket Assigned</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+                margin: 0;
+                padding: 20px;
+                background-color: #f4f4f7;
+                color: #333;
+            }}
+            .container {{
+                background-color: #ffffff;
+                max-width: 600px;
+                margin: 20px auto;
+                padding: 30px;
+                border-radius: 8px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                text-align: left;
+            }}
+            .logo-container {{
+                text-align: center;
+                margin-bottom: 25px;
+            }}
+            .logo-container img {{
+                max-width: 150px;
+                height: auto;
+            }}
+            p {{
+                font-size: 16px;
+                line-height: 1.6;
+                margin-bottom: 1em;
+            }}
+            a.button {{
+                display: inline-block;
+                background-color: #007bff;
+                color: #ffffff;
+                padding: 12px 25px;
+                text-decoration: none;
+                border-radius: 5px;
+                font-weight: bold;
+                margin-top: 10px;
+                margin-bottom: 20px;
+            }}
+            .footer {{
+                font-size: 14px;
+                color: #777;
+                margin-top: 25px;
+            }}
+            .ticket-info {{
+                background-color: #f8f9fa;
+                border-left: 4px solid #007bff;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 4px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="logo-container">
+                <img src="{settings.FRONTEND_URL}/enque.png" alt="Enque Logo">
+            </div>
+            <p>Hello {agent_name},</p>
+            <p>You have been assigned a new ticket in Enque:</p>
+            
+            <div class="ticket-info">
+                <p><strong>Ticket ID:</strong> {ticket_id}</p>
+                <p><strong>Subject:</strong> {ticket_title}</p>
+            </div>
+            
+            <p style="text-align: center;">
+                <a href="{ticket_link}" class="button">View Ticket</a>
+            </p>
+            
+            <p class="footer">
+                Best regards,<br>
+                The Enque Team
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
+
+async def send_ticket_assignment_email(
+    db: Session,
+    to_email: str,
+    agent_name: str,
+    ticket_id: int,
+    ticket_title: str,
+    sender_mailbox_email: str,
+    user_access_token: str,
+    request_origin: Optional[str] = None
+) -> bool:
+    """
+    Sends a notification email to an agent when a ticket is assigned to them.
+    """
+    subject = f"[ID:{ticket_id}] New ticket assigned: {ticket_title}"
+    
+    # Use the origin URL if provided, otherwise fallback to settings.FRONTEND_URL
+    base_url = request_origin if request_origin else settings.FRONTEND_URL
+    ticket_link = f"{base_url}/tickets?openTicket={ticket_id}"
+    
+    html_content = create_ticket_assignment_email_html(agent_name, ticket_id, ticket_title, ticket_link)
+
+    try:
+        graph_service = MicrosoftGraphService(db=db)
+
+        success = await graph_service.send_email_with_user_token(
+            user_access_token=user_access_token,
+            sender_mailbox_email=sender_mailbox_email,
+            recipient_email=to_email,
+            subject=subject,
+            html_body=html_content,
+            task_id=ticket_id
+        )
+        if success:
+            logger.info(f"Ticket assignment email sent successfully to {to_email} from {sender_mailbox_email}")
+            return True
+        else:
+            logger.error(f"Failed to send ticket assignment email to {to_email} using MicrosoftGraphService.send_email_with_user_token from {sender_mailbox_email}")
+            return False
+    except Exception as e:
+        logger.error(f"Exception in send_ticket_assignment_email for {to_email}: {e}", exc_info=True)
         return False

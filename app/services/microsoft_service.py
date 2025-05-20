@@ -6,25 +6,27 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig, MailboxConnection
 from app.schemas.microsoft import EmailData, EmailAddress, EmailAttachment, MicrosoftTokenCreate, EmailTicketMappingCreate
-from app.schemas.task import TaskStatus # Import TaskStatus Enum
-from app.models.task import Task
+from app.schemas.task import TaskStatus 
+from app.models.task import Task, TicketBody
 from app.models.agent import Agent
 from app.models.user import User
 from app.models.comment import Comment
 from app.models.activity import Activity
 from app.models.workspace import Workspace
-from app.models.task import Task, TicketBody
+from app.models.ticket_attachment import TicketAttachment
 from app.services.utils import get_or_create_user
 from app.utils.logger import logger, log_important
 import base64
-import json # Ensure json is imported
+import json 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
-import httpx # Moved import to top level
-# Removed unused import: get_current_active_user
+import httpx 
 from urllib.parse import urlencode
-
-
+import uuid
+import time
+from sqlalchemy import or_, and_, desc
+import re
+from app.utils.image_processor import extract_base64_images  
 class MicrosoftGraphService:
     """Service for interacting with Microsoft Graph API"""
 
@@ -80,13 +82,12 @@ class MicrosoftGraphService:
         except Exception as e:
             logger.error(f"Failed to get application token: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get application token: {str(e)}")
-
     def get_auth_url(
         self,
         redirect_uri: Optional[str] = None,
         scopes: Optional[List[str]] = None,
         state: Optional[str] = None,
-        prompt: Optional[str] = "consent" # Default prompt
+        prompt: Optional[str] = "consent" 
     ) -> str:
         """Get the URL for Microsoft OAuth authentication flow, allowing custom redirect URI, scopes, state and prompt."""
         if not self.integration and not self.has_env_config:
@@ -142,23 +143,35 @@ class MicrosoftGraphService:
             mailbox_email = user_info.get("mail")
             if not mailbox_email:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not get email address from Microsoft user info")
-            workspace_id: Optional[int] = None; agent_id: Optional[int] = None
+            workspace_id: Optional[int] = None
+            agent_id: Optional[int] = None
+            connection_id: Optional[int] = None  # Added for reconnection flow
+            is_reconnect: bool = False  # Flag to indicate reconnection
+            
             if state:
                 try:
                     missing_padding = len(state) % 4
                     if missing_padding: state += '=' * (4 - missing_padding)
                     decoded_state_json = base64.urlsafe_b64decode(state).decode('utf-8')
                     state_data = json.loads(decoded_state_json)
-                    ws_id_str = state_data.get('workspace_id'); ag_id_str = state_data.get('agent_id')
+                    ws_id_str = state_data.get('workspace_id')
+                    ag_id_str = state_data.get('agent_id')
+                    conn_id_str = state_data.get('connection_id')  # Extract connection_id from state
+                    is_reconnect_str = state_data.get('is_reconnect')  # Extract reconnect flag
+                    
                     if ws_id_str: workspace_id = int(ws_id_str)
                     if ag_id_str: agent_id = int(ag_id_str)
-                    logger.info(f"Extracted from Base64 state: workspace_id={workspace_id}, agent_id={agent_id}")
+                    if conn_id_str: connection_id = int(conn_id_str)
+                    if is_reconnect_str and is_reconnect_str.lower() == 'true': is_reconnect = True
+                    
+                    logger.info(f"Extracted from Base64 state: workspace_id={workspace_id}, agent_id={agent_id}, connection_id={connection_id}, is_reconnect={is_reconnect}")
                 except Exception as decode_err:
                     logger.error(f"Failed to decode/parse Base64 state parameter '{state}': {decode_err}")
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state parameter format.")
             else:
                  logger.error("State parameter is missing in exchange_code_for_token.")
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="State parameter is required.")
+                 
             if not workspace_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID missing or invalid in state parameter.")
             if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter.")
             current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
@@ -166,12 +179,43 @@ class MicrosoftGraphService:
             workspace = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
             if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
             if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+            
             if needs_integration:
                 self.integration = MicrosoftIntegration(
                     tenant_id=tenant_id, client_id=client_id, client_secret=client_secret,
                     redirect_uri=settings.MICROSOFT_REDIRECT_URI, scope=scope, is_active=True)
                 self.db.add(self.integration); self.db.commit(); self.db.refresh(self.integration)
-            mailbox_connection = self.db.query(MailboxConnection).filter(MailboxConnection.email == mailbox_email, MailboxConnection.workspace_id == workspace.id).first()
+            mailbox_connection = None
+            if is_reconnect and connection_id:
+
+                mailbox_connection = self.db.query(MailboxConnection).filter(
+                    MailboxConnection.id == connection_id,
+                    MailboxConnection.workspace_id == workspace_id
+                ).first()
+                
+                if not mailbox_connection:
+                    logger.error(f"Could not find mailbox connection with ID {connection_id} for workspace {workspace_id}")
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Mailbox connection with ID {connection_id} not found")
+                if mailbox_connection.email != mailbox_email:
+                    logger.info(f"Updating email address for connection {connection_id} from {mailbox_connection.email} to {mailbox_email}")
+                    mailbox_connection.email = mailbox_email
+                    mailbox_connection.display_name = user_info.get("displayName", "Microsoft User")
+                old_tokens = self.db.query(MicrosoftToken).filter(
+                    MicrosoftToken.mailbox_connection_id == mailbox_connection.id
+                ).all()
+                
+                if old_tokens:
+                    for old_token in old_tokens:
+                        self.db.delete(old_token)
+                    logger.info(f"Deleted {len(old_tokens)} old token(s) for mailbox connection {connection_id}")
+                
+                self.db.commit()
+            else:
+                mailbox_connection = self.db.query(MailboxConnection).filter(
+                    MailboxConnection.email == mailbox_email, 
+                    MailboxConnection.workspace_id == workspace.id
+                ).first()
+                
             if not mailbox_connection:
                 mailbox_connection = MailboxConnection(
                     email=mailbox_email, display_name=user_info.get("displayName", "Microsoft User"),
@@ -182,12 +226,21 @@ class MicrosoftGraphService:
                 access_token=token_data["access_token"], refresh_token=refresh_token_val, token_type=token_data["token_type"],
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"]))
             self.db.add(token); self.db.commit(); self.db.refresh(token)
-            existing_config = self.db.query(EmailSyncConfig).filter(EmailSyncConfig.mailbox_connection_id == mailbox_connection.id, EmailSyncConfig.workspace_id == workspace.id).first()
+            existing_config = self.db.query(EmailSyncConfig).filter(
+                EmailSyncConfig.mailbox_connection_id == mailbox_connection.id, 
+                EmailSyncConfig.workspace_id == workspace.id
+            ).first()
+            
             if not existing_config:
                 new_config = EmailSyncConfig(
                     integration_id=self.integration.id, mailbox_connection_id=mailbox_connection.id, folder_name="Inbox",
                     sync_interval=1, default_priority="Medium", auto_assign=False, workspace_id=workspace.id, is_active=True)
                 self.db.add(new_config); self.db.commit()
+            elif not existing_config.is_active:
+                existing_config.is_active = True
+                self.db.add(existing_config); self.db.commit()
+                
+            logger.info(f"Successfully {'reconnected' if is_reconnect else 'connected'} mailbox {mailbox_email} for workspace {workspace_id}")
             return token
         except Exception as e:
             logger.error(f"Error exchanging code for token: {e}", exc_info=True)
@@ -309,11 +362,17 @@ class MicrosoftGraphService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get user info: {str(e)}")
 
     def _process_html_body(self, html_content: str, attachments: List[EmailAttachment], context: str = "email") -> str:
-        if not html_content or not attachments: return html_content
+        """Process HTML content to handle things like CID-referenced images."""
+        if not html_content:
+            return html_content
+            
         processed_html = html_content
+        
         try:
+            # 1. Primero, manejamos las imágenes CID (inline attachments)
             soup = BeautifulSoup(processed_html, 'html.parser')
             cid_map = {str(att.contentId): att for att in attachments if att.is_inline and att.contentId and att.contentBytes}
+            
             if cid_map:
                 image_tags_updated = 0
                 for img_tag in soup.find_all('img'):
@@ -322,16 +381,35 @@ class MicrosoftGraphService:
                         cid_value = str(src[4:].strip('<>'))
                         matching_attachment = cid_map.get(cid_value)
                         if matching_attachment:
-                            content_type = matching_attachment.content_type; base64_data = matching_attachment.contentBytes
+                            content_type = matching_attachment.content_type
+                            base64_data = matching_attachment.contentBytes
                             if content_type and base64_data:
-                                img_tag['src'] = f"data:{content_type};base64,{base64_data}"; image_tags_updated += 1
-                if image_tags_updated > 0: processed_html = str(soup); logger.info(f"Processed HTML for {context}, updated {image_tags_updated} image tags.")
-        except Exception as e: logger.error(f"Error processing HTML for CIDs ({context}): {e}", exc_info=True); processed_html = html_content
-        return processed_html
+                                img_tag['src'] = f"data:{content_type};base64,{base64_data}"
+                                image_tags_updated += 1
+                
+                if image_tags_updated > 0:
+                    processed_html = str(soup)
+                    logger.info(f"Processed HTML for {context}, updated {image_tags_updated} CID image tags.")
+            ticket_id = None
+            if 'ticket' in context:
+                match = re.search(r'ticket\s+(\d+)', context)
+                if match:
+                    ticket_id = int(match.group(1))
+
+            if ticket_id:
+                processed_html, extracted_images = extract_base64_images(processed_html, ticket_id)
+                if extracted_images:
+                    logger.info(f"Extracted {len(extracted_images)} base64 images from {context} for ticket {ticket_id}")
+            
+            return processed_html
+            
+        except Exception as e:
+            logger.error(f"Error processing HTML for {context}: {e}", exc_info=True)
+            return html_content
 
     def sync_emails(self, sync_config: EmailSyncConfig):
         log_important(f"[MAIL SYNC] Starting sync for config ID: {sync_config.id}, Mailbox ID: {sync_config.mailbox_connection_id}")
-        user_email, token = self._get_user_email_for_sync(sync_config) # This calls the sync check_and_refresh_all_tokens
+        user_email, token = self._get_user_email_for_sync(sync_config) 
         if not user_email or not token:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
             return []
@@ -368,9 +446,32 @@ class MicrosoftGraphService:
                         workspace = self.db.query(Workspace).filter(Workspace.id == sync_config.workspace_id).first()
                         if not workspace: logger.error(f"Workspace ID {sync_config.workspace_id} not found for reply. Skipping comment creation."); continue
                         processed_reply_html = self._process_html_body(email.body_content, email.attachments, f"reply email {email.id}")
-                        sender_info_html = f"<p><strong>From:</strong> {reply_user.name} <{reply_user.email}></p><hr>"
-                        final_comment_html = sender_info_html + processed_reply_html
-                        new_comment = Comment(ticket_id=existing_mapping_by_conv.ticket_id, agent_id=system_agent.id, workspace_id=workspace.id, content=final_comment_html)
+                        processed_reply_html = re.sub(r'^<p><strong>From:</strong>.*?</p>', '', processed_reply_html, flags=re.DOTALL | re.IGNORECASE)
+                        special_metadata = f'<original-sender>{reply_user.name}|{reply_user.email}</original-sender>'
+                        
+                        new_comment = Comment(
+                            ticket_id=existing_mapping_by_conv.ticket_id, 
+                            agent_id=system_agent.id,
+                            workspace_id=workspace.id, 
+                            content=special_metadata + processed_reply_html,
+                            is_private=False
+                        )
+                        if email.attachments:
+                            non_inline_attachments = [att for att in email.attachments if not att.is_inline and att.contentBytes]
+                            if non_inline_attachments:
+                                for att in non_inline_attachments:
+                                    try:
+                                        decoded_bytes = base64.b64decode(att.contentBytes)
+                                        db_attachment = TicketAttachment(
+                                            file_name=att.name,
+                                            content_type=att.content_type,
+                                            file_size=att.size,
+                                            content_bytes=decoded_bytes
+                                        )
+                                        new_comment.attachments.append(db_attachment) # SQLAlchemy manejará el comment_id
+                                    except Exception as e:
+                                        logger.error(f"Error al procesar/decodificar adjunto '{att.name}' para comentario en ticket {existing_mapping_by_conv.ticket_id}: {e}", exc_info=True)
+                        
                         self.db.add(new_comment)
                         reply_email_mapping = EmailTicketMapping(
                             email_id=email.id, email_conversation_id=email.conversation_id, ticket_id=existing_mapping_by_conv.ticket_id,
@@ -454,21 +555,51 @@ class MicrosoftGraphService:
             workspace = self.db.query(Workspace).filter(Workspace.id == config.workspace_id).first()
             if not workspace: logger.error(f"Workspace ID {config.workspace_id} not found. Skipping ticket creation."); return None
             due_date = datetime.utcnow() + timedelta(days=3)
+            
+            # Crear el ticket sin descripción inicial
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, mailbox_connection_id=config.mailbox_connection_id)
             self.db.add(task); self.db.flush()
-            processed_html = self._process_html_body(email.body_content, email.attachments, f"new ticket {task.id}")
-            if processed_html: self.db.add(TicketBody(ticket_id=task.id, email_body=processed_html))
+            
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
             self.db.add(activity)
+
+            # Procesar adjuntos si los hay
+            attachments_for_comment = []
             if email.attachments:
-                non_inline_attachments = [att for att in email.attachments if not att.is_inline]
-                if non_inline_attachments:
-                    attachment_list = "\n".join([f"- {att.name} ({att.content_type}, {att.size} bytes)" for att in non_inline_attachments])
-                    attachment_comment = Comment(ticket_id=task.id, agent_id=system_agent.id, workspace_id=workspace.id, content=f"Email contained {len(non_inline_attachments)} non-inline attachment(s):\n\n{attachment_list}")
-                    self.db.add(attachment_comment)
+                non_inline_attachments = [att for att in email.attachments if not att.is_inline and att.contentBytes]
+                for att in non_inline_attachments:
+                    try:
+                        decoded_bytes = base64.b64decode(att.contentBytes)
+                        db_attachment = TicketAttachment(
+                            file_name=att.name,
+                            content_type=att.content_type,
+                            file_size=att.size,
+                            content_bytes=decoded_bytes
+                        )
+                        attachments_for_comment.append(db_attachment)
+                    except Exception as e:
+                        logger.error(f"Error al procesar adjunto '{att.name}' para ticket {task.id}: {e}", exc_info=True)
+
+            processed_html = self._process_html_body(email.body_content, email.attachments, f"new ticket {task.id}")
+            processed_html = re.sub(r'^<p><strong>From:</strong>.*?</p>', '', processed_html, flags=re.DOTALL | re.IGNORECASE)
+            special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
+            initial_comment = Comment(
+                ticket_id=task.id,
+                agent_id=system_agent.id,
+                workspace_id=workspace.id,
+                content=special_metadata + processed_html, 
+                is_private=False
+            )
+            for attachment in attachments_for_comment:
+                initial_comment.attachments.append(attachment)
+                
+            self.db.add(initial_comment)
+            ticket_body = TicketBody(ticket_id=task.id, email_body="")
+            self.db.add(ticket_body)
+                
             return task
         except Exception as e: logger.error(f"Error creating task from email ID {email.id}: {str(e)}", exc_info=True); self.db.rollback(); return None
 
@@ -511,10 +642,6 @@ class MicrosoftGraphService:
         except Exception as e: logger.error(f"Error marking email {message_id} as read for user {user_email}: {str(e)}"); return False
 
     def _get_user_email_for_sync(self, config: EmailSyncConfig = None) -> Tuple[Optional[str], Optional[MicrosoftToken]]:
-        # This method is synchronous, so it cannot call the async version of check_and_refresh_all_tokens_async directly.
-        # The refresh logic should ideally be handled by a background task or an async entry point.
-        # For now, it will rely on tokens being refreshed elsewhere or being valid.
-        # await self.check_and_refresh_all_tokens_async() # Cannot do this here
         token: Optional[MicrosoftToken] = None; mailbox_email: Optional[str] = None
         if config:
             mailbox = self.db.query(MailboxConnection).filter(MailboxConnection.id == config.mailbox_connection_id).first()
@@ -542,10 +669,10 @@ class MicrosoftGraphService:
                     try:
                         token = self.refresh_token(expired_refreshable_token) # Attempt sync refresh
                         logger.info(f"Successfully refreshed token ID: {token.id} synchronously for MailboxConnection ID: {mailbox.id}.")
-                    except HTTPException as e: # Catch HTTPException specifically from refresh_token
+                    except HTTPException as e: 
                         logger.error(f"Synchronous refresh failed for token ID {expired_refreshable_token.id} (MailboxConnection ID: {mailbox.id}): {e.detail}")
-                        token = None # Ensure token is None if refresh fails
-                    except Exception as e: # Catch any other unexpected errors
+                        token = None 
+                    except Exception as e: 
                         logger.error(f"Unexpected error during synchronous refresh for token ID {expired_refreshable_token.id} (MailboxConnection ID: {mailbox.id}): {str(e)}", exc_info=True)
                         token = None
                 else:
@@ -639,7 +766,22 @@ class MicrosoftGraphService:
             return new_message_id
         except Exception as e: logger.error(f"Error moving email {message_id} to folder {folder_id} for user {user_email}: {str(e)}"); return message_id
 
-    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent) -> bool:
+    def _process_html_for_email(self, html_content: str) -> str:
+        """Procesa el HTML para asegurar que los párrafos vacíos tengan la altura adecuada en clientes de correo como Gmail."""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for p_tag in soup.find_all('p'):
+                if not p_tag.get_text(strip=True) and (not p_tag.contents or all(tag.name == 'br' for tag in p_tag.contents if hasattr(tag, 'name'))):
+                    p_tag['style'] = 'margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; display: block;'
+                    if not p_tag.contents:
+                        p_tag.append('\u00A0')  
+            
+            return str(soup)
+        except Exception as e:
+            logger.error(f"Error al procesar HTML para correo electrónico: {str(e)}", exc_info=True)
+            return html_content  # Devolver el HTML original si hay algún error
+
+    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None) -> bool:
         logger.info(f"Attempting to send email reply for task_id: {task_id} by agent: {agent.email}")
         task = self.db.query(Task).options(joinedload(Task.mailbox_connection), joinedload(Task.user)).filter(Task.id == task_id).first()
         if not task: logger.error(f"Task not found for task_id: {task_id}"); return False
@@ -654,43 +796,278 @@ class MicrosoftGraphService:
             logger.error(f"Could not find original email_id in mapping for task_id: {task_id}. Cannot send reply."); return True
         original_message_id = email_mapping.email_id
         logger.info(f"Found original message ID '{original_message_id}' for reply to task {task_id}")
+        reply_content = self._process_html_for_email(reply_content)
+        attachments_data = []
+        if attachment_ids and len(attachment_ids) > 0:
+            # Retrieve attachment data from provided IDs
+            logger.info(f"Processing {len(attachment_ids)} attachment IDs for email reply: {attachment_ids}")
+            for attachment_id in attachment_ids:
+                attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+                if attachment:
+                    # Convert binary content to base64 for MS Graph API
+                    content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                    attachments_data.append({
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": attachment.file_name,
+                        "contentType": attachment.content_type,
+                        "contentBytes": content_b64
+                    })
+                    logger.info(f"Added attachment {attachment.file_name} (ID: {attachment_id}) to email reply")
+                else:
+                    logger.warning(f"Attachment ID {attachment_id} not found when preparing email reply")
+        if not attachments_data:
+            latest_comment = self.db.query(Comment).filter(
+                Comment.ticket_id == task_id,
+                Comment.agent_id == agent.id
+            ).order_by(Comment.created_at.desc()).first()
+            
+            # Check for attachments
+            if latest_comment:
+                attachments = self.db.query(TicketAttachment).filter(
+                    TicketAttachment.comment_id == latest_comment.id
+                ).all()
+                
+                if attachments:
+                    logger.info(f"Found {len(attachments)} attachments for comment ID {latest_comment.id} (fallback method)")
+                    for attachment in attachments:
+                        # Convert binary content to base64 for MS Graph API
+                        content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                        attachments_data.append({
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": attachment.file_name,
+                            "contentType": attachment.content_type,
+                            "contentBytes": content_b64
+                        })
+        
+        # Format the HTML content if needed
         if not reply_content.strip().lower().startswith('<html'):
-             html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 1em 0; }}</style></head><body>{reply_content}</body></html>"
-        else: html_body = reply_content
-        reply_payload = {"comment": html_body}
-        try:
-            reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
-            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
-            logger.debug(f"Sending email reply via endpoint: {reply_endpoint}")
-            response = requests.post(reply_endpoint, headers=headers, json=reply_payload)
-            if response.status_code not in [200, 201, 202]:
-                error_details = "No details available"; 
-                try: error_details = response.json()
-                except ValueError: error_details = response.text
-                logger.error(f"Failed to send email reply for task_id: {task_id}. Status Code: {response.status_code}. Details: {error_details}")
-                response.raise_for_status()
-            logger.info(f"Successfully sent email reply (via /reply endpoint) for task_id: {task_id} to original sender of message {original_message_id}")
-            return True
-        except requests.exceptions.RequestException as e:
-            error_details = "No details available"; status_code = 'N/A'
-            if e.response is not None:
-                status_code = e.response.status_code
-                try: error_details = e.response.json()
-                except ValueError: error_details = e.response.text
-            logger.error(f"Failed to send email reply for task_id: {task_id}. Status Code: {status_code}. Details: {error_details}. Error: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while sending email reply for task_id: {task_id}. Error: {str(e)}", exc_info=True)
-            return False
+             html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{reply_content}</body></html>"
+        else: html_body = reply_content  
+        if attachments_data:
 
-    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str) -> bool:
+            try:
+                create_reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/createReply"
+                headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+                logger.debug(f"Creating draft reply via endpoint: {create_reply_endpoint}")
+
+                response = requests.post(create_reply_endpoint, headers=headers)
+                if response.status_code not in [200, 201, 202]:
+                    error_details = "No details available"
+                    try: error_details = response.json()
+                    except ValueError: error_details = response.text
+                    logger.error(f"Failed to create draft reply for task_id: {task_id}. Status Code: {response.status_code}. Details: {error_details}")
+                    response.raise_for_status()
+
+                draft_message = response.json()
+                draft_id = draft_message.get("id")
+                if not draft_id:
+                    logger.error(f"Failed to get draft ID from createReply response for task_id: {task_id}")
+                    return False
+                original_subject = draft_message.get("subject", "").strip()
+                ticket_id_tag = f"[ID:{task_id}]"
+
+                if ticket_id_tag not in original_subject:
+                    if original_subject.lower().startswith("re:"):
+                        new_subject = f"Re: {ticket_id_tag} {original_subject[3:].strip()}"
+                    else:
+                        new_subject = f"{ticket_id_tag} {original_subject}"
+                    
+                    logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
+                else:
+                    new_subject = original_subject
+                    logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
+                update_payload = {
+                    "subject": new_subject,
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_body
+                    }
+                }
+                
+                update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
+                response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
+                if response.status_code not in [200, 201, 202]:
+                    error_details = "No details available"
+                    try: error_details = response.json()
+                    except ValueError: error_details = response.text
+                    logger.error(f"Failed to update draft message for task_id: {task_id}. Status Code: {response.status_code}. Details: {error_details}")
+                    response.raise_for_status()
+                
+                # Step 4: Add attachments one by one
+                for attachment_data in attachments_data:
+                    attachments_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/attachments"
+                    attachment_response = requests.post(attachments_endpoint, headers=headers, json=attachment_data)
+                    if attachment_response.status_code not in [200, 201, 202]:
+                        logger.warning(f"Failed to add attachment to draft message for task_id: {task_id}. Status Code: {attachment_response.status_code}")
+                    else:
+                        logger.info(f"Successfully added attachment '{attachment_data['name']}' to draft message")
+                
+                # Step 5: Send the message
+                send_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/send"
+                send_response = requests.post(send_endpoint, headers=headers)
+                if send_response.status_code not in [200, 201, 202, 204]:  # 204 No Content is success for this endpoint
+                    error_details = "No details available"
+                    try: error_details = send_response.json()
+                    except ValueError: error_details = send_response.text
+                    logger.error(f"Failed to send draft message for task_id: {task_id}. Status Code: {send_response.status_code}. Details: {error_details}")
+                    send_response.raise_for_status()
+                
+                logger.info(f"Successfully sent email reply with {len(attachments_data)} attachments for task_id: {task_id}")
+                return True
+                
+            except requests.exceptions.RequestException as e:
+                error_details = "No details available"; status_code = 'N/A'
+                if e.response is not None:
+                    status_code = e.response.status_code
+                    try: error_details = e.response.json()
+                    except ValueError: error_details = e.response.text
+                logger.error(f"Failed to send email reply with attachments for task_id: {task_id}. Status Code: {status_code}. Details: {error_details}. Error: {str(e)}")
+                return False
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while sending email reply with attachments for task_id: {task_id}. Error: {str(e)}", exc_info=True)
+                return False
+        else:
+            try:
+                message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}"
+                headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+                
+                response = requests.get(message_endpoint, headers=headers)
+                if response.status_code != 200:
+                    logger.warning(f"Couldn't get original message details for task {task_id}. Falling back to simple reply.")
+                    reply_payload = {"comment": html_body}
+                    reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
+                    response = requests.post(reply_endpoint, headers=headers, json=reply_payload)
+                    response.raise_for_status()
+                    logger.info(f"Successfully sent simple email reply for task_id: {task_id} (without subject modification)")
+                    return True
+                else:
+                    message_data = response.json()
+                    original_subject = message_data.get("subject", "").strip()
+                    ticket_id_tag = f"[ID:{task_id}]"
+                    if ticket_id_tag not in original_subject:
+                        if original_subject.lower().startswith("re:"):
+                            new_subject = f"Re: {ticket_id_tag} {original_subject[3:].strip()}"
+                        else:
+                            new_subject = f"{ticket_id_tag} {original_subject}"
+                        
+                        logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
+                    else:
+                        new_subject = original_subject
+                        logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
+                    
+                    # Create a proper reply message with our modified subject
+                    create_reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/createReply"
+                    response = requests.post(create_reply_endpoint, headers=headers)
+                    response.raise_for_status()
+                    
+                    # Get the draft
+                    draft_message = response.json()
+                    draft_id = draft_message.get("id")
+                    if not draft_id:
+                        logger.error(f"Failed to get draft ID from createReply response for task_id: {task_id}")
+                        return False
+                    
+                    # Update the draft with our content and subject
+                    update_payload = {
+                        "subject": new_subject,
+                        "body": {
+                            "contentType": "HTML",
+                            "content": html_body
+                        }
+                    }
+                    
+                    update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
+                    response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
+                    response.raise_for_status()
+                    
+                    # Send the modified message
+                    send_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/send"
+                    response = requests.post(send_endpoint, headers=headers)
+                    response.raise_for_status()
+                    
+                    logger.info(f"Successfully sent email reply with modified subject for task_id: {task_id}")
+                    return True
+            except requests.exceptions.RequestException as e:
+                error_details = "No details available"; status_code = 'N/A'
+                if e.response is not None:
+                    status_code = e.response.status_code
+                    try: error_details = e.response.json()
+                    except ValueError: error_details = e.response.text
+                
+                # If something fails with our approach, fall back to simple reply
+                logger.warning(f"Failed custom reply approach for task {task_id}. Status Code: {status_code}. Falling back to simple reply.")
+                try:
+                    reply_payload = {"comment": html_body}
+                    reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
+                    response = requests.post(reply_endpoint, headers=headers, json=reply_payload)
+                    response.raise_for_status()
+                    logger.info(f"Successfully sent fallback simple email reply for task_id: {task_id}")
+                    return True
+                except Exception as fallback_error:
+                    logger.error(f"Both custom and fallback reply methods failed for task {task_id}. Error: {str(fallback_error)}")
+                return False
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while sending email reply for task_id: {task_id}. Error: {str(e)}", exc_info=True)
+                return False
+
+    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None) -> bool:
         logger.info(f"Attempting to send new email using app token from: {mailbox_email} to: {recipient_email} with subject: {subject}")
         try: app_token = self.get_application_token()
         except Exception as e: logger.error(f"Failed to get application token for sending new email: {e}"); return False
+        
+        # Procesar el contenido HTML para mejorar compatibilidad con Gmail
+        html_body = self._process_html_for_email(html_body)
+        
+        # Check for attachments if IDs were provided
+        attachments_data = []
+        if attachment_ids and len(attachment_ids) > 0:
+            # Retrieve attachment data
+            for attachment_id in attachment_ids:
+                attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+                if attachment:
+                    content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                    attachments_data.append({
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": attachment.file_name,
+                        "contentType": attachment.content_type,
+                        "contentBytes": content_b64
+                    })
+                    logger.info(f"Added attachment {attachment.file_name} ({attachment.id}) to new email")
+                else:
+                    logger.warning(f"Attachment ID {attachment_id} not found when preparing email")
+        
+        # Format HTML content if needed
+        if not html_body.strip().lower().startswith('<html'):
+            html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{html_body}</body></html>"
+        
+        # If task_id is provided, add it to the subject line in format [ID:XXXXX]
+        original_subject = subject.strip()
+        if task_id:
+            ticket_id_tag = f"[ID:{task_id}]"
+            
+            # Check if the ID tag is already in the subject
+            if ticket_id_tag not in original_subject:
+                new_subject = f"{ticket_id_tag} {original_subject}"
+                logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
+                subject = new_subject
+            else:
+                logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
+        
+        # Prepare basic email payload
         email_payload = {
-            "message": {"subject": subject, "body": {"contentType": "HTML", "content": html_body},
-                        "toRecipients": [{"emailAddress": {"address": recipient_email}}]},
-            "saveToSentItems": "true"}
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": html_body},
+                "toRecipients": [{"emailAddress": {"address": recipient_email}}]
+            },
+            "saveToSentItems": "true"
+        }
+        
+        # Add attachments to payload if any were found
+        if attachments_data:
+            email_payload["message"]["attachments"] = attachments_data
+            logger.info(f"Including {len(attachments_data)} attachments in new email")
+            
         try:
             send_mail_endpoint = f"{self.graph_url}/users/{mailbox_email}/sendMail"
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
@@ -718,9 +1095,30 @@ class MicrosoftGraphService:
 
     async def send_email_with_user_token(
         self, user_access_token: str, sender_mailbox_email: str, recipient_email: str, 
-        subject: str, html_body: str
+        subject: str, html_body: str, task_id: Optional[int] = None
     ) -> bool:
         logger.info(f"Attempting to send new email using user token from: {sender_mailbox_email} to: {recipient_email} with subject: {subject}")
+        
+        # Procesar el contenido HTML para mejorar compatibilidad con Gmail
+        html_body = self._process_html_for_email(html_body)
+        
+        # Format HTML content if needed
+        if not html_body.strip().lower().startswith('<html'):
+            html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{html_body}</body></html>"
+        
+        # If task_id is provided, add it to the subject line in format [ID:XXXXX]
+        original_subject = subject.strip()
+        if task_id:
+            ticket_id_tag = f"[ID:{task_id}]"
+            
+            # Check if the ID tag is already in the subject
+            if ticket_id_tag not in original_subject:
+                new_subject = f"{ticket_id_tag} {original_subject}"
+                logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
+                subject = new_subject
+            else:
+                logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
+        
         email_payload = {
             "message": {"subject": subject, "body": {"contentType": "HTML", "content": html_body},
                         "toRecipients": [{"emailAddress": {"address": recipient_email}}]},

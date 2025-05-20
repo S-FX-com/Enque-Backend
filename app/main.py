@@ -36,6 +36,11 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# Configurar directorio de uploads como contenido estático
+uploads_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
+os.makedirs(uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+
 def allow_origin_regex(origin: str):
     allowed_patterns = [
         r"^https://app\.enque\.cc$",

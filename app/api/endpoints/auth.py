@@ -1,10 +1,10 @@
-from datetime import datetime, timedelta # Ensure datetime is imported
+from datetime import datetime, timedelta 
 from typing import Any, Optional, Dict, List 
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Header, Query 
 from fastapi.responses import RedirectResponse 
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session, joinedload # Added joinedload
+from sqlalchemy.orm import Session, joinedload 
 from jose import jwt, JWTError
 from app.models.workspace import Workspace
 
@@ -62,18 +62,46 @@ async def login_access_token(
             detail=f"User not authorized for workspace ID {requested_workspace_id}",
         )
     logger.info(f"User {user.email} successfully authenticated and authorized for workspace {user.workspace_id}.")
+    
+    user.last_login = datetime.utcnow()
+    origin = None
+
+    origin_header = request.headers.get("origin")
+    if origin_header:
+        origin = origin_header
+        logger.info(f"Setting origin from header for user {user.email}: {origin}")
+    elif request.headers.get("host"):
+        scheme = request.headers.get("x-forwarded-proto", "https")
+        host = request.headers.get("host")
+        origin = f"{scheme}://{host}"
+        logger.info(f"Constructed origin from headers for user {user.email}: {origin}")
+    elif request.headers.get("referer"):
+        origin = request.headers.get("referer")
+        logger.info(f"Using referer as origin for user {user.email}: {origin}")
+    if origin:
+        user.last_login_origin = origin
+    
+    db.add(user)
+    db.commit()
+    
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    extra_data = {
-        "email": user.email, "name": user.name, "role": user.role,
-        "workspace_id": user.workspace_id, 
-        "job_title": user.job_title, "phone_number": user.phone_number,
-        "email_signature": user.email_signature
+    workspace_id_str = str(user.workspace_id)
+    token_payload = {
+        "role": user.role,
+        "workspace_id": workspace_id_str,
+        "name": user.name,
+        "email": user.email
     }
-    token = create_access_token(
-        subject=str(user.id), expires_delta=access_token_expires, extra_data=extra_data
+    access_token = create_access_token(
+        subject=str(user.id),
+        extra_data=token_payload,
+        expires_delta=access_token_expires,
     )
-    logger.info(f"Token generated successfully for user {user.email} in workspace {user.workspace_id}")
-    return {"access_token": token, "token_type": "bearer", "expires_in": int(access_token_expires.total_seconds())}
+    logger.info(f"Generated token for user {user.email} (ID: {user.id}, Workspace: {workspace_id_str})")
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
 
 @router.get("/me", response_model=AgentSchema)
 async def get_current_user(current_user: Agent = Depends(get_current_active_user)) -> Any:
@@ -134,8 +162,6 @@ async def request_password_reset(request_data: AgentPasswordResetRequest, db: Se
     agent.password_reset_token_expires_at = datetime.utcnow() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS)
     db.add(agent); db.commit()
     reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-
-    # Find an admin/manager in the agent's workspace with an active mailbox connection and a token
     admin_sender_mailbox_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
         .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
         .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
@@ -143,7 +169,7 @@ async def request_password_reset(request_data: AgentPasswordResetRequest, db: Se
             Agent.workspace_id == agent.workspace_id,
             Agent.role.in_(['admin', 'manager']),
             MailboxConnection.is_active == True,
-            MicrosoftToken.access_token.isnot(None) # Ensure there's an access token
+            MicrosoftToken.access_token.isnot(None)
         ).order_by(Agent.role.desc()).first()
 
     if not admin_sender_mailbox_info:

@@ -31,6 +31,7 @@ class Workspace(Base):
     comments = relationship("Comment", back_populates="workspace")
     activities = relationship("Activity", back_populates="workspace")
     mailbox_connections = relationship("MailboxConnection", back_populates="workspace")
+    global_signature = relationship("GlobalSignature", back_populates="workspace", uselist=False, cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Workspace {self.name}>" 

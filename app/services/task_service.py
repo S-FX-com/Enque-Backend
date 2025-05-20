@@ -1,21 +1,26 @@
-from typing import List, Optional, Dict, Any
-from sqlalchemy.orm import Session, joinedload # Import joinedload
+from typing import List, Optional, Dict, Any, Tuple
+from sqlalchemy.orm import Session, joinedload 
 from datetime import datetime
 import threading
+import re
+import asyncio
+from uuid import UUID
 
-from app.models.task import Task
+from app.models.task import Task, TicketBody  
 from app.models.microsoft import EmailTicketMapping
-# from app.models.activity import Activity # No longer needed here
-# Import the renamed schemas TicketCreate and TicketUpdate
 from app.schemas.task import TicketCreate, TicketUpdate
 from app.schemas.microsoft import EmailInfo
 from app.utils.logger import logger, log_important
-from app.database.session import SessionLocal # Import SessionLocal
+from app.database.session import SessionLocal 
+from app.models.agent import Agent
+from app.models.microsoft import MailboxConnection, MicrosoftToken
+from app.core.config import settings
+from app.services.email_service import send_ticket_assignment_email
+from app.services.microsoft_service import MicrosoftGraphService
 
 
 def get_tasks(db: Session, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get all tasks"""
-    # Add joinedload for the user relationship
     return db.query(Task).options(joinedload(Task.user)).filter(Task.is_deleted == False).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
 
@@ -24,8 +29,6 @@ def get_task_by_id(db: Session, task_id: int) -> Optional[Dict[str, Any]]:
     task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
     if not task:
         return None
-    
-    # Check if task has email mapping
     email_mapping = db.query(EmailTicketMapping).filter(
         EmailTicketMapping.ticket_id == task.id
     ).first()
@@ -48,43 +51,32 @@ def get_task_by_id(db: Session, task_id: int) -> Optional[Dict[str, Any]]:
     return task_dict
 
 
-def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None) -> Task: # Use TicketCreate
+def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None) -> Task: 
     """Create a new task"""
     task_data = task_in.dict()
-    
-    # Set the current user as the sent_from user if not specified
+
     if not task_data.get('sent_from_id') and current_user_id:
         task_data['sent_from_id'] = current_user_id
     
     task = Task(**task_data)
     db.add(task)
     db.commit()
-    # Refresh the task object to load all attributes from the DB, including description
     db.refresh(task) 
-    # Explicitly load the user relationship as well, as refresh might not load relationships by default
     db.refresh(task, attribute_names=['user']) 
     
-    # --- Removed Activity Logging Logic ---
-    # Activity logging should happen in the endpoint that calls this,
-    # or the endpoint should call this service and pass the necessary user info.
-    # Currently, the endpoint creates the task directly.
 
     return task
 
-
-# Función auxiliar para marcar email como leído en segundo plano
-def _mark_email_read_bg(task_id: int): # Remove db_session argument
+def _mark_email_read_bg(task_id: int): 
     """Marcar email como leído en segundo plano usando una nueva sesión de DB."""
-    db: Session = None # Initialize db to None
+    db: Session = None 
     try:
-        # Create a new session specifically for this thread
         db = SessionLocal()
         if db is None:
              logger.error(f"Failed to create DB session for background task (ticket #{task_id})")
              return
 
         from app.services.microsoft_service import mark_email_as_read_by_task_id
-        # Pass the new session to the service function
         success = mark_email_as_read_by_task_id(db, task_id)
         if success:
             log_important(f"Email successfully marked as read in background for ticket #{task_id}")
@@ -93,42 +85,30 @@ def _mark_email_read_bg(task_id: int): # Remove db_session argument
     except Exception as e:
         logger.error(f"Error in background email marking for ticket #{task_id}: {str(e)}")
     finally:
-        # Ensure the session is closed even if an error occurs
         if db:
             db.close()
 
 
-def update_task(db: Session, task_id: int, task_in: TicketUpdate) -> Optional[Dict[str, Any]]: # Use TicketUpdate
+def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin: Optional[str] = None) -> Optional[Dict[str, Any]]: 
     """Update a task"""
     task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
     if not task:
         return None
-    
-    # Store the old status for comparison
-    old_status = task.status
+    old_assignee_id = task.assignee_id
 
-    # Update task attributes
-    # Use exclude_unset=True to only include fields explicitly provided in the request
     update_data = task_in.dict(exclude_unset=True)
     for field, value in update_data.items():
-        # Pydantic validation ensures fields exist and have correct types (or None if Optional)
-        # The previous change to TicketUpdate schema allows assignee_id to be None
-        # setattr will correctly handle setting assignee_id to None if provided in update_data
         setattr(task, field, value)
 
     db.commit()
     db.refresh(task)
+    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
+    if 'assignee_id' in update_data and old_assignee_id != task.assignee_id and task.assignee_id is not None:
 
-    # Explicitly reload relationships needed by TaskWithDetails after refresh
-    # to ensure they are present in the returned object for serialization.
-    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) # Added 'category'
-
-    # Check if task has email mapping
+        asyncio.create_task(send_assignment_notification(db, task, request_origin))
     email_mapping = db.query(EmailTicketMapping).filter(
         EmailTicketMapping.ticket_id == task.id
     ).first()
-    
-    # Preparar respuesta inmediatamente
     task_dict = task.__dict__.copy()
     task_dict['is_from_email'] = email_mapping is not None
     
@@ -144,24 +124,73 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate) -> Optional[Di
     else:
         task_dict['email_info'] = None
     
-    # Si status cambió de "Unread" a "Open" y tiene email mapping,
-    # marcar el email como leído en Microsoft en segundo plano
-    if email_mapping and old_status == "Unread" and task.status == "Open":
-        log_important(f"Iniciando proceso de marcado de email como leído para ticket #{task.id}")
-        
-        # Crear un hilo para marcar email como leído en segundo plano
-        # Pass only task.id, not the original db session
-        mark_thread = threading.Thread(
-            target=_mark_email_read_bg,
-            args=(task.id,) # Note the comma to make it a tuple
-        )
-        mark_thread.daemon = True  # El hilo se cerrará cuando la aplicación termine
-        mark_thread.start()
+    return task_dict
 
-    # Return the refreshed Task ORM object directly.
-    # FastAPI will serialize it using the TaskWithDetails response_model.
-    # Note: Relationships might need explicit reloading if not handled by refresh/existing loads.
-    return task
+
+async def send_assignment_notification(db: Session, task: Task, request_origin: Optional[str] = None):
+    """
+    Envía una notificación por correo al agente asignado a un ticket.
+    """
+    try:
+
+        if not task.assignee_id or not task.assignee:
+            logger.warning(f"No se pudo enviar notificación para el ticket {task.id}: No hay asignado")
+            return
+        admin_sender_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
+            .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
+            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+            .filter(
+                Agent.workspace_id == task.workspace_id,
+                Agent.role.in_(['admin', 'manager']),
+                MailboxConnection.is_active == True,
+                MicrosoftToken.access_token.isnot(None)
+            ).order_by(Agent.role.desc()).first()
+        
+        if not admin_sender_info:
+            logger.warning(f"No hay administradores con buzón conectado para enviar notificación del ticket {task.id}")
+            return
+        
+        admin, mailbox_connection, ms_token = admin_sender_info
+        if not request_origin:
+            workspace_domain_info = db.query(Agent).filter(
+                Agent.workspace_id == task.workspace_id,
+                Agent.last_login_origin.isnot(None)
+            ).order_by(Agent.last_login.desc()).first()
+            
+            if workspace_domain_info and workspace_domain_info.last_login_origin:
+                request_origin = workspace_domain_info.last_login_origin
+                logger.info(f"Usando último dominio de login para la notificación: {request_origin}")
+            else:
+                request_origin = settings.FRONTEND_URL
+                logger.info(f"Usando dominio predeterminado para la notificación: {request_origin}")
+        current_access_token = ms_token.access_token
+        if ms_token.expires_at < datetime.utcnow():
+            try:
+                logger.info(f"Refrescando token para el buzón {mailbox_connection.email}")
+                graph_service = MicrosoftGraphService(db=db)
+                refreshed_ms_token = await graph_service.refresh_token_async(ms_token)
+                current_access_token = refreshed_ms_token.access_token
+            except Exception as e:
+                logger.error(f"Error al refrescar token para enviar notificación: {e}")
+                return
+        sent = await send_ticket_assignment_email(
+            db=db,
+            to_email=task.assignee.email,
+            agent_name=task.assignee.name,
+            ticket_id=task.id,
+            ticket_title=task.title,
+            sender_mailbox_email=mailbox_connection.email,
+            user_access_token=current_access_token,
+            request_origin=request_origin
+        )
+        
+        if sent:
+            logger.info(f"Notificación enviada al agente {task.assignee.name} ({task.assignee.email}) para el ticket {task.id}")
+        else:
+            logger.error(f"Error al enviar notificación para el ticket {task.id} al agente {task.assignee.email}")
+    
+    except Exception as e:
+        logger.error(f"Error inesperado al enviar notificación para el ticket {task.id}: {e}", exc_info=True)
 
 
 def delete_task(db: Session, task_id: int) -> Optional[Task]:
@@ -169,8 +198,6 @@ def delete_task(db: Session, task_id: int) -> Optional[Task]:
     task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
     if not task:
         return None
-    
-    # Soft delete (mark as deleted)
     task.is_deleted = True
     task.deleted_at = datetime.utcnow()
     

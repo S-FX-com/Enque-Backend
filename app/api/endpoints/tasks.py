@@ -1,13 +1,14 @@
 from typing import Any, List, Optional
+import asyncio  # Importar asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_ # Import 'or_' for OR condition
 
 # Import dependencies
 from app.api.dependencies import get_current_active_user, get_current_active_admin_or_manager
 from app.database.session import get_db
-from app.models.task import Task, TicketBody
+from app.models.task import Task, TicketBody  # Importar TicketBody junto con Task
 from app.models.agent import Agent
 from app.models.user import User # Import User model
 from app.models.team import TeamMember # Import TeamMember for filtering
@@ -18,9 +19,10 @@ from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailI
 # Import logger if needed for activity logging errors
 from app.utils.logger import logger
 # Import update_task service function and Microsoft service
-from app.services.task_service import update_task # Assuming update_task is here
+from app.services.task_service import update_task, send_assignment_notification # Importar función de notificación
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
 from datetime import datetime # Import datetime
+from app.core.config import settings # Import settings
 
 router = APIRouter()
 
@@ -143,6 +145,7 @@ async def search_tickets(
 @router.post("/", response_model=TaskSchema)
 async def create_task(
     task_in: TicketCreate, # Use the renamed schema TicketCreate
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
@@ -187,6 +190,38 @@ async def create_task(
         db.rollback() # Rollback activity commit if it failed
     # --- End Log Activity ---
 
+    # --- Send Email Notification for Assigned Ticket ---
+    if task.assignee_id and task.assignee_id != current_user.id:
+        # Obtener la URL de origen para usar el subdominio correcto
+        origin_url = None
+        
+        # 1. Intenta obtener origin de los headers
+        origin_header = request.headers.get("origin")
+        if origin_header:
+            origin_url = origin_header
+            logger.info(f"Using origin header for notification: {origin_url}")
+        
+        # 2. Si no hay origin en headers, intenta obtener host y esquema
+        elif request.headers.get("host"):
+            scheme = request.headers.get("x-forwarded-proto", "https")
+            host = request.headers.get("host")
+            origin_url = f"{scheme}://{host}"
+            logger.info(f"Constructed origin from host header: {origin_url}")
+        
+        # 3. Si todo falla, usa la URL frontend de settings
+        if not origin_url:
+            origin_url = settings.FRONTEND_URL
+            logger.info(f"Using settings.FRONTEND_URL as fallback: {origin_url}")
+            
+        # Si el ticket se ha creado con un agente asignado y no es el creador, enviar notificación
+        try:
+            # Lanzar tarea en segundo plano para enviar la notificación
+            asyncio.create_task(send_assignment_notification(db, task, request_origin=origin_url))
+            logger.info(f"Notificación de asignación programada para ticket {task.id} al agente {task.assignee_id}")
+        except Exception as e:
+            logger.error(f"Error al programar la notificación de asignación para ticket {task.id}: {str(e)}")
+    # --- End Assignment Notification ---
+
     # --- Send Email for Manually Created Ticket ---
     if task.description and task.user: # Check if description exists and user is loaded
         try:
@@ -219,7 +254,8 @@ async def create_task(
                          mailbox_email=sender_mailbox,
                          recipient_email=recipient_email,
                          subject=subject,
-                         html_body=html_body
+                         html_body=html_body,
+                         task_id=task.id  # Pass the task ID to include in the subject
                      )
                      if not email_sent:
                          logger.error(f"Failed to send new ticket email for task {task.id}")
@@ -276,12 +312,13 @@ async def read_task(
 async def update_task_endpoint(
     task_id: int,
     task_in: TicketUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     # Inject the basic active user dependency
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Update a task. Requires admin/manager role to change assignee or team.
+    Update a task. All roles (admin, manager, agent) can update all fields including assignee and team.
     """
     # Fetch the task ensuring it belongs to the user's workspace
     task = db.query(Task).filter(
@@ -296,37 +333,19 @@ async def update_task_endpoint(
             detail="Task not found",
         )
 
-    # Check permissions *before* calling the service function
-    is_changing_assignment = task_in.assignee_id is not None or task_in.team_id is not None
-    if is_changing_assignment and current_user.role not in ["admin", "manager"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin or Manager role required to change task assignment.",
-        )
-
-    # --- Optional: Further permission checks ---
-    # Example: Allow agent to only update status/priority if assigned
-    # if current_user.role == 'agent' and task.assignee_id != current_user.id:
-    #     allowed_updates_for_agent = {'status', 'priority'}
-    #     update_keys = set(task_in.dict(exclude_unset=True).keys())
-    #     # Check if trying to update fields other than allowed ones OR assignment fields
-    #     if not update_keys.issubset(allowed_updates_for_agent) and not is_changing_assignment:
-    #          raise HTTPException(
-    #              status_code=status.HTTP_403_FORBIDDEN,
-    #              detail="Agent can only update status or priority of assigned tickets.",
-    #          )
-    # --- End Permission Check ---
-
+    # Get origin URL for notification
+    origin = request.headers.get("origin") or settings.FRONTEND_URL
 
     # Use the service function which handles the actual update logic
-    # Remove the task_obj argument as the service function fetches it
-    updated_task_obj = update_task(db=db, task_id=task_id, task_in=task_in)
+    updated_task_obj = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
 
     if not updated_task_obj: # Service function returns the updated ORM object or None
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
             detail="Task update failed", # Or more specific error from service
         )
+    
+    # Ya no enviamos la notificación aquí porque update_task ya lo hace
 
     # Return the updated ORM object
     return updated_task_obj

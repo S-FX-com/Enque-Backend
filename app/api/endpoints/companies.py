@@ -160,6 +160,7 @@ async def update_company(
             User.company_id == None
         ).all()
 
+        assigned_users_emails = [] # Keep track of emails of assigned users
         assigned_count = 0
         for user_to_check in users_to_potentially_assign:
             if user_to_check.email:
@@ -167,12 +168,21 @@ async def update_company(
                 if user_email_domain == normalized_new_domain:
                     user_to_check.company_id = company.id
                     db.add(user_to_check) # Marcar para actualizar
+                    assigned_users_emails.append(user_to_check.email) # Add email to list
                     assigned_count += 1
                     print(f"Assigning user {user_to_check.email} (ID: {user_to_check.id}) to company {company.name}")
 
         if assigned_count > 0:
-            db.commit()
-            print(f"Successfully assigned {assigned_count} users to company {company.name} based on new email domain.")
+            # Remove these users from the UnassignedUser table
+            if assigned_users_emails:
+                logger.info(f"Removing {len(assigned_users_emails)} users from unassigned list: {assigned_users_emails} after company domain update.")
+                db.query(UnassignedUser).filter(
+                    UnassignedUser.email.in_(assigned_users_emails),
+                    UnassignedUser.workspace_id == current_workspace.id
+                ).delete(synchronize_session=False)
+            
+            db.commit() # Commit user company_id updates and UnassignedUser deletions
+            print(f"Successfully assigned {assigned_count} users to company {company.name} based on new email domain and removed from unassigned list.")
             # No es necesario un db.refresh() para los usuarios aquí, ya que la respuesta es la compañía.
             # El frontend debería re-evaluar las listas de usuarios a través de la invalidación de queries.
 

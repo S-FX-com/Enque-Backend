@@ -1,8 +1,11 @@
-from typing import Any, List
+from typing import Any, List, Dict
 from datetime import datetime # Import datetime
+import asyncio
+from threading import Thread
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload # Re-import joinedload
+from pydantic import BaseModel
 
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
@@ -13,11 +16,23 @@ from app.models.task import Task as TaskModel # Keep TaskModel alias
 from app.models.microsoft import MailboxConnection # Import MailboxConnection
 # CommentSchema now includes the agent object due to previous edit
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
-from app.schemas.task import TaskStatus # Import TaskStatus Enum
+from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails # Import Task schema and detailed schema
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
+from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
+from app.core.config import settings
 
 router = APIRouter()
+
+# Create a response model for the comment creation endpoint
+class CommentResponseModel(BaseModel):
+    comment: CommentSchema
+    task: TicketWithDetails
+    assignee_changed: bool
+
+    model_config = {
+        "from_attributes": True
+    }
 
 
 @router.get("/tasks/{task_id}/comments", response_model=List[CommentSchema])
@@ -50,7 +65,8 @@ async def read_comments(
     # Query comments and explicitly load the 'agent' relationship
     # because the updated CommentSchema now expects it.
     comments_orm = db.query(CommentModel).options(
-        joinedload(CommentModel.agent) # Eager load the agent relationship
+        joinedload(CommentModel.agent), # Eager load agente
+        joinedload(CommentModel.attachments) # Eager load adjuntos
     ).filter(
         CommentModel.ticket_id == task_id # Use correct column name
     )
@@ -67,45 +83,62 @@ async def read_comments(
     return comments_orm
 
 
-@router.post("/tasks/{task_id}/comments", response_model=CommentSchema)
+@router.post("/tasks/{task_id}/comments", response_model=CommentResponseModel)
 async def create_comment(
     task_id: int,
     comment_in: CommentCreate,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
     """
-    Create a new comment for a task
+    Create a new comment on a task.
+    The comment can be private (visible only to agents) or public.
     """
-    # Verify task exists and belongs to the workspace
+    
+    # Fetch the task ensuring it belongs to the user's workspace
     task = db.query(TaskModel).filter(
-        TaskModel.id == task_id, 
-        TaskModel.workspace_id == current_user.workspace_id, 
+        TaskModel.id == task_id,
+        TaskModel.workspace_id == current_user.workspace_id,
         TaskModel.is_deleted == False
     ).first()
+    
     if not task:
-        # Check workspace first for security
-        task_check = db.query(TaskModel.id, TaskModel.workspace_id).filter(TaskModel.id == task_id).first()
-        if task_check and task_check.workspace_id != current_user.workspace_id:
-            logger.error(f"Attempt to create comment on task {task_id} from different workspace by agent {current_user.id}")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot comment on tasks outside your workspace.",
-            )
-        # If task doesn't exist or belongs to workspace but is deleted
-        logger.error(f"Task {task_id} not found or is deleted in workspace {current_user.workspace_id} when creating comment.")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
     
-    # Check agent workspace_id
-    if not current_user.workspace_id:
-         logger.error(f"Agent {current_user.id} ({current_user.email}) is missing workspace_id. Cannot create comment.")
-         raise HTTPException(
-             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-             detail="Agent configuration error: Missing workspace ID.",
-         )
+    # Verificar si hay un cambio de assignee
+    previous_assignee_id = task.assignee_id
+    assignee_changed = False
+    
+    # Para respuestas externas, auto-establecer status="With User" si no es "Closed"
+    if not comment_in.is_private and task.status != "Closed":
+        task.status = "With User"
+        db.add(task)
+    
+    # Lógica para asignar ticket al agente que comenta (si no está asignado)
+    if task.assignee_id is None and not comment_in.preserve_assignee:
+        # Solo asignar al usuario actual si no tiene un assignee_id explícito en request
+        # y si no es una carga de adjunto (is_attachment_upload)
+        if comment_in.assignee_id is None and not comment_in.is_attachment_upload:
+            task.assignee_id = current_user.id
+            assignee_changed = True
+        # Si se proporciona explícitamente un assignee_id, usar ese
+        elif comment_in.assignee_id is not None:
+            task.assignee_id = comment_in.assignee_id
+            assignee_changed = previous_assignee_id != comment_in.assignee_id
+    
+    # Si hay un assignee_id explícito (y no estamos preservando el actual)
+    elif comment_in.assignee_id is not None and not comment_in.preserve_assignee:
+        task.assignee_id = comment_in.assignee_id
+        assignee_changed = previous_assignee_id != comment_in.assignee_id
+    
+    # Update last_update field on the task
+    task.last_update = datetime.utcnow()  # Use import
+    db.add(task)
 
     # Create the comment
     comment = CommentModel(
@@ -116,96 +149,125 @@ async def create_comment(
         is_private=comment_in.is_private
     )
     db.add(comment)
-    task.last_update = datetime.utcnow()
-    db.add(task)
-    db.commit()
-    db.refresh(comment)
-    db.refresh(task)
-    logger.info(f"Comment {comment.id} created for task {task_id}. Task last_update set to {task.last_update}.")
-
-    # --- Automatic Status and Assignment Update Logic ---
-    if not comment.is_private and current_user.role in ["agent", "admin", "manager"]: # Check roles allowed to auto-assign/update status
-        needs_commit = False # Flag to track if DB commit is needed
-
-        # 1. Auto-Assignment Logic
-        if task.assignee_id is None:
-            logger.info(f"Task {task_id} is unassigned. Assigning to agent {current_user.id} ({current_user.email}) who commented.")
-            task.assignee_id = current_user.id
-            db.add(task) # Add task to session for assignment update
-            needs_commit = True
-
-        # 2. Status Update Logic
-        if task.status in [TaskStatus.OPEN, TaskStatus.IN_PROGRESS]:
-            logger.info(f"Agent {current_user.id} commented on task {task_id} (status: {task.status}). Updating status to '{TaskStatus.WITH_USER}'.")
-            task.status = TaskStatus.WITH_USER
-            if not needs_commit: # Add task to session if not already added for assignment
-                 db.add(task)
-            needs_commit = True
-        else:
-             logger.info(f"Agent {current_user.id} commented on task {task_id}. Status is '{task.status}', no automatic status update needed.")
-
-        # Commit if any changes were made (assignment or status)
-        if needs_commit:
-            db.commit()
-            db.refresh(task) # Refresh task to get updated data
-
-    # --- Email Notification Logic ---
-    # Attempt to send email notification for non-private comments
-    if not comment.is_private:
-        try:
-            # Re-fetch task with user relationship loaded to get recipient email if needed
-            task_with_user = db.query(TaskModel).options(
-                joinedload(TaskModel.user)
-            ).filter(TaskModel.id == task_id).first()
-
-            if not task_with_user:
-                logger.error(f"Task {task_id} not found when attempting to send email for comment {comment.id}.")
-            elif task_with_user.mailbox_connection_id:
-                # Task originated from email, send a reply
-                logger.info(f"Task {task_id} originated from email. Attempting to send comment ID {comment.id} as reply.")
-                microsoft_service = get_microsoft_service(db)
-                microsoft_service.send_reply_email(task_id=task_id, reply_content=comment.content, agent=current_user)
-            else:
-                # Task was created manually, send a new email notification
-                logger.info(f"Task {task_id} was manual. Attempting to send comment ID {comment.id} as new email notification.")
-                if not task_with_user.user or not task_with_user.user.email:
-                    logger.warning(f"Cannot send notification for comment {comment.id} on task {task_id}: Task user or user email is missing.")
+    
+    # Procesar attachment_ids si están presentes
+    processed_attachment_ids = []
+    if comment_in.attachment_ids:
+        from app.models.ticket_attachment import TicketAttachment
+        
+        logger.info(f"Processing {len(comment_in.attachment_ids)} attachment IDs for comment ID {comment.id}: {comment_in.attachment_ids}")
+        
+        # Commit para asegurar que tengamos un comment ID válido antes de asociar adjuntos
+        db.commit()
+        db.refresh(comment)
+        
+        # Buscar y actualizar attachments
+        for attachment_id in comment_in.attachment_ids:
+            attachment = db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+            if attachment:
+                # Verificar si el adjunto está en un comentario temporal (placeholder)
+                prev_comment = db.query(CommentModel).filter(CommentModel.id == attachment.comment_id).first()
+                if prev_comment and prev_comment.content == "TEMP_ATTACHMENT_PLACEHOLDER":
+                    # Actualizar la relación del adjunto al nuevo comentario
+                    attachment.comment_id = comment.id
+                    db.add(attachment)
+                    processed_attachment_ids.append(attachment_id)
+                    logger.info(f"Adjunto {attachment_id} asociado al comentario {comment.id}")
                 else:
-                    recipient_email = task_with_user.user.email
-                    # Find an active mailbox for the workspace to send from
-                    sender_mailbox_conn = db.query(MailboxConnection).filter(
-                        MailboxConnection.workspace_id == task_with_user.workspace_id,
-                        MailboxConnection.is_active == True
-                    ).first()
+                    logger.warning(f"Adjunto {attachment_id} ya está asociado a un comentario no temporal")
+            else:
+                logger.warning(f"Adjunto {attachment_id} no encontrado al crear el comentario {comment.id}")
+    
+    # Si es una respuesta externa, procesar el email
+    if not comment_in.is_private and comment_in.content and len(comment_in.content) > 0:
+        # Si hay un reply_to_email especificado, se debe enviar a ese correo
+        # En caso contrario, se determina a partir del ticket
+        if not comment_in.is_attachment_upload:
+            from app.core.config import settings
+            db_path = settings.DATABASE_URI
 
-                    if not sender_mailbox_conn:
-                        logger.warning(f"Cannot send notification for comment {comment.id} on task {task_id}: No active sender mailbox found for workspace {task_with_user.workspace_id}.")
-                    else:
-                        sender_mailbox = sender_mailbox_conn.email
-                        subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
-                        # Prepare HTML body - maybe add context?
-                        # For now, just the comment content. Consider adding agent name.
-                        html_body = f"<p><strong>{current_user.name} commented:</strong></p>{comment.content}" # Added agent name
+            # Verificar si task tiene email_mappings o mailbox_connection_id
+            email_from_mailbox = True
+            if hasattr(task, 'mailbox_connection_id') and task.mailbox_connection_id:
+                email_from_mailbox = True
+                logger.info(f"Task {task_id} has mailbox_connection_id {task.mailbox_connection_id}. Will send reply.")
+            elif hasattr(task, 'email_mappings') and task.email_mappings:
+                email_from_mailbox = True
+                logger.info(f"Task {task_id} has email_mappings. Will send reply.")
+            else:
+                # Verificar directamente en la base de datos
+                from app.models.microsoft import EmailTicketMapping
+                email_mapping = db.query(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == task_id).first()
+                if email_mapping:
+                    email_from_mailbox = True
+                    logger.info(f"Task {task_id} has email mapping in database. Will send reply.")
+                else:
+                    email_from_mailbox = False
+                    logger.info(f"Task {task_id} has no email mapping or mailbox connection. Will send notification.")
 
-                        microsoft_service = get_microsoft_service(db)
-                        logger.info(f"Sending new email notification for comment {comment.id} from {sender_mailbox} to {recipient_email}")
-                        email_sent = microsoft_service.send_new_email(
-                            mailbox_email=sender_mailbox,
-                            recipient_email=recipient_email,
-                            subject=subject,
-                            html_body=html_body
-                        )
-                        if not email_sent:
-                            logger.error(f"Failed to send new email notification for comment {comment.id} on task {task_id}")
-                        else:
-                            logger.info(f"Successfully sent new email notification for comment {comment.id}")
-
-        except Exception as e:
-            # Catch unexpected errors during the email sending process
-            logger.error(f"Unexpected error trying to send email for comment ID {comment.id}, task ID {task_id}: {str(e)}", exc_info=True)
-            # Do not re-raise, as the primary operation (saving comment) succeeded.
-
-    return comment
+            # Add task to background tasks for email sending
+            try:
+                # Iniciar un thread para procesar el email en segundo plano
+                thread = Thread(
+                    target=send_email_in_background,
+                    args=(
+                        task_id,
+                        comment.id,
+                        comment.content,
+                        current_user.id,
+                        current_user.email,
+                        current_user.name,
+                        comment.is_private,
+                        processed_attachment_ids,
+                        db_path
+                    )
+                )
+                thread.daemon = True
+                thread.start()
+                logger.info(f"Started background thread for email sending for comment {comment.id} on task {task_id}")
+            except Exception as e:
+                logger.error(f"Error queuing email for task {task_id}: {e}", exc_info=True)
+    
+    db.commit()
+    db.refresh(task)  # Ensure the task is fresh
+    db.refresh(comment)  # Ensure comment is fresh with relationships
+    
+    # Si hubo un cambio de asignación y hay un nuevo asignado, enviar la notificación
+    if assignee_changed and task.assignee_id is not None:
+        # Obtener la URL de origen para usar el subdominio correcto
+        origin_url = None
+        
+        # 1. Intenta obtener origin de los headers
+        origin_header = request.headers.get("origin")
+        if origin_header:
+            origin_url = origin_header
+            logger.info(f"Using origin header for notification: {origin_url}")
+        
+        # 2. Si no hay origin en headers, intenta obtener host y esquema
+        elif request.headers.get("host"):
+            scheme = request.headers.get("x-forwarded-proto", "https")
+            host = request.headers.get("host")
+            origin_url = f"{scheme}://{host}"
+            logger.info(f"Constructed origin from host header: {origin_url}")
+        
+        # 3. Si todo falla, usa la URL frontend de settings
+        if not origin_url:
+            origin_url = settings.FRONTEND_URL
+            logger.info(f"Using settings.FRONTEND_URL as fallback: {origin_url}")
+            
+        # Lanzar la tarea en segundo plano
+        asyncio.create_task(send_assignment_notification(db, task, request_origin=origin_url))
+    
+    # Ensure all necessary relationships are eagerly loaded
+    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category'])
+    db.refresh(comment, attribute_names=['agent', 'ticket', 'attachments'])
+    
+    # Return the new comment in the response
+    return CommentResponseModel(
+        comment=comment,
+        task=task,
+        assignee_changed=assignee_changed
+    )
 
 
 @router.get("/comments/{comment_id}", response_model=CommentSchema)
@@ -236,7 +298,6 @@ async def read_comment(
             detail="Comment not found" # Remove duplicated detail argument
         )
     # Correct indentation for the return statement
-    return comment
     return comment
 
 
@@ -326,3 +387,101 @@ async def delete_comment(
     db.commit()
     
     return comment
+
+# Función para manejar el envío de correos en segundo plano
+def send_email_in_background(
+    task_id: int, 
+    comment_id: int, 
+    comment_content: str, 
+    agent_id: int,
+    agent_email: str,
+    agent_name: str,
+    is_private: bool,
+    processed_attachment_ids: list,
+    db_path: str
+):
+    """
+    Función para enviar correos electrónicos en segundo plano.
+    Se ejecuta en un thread separado para no bloquear la respuesta API.
+    """
+    import time
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker, joinedload
+    from app.models.task import Task as TaskModel
+    from app.models.agent import Agent as AgentModel
+    from app.models.microsoft import MailboxConnection
+    from app.services.microsoft_service import get_microsoft_service
+    
+    # Crear una nueva sesión de base de datos
+    engine = create_engine(db_path)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    
+    try:
+        logger.info(f"[BACKGROUND] Iniciando envío de correo para comment_id: {comment_id} en task_id: {task_id}")
+        
+        # Re-crear el objeto Agent
+        agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+        if not agent:
+            logger.error(f"[BACKGROUND] Agent {agent_id} no encontrado en base de datos")
+            return
+            
+        # Skip for private comments
+        if is_private:
+            logger.info(f"[BACKGROUND] Skipping email for private comment {comment_id}")
+            return
+            
+        # Re-fetch task with user relationship loaded to get recipient email if needed
+        task_with_user = db.query(TaskModel).options(
+            joinedload(TaskModel.user)
+        ).filter(TaskModel.id == task_id).first()
+
+        if not task_with_user:
+            logger.error(f"[BACKGROUND] Task {task_id} not found when attempting to send email for comment {comment_id}.")
+            return
+        elif task_with_user.mailbox_connection_id:
+            # Task originated from email, send a reply
+            logger.info(f"[BACKGROUND] Task {task_id} originated from email. Attempting to send comment ID {comment_id} as reply with {len(processed_attachment_ids)} attachments.")
+            microsoft_service = get_microsoft_service(db)
+            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids)
+        else:
+            # Task was created manually, send a new email notification
+            logger.info(f"[BACKGROUND] Task {task_id} was manual. Attempting to send comment ID {comment_id} as new email notification.")
+            if not task_with_user.user or not task_with_user.user.email:
+                logger.warning(f"[BACKGROUND] Cannot send notification for comment {comment_id} on task {task_id}: Task user or user email is missing.")
+                return
+            
+            recipient_email = task_with_user.user.email
+            # Find an active mailbox for the workspace to send from
+            sender_mailbox_conn = db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == task_with_user.workspace_id,
+                MailboxConnection.is_active == True
+            ).first()
+
+            if not sender_mailbox_conn:
+                logger.warning(f"[BACKGROUND] Cannot send notification for comment {comment_id} on task {task_id}: No active sender mailbox found for workspace {task_with_user.workspace_id}.")
+                return
+            
+            sender_mailbox = sender_mailbox_conn.email
+            subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
+            html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
+
+            microsoft_service = get_microsoft_service(db)
+            logger.info(f"[BACKGROUND] Sending new email notification for comment {comment_id} from {sender_mailbox} to {recipient_email} with {len(processed_attachment_ids)} attachments")
+            email_sent = microsoft_service.send_new_email(
+                mailbox_email=sender_mailbox,
+                recipient_email=recipient_email,
+                subject=subject,
+                html_body=html_body,
+                attachment_ids=processed_attachment_ids,
+                task_id=task_id  # Pass the task ID to include in the subject
+            )
+            if not email_sent:
+                logger.error(f"[BACKGROUND] Failed to send new email notification for comment {comment_id} on task {task_id}")
+            else:
+                logger.info(f"[BACKGROUND] Successfully sent new email notification for comment {comment_id}")
+                
+    except Exception as e:
+        logger.error(f"[BACKGROUND] Error en el envío de correo para comment_id: {comment_id}: {str(e)}", exc_info=True)
+    finally:
+        db.close()

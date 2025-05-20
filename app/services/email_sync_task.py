@@ -36,9 +36,11 @@ def sync_emails_job():
     Background job to sync emails from Microsoft based on active configurations
     """
     logger.info("Starting email sync job")
-    db = SessionLocal()
+    db = None
     
     try:
+        db = SessionLocal()
+        
         configs = db.query(EmailSyncConfig).filter(
             EmailSyncConfig.is_active == True
         ).all()
@@ -48,32 +50,41 @@ def sync_emails_job():
             return
             
         for config in configs:
-            integration = db.query(MicrosoftIntegration).filter(
-                MicrosoftIntegration.id == config.integration_id,
-                MicrosoftIntegration.is_active == True
-            ).first()
-            
-            if not integration:
-                logger.warning(f"No active integration found for sync config #{config.id}")
-                continue
-            token = db.query(MicrosoftToken).filter(
-                MicrosoftToken.integration_id == integration.id
-            ).first()
-            
-            if not token:
-                logger.warning(f"No token found for integration #{integration.id}")
-                continue
-                
+            # Create a separate session for each configuration to avoid
+            # holding connections open for too long
+            config_db = SessionLocal()
             try:
-                service = MicrosoftGraphService(db)
-                created_tasks = service.sync_emails(config)
-            except Exception as e:
-                logger.error(f"Error syncing emails for config #{config.id}: {e}")
+                integration = config_db.query(MicrosoftIntegration).filter(
+                    MicrosoftIntegration.id == config.integration_id,
+                    MicrosoftIntegration.is_active == True
+                ).first()
+                
+                if not integration:
+                    logger.warning(f"No active integration found for sync config #{config.id}")
+                    continue
+                token = config_db.query(MicrosoftToken).filter(
+                    MicrosoftToken.integration_id == integration.id
+                ).first()
+                
+                if not token:
+                    logger.warning(f"No token found for integration #{integration.id}")
+                    continue
+                    
+                try:
+                    service = MicrosoftGraphService(config_db)
+                    created_tasks = service.sync_emails(config)
+                except Exception as e:
+                    logger.error(f"Error syncing emails for config #{config.id}: {e}")
+            finally:
+                # Ensure we close the config-specific database session
+                config_db.close()
                 
     except Exception as e:
         logger.error(f"Error in email sync job: {e}")
     finally:
-        db.close()
+        # Ensure we close the main database session
+        if db is not None:
+            db.close()
 
 
 def refresh_tokens_job():
@@ -81,9 +92,10 @@ def refresh_tokens_job():
     Background job to check and renew Microsoft tokens before they expire
     """
     logger.info("Starting token refresh job")
-    db = SessionLocal()
+    db = None
     
     try:
+        db = SessionLocal()
         service = MicrosoftGraphService(db)
     
         service.check_and_refresh_all_tokens()
@@ -92,7 +104,8 @@ def refresh_tokens_job():
     except Exception as e:
         logger.error(f"Error refreshing tokens: {e}")
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def start_scheduler():
@@ -102,6 +115,7 @@ def start_scheduler():
     if not scheduler_available:
         logger.warning("Schedule library is not available. Email synchronization scheduler will not run.")
         return
+    # Configura la frecuencia de sincronización a 15 segundos para mayor rapidez
     schedule.every(30).seconds.do(sync_emails_job)
     schedule.every(4).hours.do(refresh_tokens_job)
     
@@ -115,4 +129,4 @@ def start_scheduler():
     scheduler_thread.daemon = True
     scheduler_thread.start()
     
-    logger.info("Email sync (every 30s) and token refresh scheduler started")
+    logger.info("Email sync (every 15s) and token refresh scheduler started")

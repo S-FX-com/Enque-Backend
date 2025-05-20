@@ -1,8 +1,8 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, Enum, Boolean, ForeignKey, func, Index
-from sqlalchemy.dialects.mysql import LONGTEXT # Import LONGTEXT
+from sqlalchemy.dialects.mysql import LONGTEXT 
 from sqlalchemy.orm import relationship
 from app.database.base_class import Base
-from .category import Category # Import Category model
+from .category import Category 
 
 class TicketBody(Base):
     """Stores the potentially large body content of tickets, especially those from emails."""
@@ -10,10 +10,7 @@ class TicketBody(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
-    # Change Text to LONGTEXT for larger email bodies
     email_body = Column(LONGTEXT, nullable=True)
-
-    # Relationship back to the ticket
     ticket = relationship("Task", back_populates="body")
 
 class Task(Base):
@@ -22,11 +19,8 @@ class Task(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     title = Column(String(255), nullable=False)
-    # Description can now be used for manual descriptions or summaries
     description = Column(Text, nullable=True)
-    # Add 'With User', 'In Progress', and 'Resolved' to status Enum
-    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', 'Resolved', name='ticket_status'), default='Unread', nullable=False) # Added 'Resolved'
-    # Add 'Critical' to the Enum definition
+    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', 'Resolved', name='ticket_status'), default='Unread', nullable=False) 
     priority = Column(Enum('Low', 'Medium', 'High', 'Critical', name='ticket_priority'), default='Medium', nullable=False)
     assignee_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
@@ -42,8 +36,8 @@ class Task(Base):
     is_deleted = Column(Boolean, default=False)
     deleted_at = Column(DateTime, nullable=True)
     is_read = Column(Boolean, default=False)
-    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) # Added for email replies
-    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) # Added category foreign key
+    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) 
+    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) 
 
     # Relationships
     workspace = relationship("Workspace", back_populates="tasks")
@@ -53,17 +47,11 @@ class Task(Base):
     team = relationship("Team", back_populates="tasks")
     user = relationship("User", back_populates="tasks")
     company = relationship("Company", back_populates="tasks")
-    comments = relationship("Comment", back_populates="ticket", cascade="all, delete-orphan") # Cascade comment deletes
-
-    # Relación con los emails (Microsoft 365 integration)
+    comments = relationship("Comment", back_populates="ticket", cascade="all, delete-orphan") 
     email_mappings = relationship("EmailTicketMapping", back_populates="ticket", cascade="all, delete-orphan")
-    
-    # Relationship to the separate body content
     body = relationship("TicketBody", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
-    mailbox_connection = relationship("MailboxConnection", back_populates="tasks") # Added for email replies
-    category = relationship("Category", back_populates="tasks") # Added relationship to Category
-
-    # Helper para verificar si el ticket se creó a partir de un email
+    mailbox_connection = relationship("MailboxConnection", back_populates="tasks") 
+    category = relationship("Category", back_populates="tasks") 
     @property
     def is_from_email(self):
         """Check if this task was created from an email"""

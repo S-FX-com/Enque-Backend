@@ -24,6 +24,7 @@ from app.utils.logger import ms_logger as logger
 import urllib.parse
 import base64 # Ensure base64 is imported
 import json # Ensure json is imported
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -121,6 +122,96 @@ def disconnect_mailbox(
         db.rollback()
         logger.error(f"Error disconnecting mailbox for workspace {workspace_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to disconnect mailbox.")
+
+
+# Add the new schema class before the endpoint
+class ReconnectMailboxRequest(BaseModel):
+    state: Optional[str] = Field(None, description="Base64 encoded state from frontend containing workspace_id, agent_id, and original_hostname")
+
+# New endpoint for reconnecting a mailbox connection
+@router.post("/connection/{connection_id}/reconnect", response_model=dict)
+def reconnect_mailbox(
+    connection_id: int,
+    request_data: ReconnectMailboxRequest,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Reconnect a specific mailbox by initiating a new OAuth flow.
+    This is useful when connection authentication has expired or been revoked.
+    """
+    if not current_agent or not current_agent.workspace_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    
+    workspace_id = current_agent.workspace_id
+    logger.info(f"Attempting to reconnect mailbox connection ID {connection_id} for workspace {workspace_id}")
+    
+    # Find the specific connection by ID and ensure it belongs to the agent's workspace
+    connection = db.query(MailboxConnection).filter(
+        MailboxConnection.id == connection_id,
+        MailboxConnection.workspace_id == workspace_id
+    ).first()
+    
+    if not connection:
+        logger.warning(f"Mailbox connection ID {connection_id} not found or does not belong to workspace {workspace_id}.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox connection not found.")
+    
+    try:
+        # If state was provided in the request, decode it to get original_hostname
+        original_hostname = None
+        if request_data.state:
+            try:
+                # Decode base64 state
+                missing_padding = len(request_data.state) % 4
+                if missing_padding:
+                    padded_state = request_data.state + ('=' * (4 - missing_padding))
+                else:
+                    padded_state = request_data.state
+                
+                decoded_state = base64.urlsafe_b64decode(padded_state).decode('utf-8')
+                state_data = json.loads(decoded_state)
+                original_hostname = state_data.get("original_hostname")
+                logger.info(f"Extracted original_hostname from state: {original_hostname}")
+            except Exception as e:
+                logger.warning(f"Could not decode state parameter: {e}")
+        
+        # Generate state parameter with connection_id included
+        state_data = {
+            "workspace_id": str(workspace_id),
+            "agent_id": str(current_agent.id),
+            "connection_id": str(connection_id),
+            "is_reconnect": "true",
+            "original_hostname": original_hostname
+        }
+        
+        # Encode state data
+        state_json_string = json.dumps(state_data)
+        base64_state = base64.urlsafe_b64encode(state_json_string.encode()).decode('utf-8')
+        # Remove padding characters
+        base64_state = base64_state.replace('+', '-').replace('/', '_').rstrip('=')
+        
+        logger.info(f"Generated reconnect state for Microsoft auth: {base64_state}")
+        
+        microsoft_service = MicrosoftGraphService(db)
+        # Use explicit redirect URI and scopes for email sync
+        email_sync_redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
+        email_sync_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
+        
+        # Get the authorization URL with the state
+        auth_url = microsoft_service.get_auth_url(
+            redirect_uri=email_sync_redirect_uri,
+            scopes=email_sync_scopes,
+            state=base64_state,
+            prompt="consent"  # Force consent prompt to get fresh tokens
+        )
+        
+        return {"auth_url": auth_url}
+    except Exception as e:
+        logger.error(f"Error generating reconnection URL for mailbox {connection_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate reconnection URL: {str(e)}"
+        )
 
 
 # Removed the old get_connection_status endpoint
