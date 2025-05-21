@@ -3,13 +3,9 @@ from typing import List, Optional, Any
 from fastapi import APIRouter, Depends, HTTPException, Path, Body, Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-import json
-from datetime import datetime
-from sqlalchemy.sql import func
 
 from app.api.dependencies import get_db, get_current_active_user
 from app.models.agent import Agent
-from app.models.notification import NotificationSetting
 from app.schemas.notification import (
     NotificationSettingsResponse,
     NotificationToggleRequest,
@@ -151,66 +147,4 @@ async def connect_teams_channel(
             detail="Failed to connect Teams channel",
         )
     
-    return {"success": True, "message": "Teams channel connected successfully"}
-
-
-@router.post("/{workspace_id}/connect/enque_popup", response_model=dict)
-async def connect_popup_channel(
-    workspace_id: int = Path(...),
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Connect Enque popup notification channel.
-    Initializes all popup notification settings if they don't exist.
-    """
-    if current_user.workspace_id != workspace_id and current_user.role != "superadmin":
-        raise HTTPException(
-            status_code=403,
-            detail="You don't have permission to connect popup notifications for this workspace",
-        )
-    
-    # Initialize popup settings for all notification types
-    try:
-        # Tipos de notificaciones a actualizar
-        notification_types = ["new_ticket_created", "new_response", "ticket_assigned"]
-        
-        for notification_type in notification_types:
-            # Buscar configuración existente
-            setting = db.query(NotificationSetting).filter(
-                NotificationSetting.workspace_id == workspace_id,
-                NotificationSetting.category == "agents",
-                NotificationSetting.type == notification_type
-            ).first()
-            
-            if setting:
-                # Actualizar configuración existente añadiendo canal enque_popup
-                channels = json.loads(setting.channels) if isinstance(setting.channels, str) else setting.channels
-                if "enque_popup" not in channels:
-                    channels.append("enque_popup")
-                    setting.channels = json.dumps(channels)
-                    setting.updated_at = datetime.utcnow()
-            else:
-                # Si no existe, crear una nueva configuración
-                new_setting = NotificationSetting(
-                    workspace_id=workspace_id,
-                    category="agents",
-                    type=notification_type,
-                    is_enabled=True,
-                    channels=json.dumps(["enque_popup"]),
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                db.add(new_setting)
-        
-        db.commit()
-        
-        return {"success": True, "message": "Popup notifications initialized successfully"}
-    
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error initializing popup notifications: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to initialize popup notifications: {str(e)}",
-        ) 
+    return {"success": True, "message": "Teams channel connected successfully"} 
