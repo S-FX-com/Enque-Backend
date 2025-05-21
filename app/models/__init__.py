@@ -10,3 +10,4 @@ from app.models.activity import Activity
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig 
 from .ticket_attachment import TicketAttachment 
 from app.models.global_signature import GlobalSignature 
+from app.models.notification import NotificationTemplate, NotificationSetting 

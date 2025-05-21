@@ -95,6 +95,7 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     if not task:
         return None
     old_assignee_id = task.assignee_id
+    old_status = task.status
 
     update_data = task_in.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -103,9 +104,43 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     db.commit()
     db.refresh(task)
     db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
+    
+    # Send assignment notification if the assignee has changed
     if 'assignee_id' in update_data and old_assignee_id != task.assignee_id and task.assignee_id is not None:
-
         asyncio.create_task(send_assignment_notification(db, task, request_origin))
+    
+    # Send notification when ticket status changes to Closed/Resolved
+    if 'status' in update_data and old_status != task.status and task.status == 'Closed':
+        try:
+            from app.services.notification_service import send_notification
+            
+            # Si el ticket tiene un usuario, enviarle una notificación
+            # Solo se envía cuando el ticket se cierra (resuelve)
+            if task.user and task.user.email:
+                # Preparar variables de plantilla
+                template_vars = {
+                    "user_name": task.user.name,
+                    "ticket_id": task.id,
+                    "ticket_title": task.title
+                }
+                
+                # Enviar la notificación de forma asíncrona
+                asyncio.create_task(
+                    send_notification(
+                        db=db,
+                        workspace_id=task.workspace_id,
+                        category="users",
+                        notification_type="ticket_resolved",
+                        recipient_email=task.user.email,
+                        recipient_name=task.user.name,
+                        template_vars=template_vars,
+                        task_id=task.id
+                    )
+                )
+                logger.info(f"Notification queued for resolved ticket {task.id} to user {task.user.name}")
+        except Exception as e:
+            logger.error(f"Error sending resolved ticket notification for task {task.id}: {str(e)}", exc_info=True)
+    
     email_mapping = db.query(EmailTicketMapping).filter(
         EmailTicketMapping.ticket_id == task.id
     ).first()

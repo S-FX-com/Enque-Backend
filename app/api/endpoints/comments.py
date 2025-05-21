@@ -13,6 +13,7 @@ from app.database.session import get_db
 from app.models.agent import Agent as AgentModel
 from app.models.comment import Comment as CommentModel
 from app.models.task import Task as TaskModel # Keep TaskModel alias
+from app.models.activity import Activity # Añadir importación de Activity
 from app.models.microsoft import MailboxConnection # Import MailboxConnection
 # CommentSchema now includes the agent object due to previous edit
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
@@ -155,11 +156,11 @@ async def create_comment(
     if comment_in.attachment_ids:
         from app.models.ticket_attachment import TicketAttachment
         
-        logger.info(f"Processing {len(comment_in.attachment_ids)} attachment IDs for comment ID {comment.id}: {comment_in.attachment_ids}")
-        
         # Commit para asegurar que tengamos un comment ID válido antes de asociar adjuntos
         db.commit()
         db.refresh(comment)
+        
+        logger.info(f"Processing {len(comment_in.attachment_ids)} attachment IDs for comment ID {comment.id}: {comment_in.attachment_ids}")
         
         # Buscar y actualizar attachments
         for attachment_id in comment_in.attachment_ids:
@@ -177,34 +178,33 @@ async def create_comment(
                     logger.warning(f"Adjunto {attachment_id} ya está asociado a un comentario no temporal")
             else:
                 logger.warning(f"Adjunto {attachment_id} no encontrado al crear el comentario {comment.id}")
-    
-    # Si es una respuesta externa, procesar el email
-    if not comment_in.is_private and comment_in.content and len(comment_in.content) > 0:
-        # Si hay un reply_to_email especificado, se debe enviar a ese correo
-        # En caso contrario, se determina a partir del ticket
-        if not comment_in.is_attachment_upload:
-            from app.core.config import settings
-            db_path = settings.DATABASE_URI
+    else:
+        # Si no hay adjuntos, hacemos commit para asegurar que el comentario tenga ID
+        db.commit()
+        db.refresh(comment)
 
-            # Verificar si task tiene email_mappings o mailbox_connection_id
-            email_from_mailbox = True
-            if hasattr(task, 'mailbox_connection_id') and task.mailbox_connection_id:
-                email_from_mailbox = True
-                logger.info(f"Task {task_id} has mailbox_connection_id {task.mailbox_connection_id}. Will send reply.")
-            elif hasattr(task, 'email_mappings') and task.email_mappings:
-                email_from_mailbox = True
-                logger.info(f"Task {task_id} has email_mappings. Will send reply.")
-            else:
-                # Verificar directamente en la base de datos
-                from app.models.microsoft import EmailTicketMapping
-                email_mapping = db.query(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == task_id).first()
-                if email_mapping:
-                    email_from_mailbox = True
-                    logger.info(f"Task {task_id} has email mapping in database. Will send reply.")
-                else:
-                    email_from_mailbox = False
-                    logger.info(f"Task {task_id} has no email mapping or mailbox connection. Will send notification.")
+    # Log the activity (agent created comment) - ahora comment.id no será None
+    try:
+        activity = Activity(
+            agent_id=current_user.id,
+            source_type="Ticket", 
+            source_id=comment.id,
+            action="created" if not comment_in.is_attachment_upload else "attachment_upload",
+            workspace_id=current_user.workspace_id
+        )
+        db.add(activity)
+        logger.info(f"Activity logged for comment creation: {comment.id} by {current_user.id}")
+    except Exception as e:
+        logger.error(f"Error creating activity for comment {comment.id}: {e}")
+        # No hacemos rollback aquí, solo registramos el error
 
+    # Send email notification when a public comment is created
+    # (but not for attachment uploads which are handled separately)
+    if not comment_in.is_private and not comment_in.is_attachment_upload:
+        # Necesitamos la ruta de la base de datos para el background thread
+        db_path = settings.DATABASE_URI
+        
+        if db_path:
             # Add task to background tasks for email sending
             try:
                 # Iniciar un thread para procesar el email en segundo plano
@@ -228,46 +228,92 @@ async def create_comment(
             except Exception as e:
                 logger.error(f"Error queuing email for task {task_id}: {e}", exc_info=True)
     
+    # Hacemos un commit final para guardar todo (activity)
     db.commit()
     db.refresh(task)  # Ensure the task is fresh
-    db.refresh(comment)  # Ensure comment is fresh with relationships
+    db.refresh(comment)
     
-    # Si hubo un cambio de asignación y hay un nuevo asignado, enviar la notificación
-    if assignee_changed and task.assignee_id is not None:
-        # Obtener la URL de origen para usar el subdominio correcto
-        origin_url = None
-        
-        # 1. Intenta obtener origin de los headers
-        origin_header = request.headers.get("origin")
-        if origin_header:
-            origin_url = origin_header
-            logger.info(f"Using origin header for notification: {origin_url}")
-        
-        # 2. Si no hay origin en headers, intenta obtener host y esquema
-        elif request.headers.get("host"):
-            scheme = request.headers.get("x-forwarded-proto", "https")
-            host = request.headers.get("host")
-            origin_url = f"{scheme}://{host}"
-            logger.info(f"Constructed origin from host header: {origin_url}")
-        
-        # 3. Si todo falla, usa la URL frontend de settings
-        if not origin_url:
-            origin_url = settings.FRONTEND_URL
-            logger.info(f"Using settings.FRONTEND_URL as fallback: {origin_url}")
+    # Si el ticket se asignó a un nuevo agente y no es el que está comentando
+    if assignee_changed and task.assignee_id != current_user.id:
+        try:
+            # Obtener la URL de origen para usar el subdominio correcto
+            origin_url = None
+            if request:
+                origin_url = str(request.headers.get("origin", ""))
+            if not origin_url:
+                origin_url = settings.FRONTEND_URL
+            logger.info(f"Using {origin_url} for assignment notification")
             
-        # Lanzar la tarea en segundo plano
-        asyncio.create_task(send_assignment_notification(db, task, request_origin=origin_url))
+            # Get the assigned agent
+            assigned_agent = db.query(AgentModel).filter(AgentModel.id == task.assignee_id).first()
+            if assigned_agent:
+                # Send notification in background
+                from app.services.task_service import send_assignment_notification
+                await send_assignment_notification(db, task, origin_url)
+                logger.info(f"Notification scheduled for new assignment from comment: task {task_id} to agent {task.assignee_id}")
+        except Exception as e:
+            logger.error(f"Error scheduling assignment notification from comment: {e}", exc_info=True)
     
-    # Ensure all necessary relationships are eagerly loaded
-    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category'])
-    db.refresh(comment, attribute_names=['agent', 'ticket', 'attachments'])
+    # --- Send Notifications Based on Settings ---
+    try:
+        # Import notification service
+        from app.services.notification_service import send_notification
+
+        # 1. For agent comments (solo notificar a otros agentes, NO a los usuarios)
+        if not comment_in.is_private and not comment_in.is_attachment_upload:
+            # ELIMINAMOS LA NOTIFICACIÓN AL USUARIO CUANDO UN AGENTE RESPONDE
+            # Los usuarios solo deben recibir notificaciones cuando:
+            # 1. Se crea un ticket (ya implementado en _create_task_from_email)
+            # 2. Se resuelve un ticket (ya implementado en update_task cuando status='Closed')
+            
+            # Get the task user for reference (needed for agent notifications)
+            task_user = None
+            if task.user_id:
+                from app.models.user import User
+                task_user = db.query(User).filter(User.id == task.user_id).first()
+            
+            # 2. Notify other agents about new response
+            # La función send_notification ya verifica si la notificación está habilitada
+            # en la configuración del workspace
+            agents = db.query(AgentModel).filter(
+                AgentModel.workspace_id == task.workspace_id,
+                AgentModel.is_active == True,
+                AgentModel.id != current_user.id  # Don't notify the commenting agent
+            ).all()
+            
+            for agent in agents:
+                if agent.email:
+                    template_vars = {
+                        "agent_name": agent.name,
+                        "ticket_id": task.id,
+                        "ticket_title": task.title,
+                        "commenter_name": current_user.name,
+                        "user_name": task_user.name if task_user else "Unknown User",
+                        "comment_content": comment.content
+                    }
+                    
+                    # Intentar enviar notificación a otros agentes
+                    await send_notification(
+                        db=db,
+                        workspace_id=task.workspace_id,
+                        category="agents",
+                        notification_type="new_response",
+                        recipient_email=agent.email,
+                        recipient_name=agent.name,
+                        template_vars=template_vars,
+                        task_id=task.id
+                    )
     
-    # Return the new comment in the response
-    return CommentResponseModel(
-        comment=comment,
-        task=task,
-        assignee_changed=assignee_changed
-    )
+    except Exception as notification_error:
+        logger.error(f"Error sending notifications for comment {comment.id} on task {task_id}: {str(notification_error)}", exc_info=True)
+    # --- End Send Notifications ---
+    
+    # Return both the comment and updated task
+    return {
+        "comment": comment,
+        "task": task,
+        "assignee_changed": assignee_changed  # Asegurarnos de incluir este campo requerido
+    }
 
 
 @router.get("/comments/{comment_id}", response_model=CommentSchema)

@@ -445,12 +445,75 @@ class MicrosoftGraphService:
             if not processed_folder_id: logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
+            
+            # Lista de filtros para identificar correos generados por notificaciones
+            notification_subject_patterns = [
+                "New ticket #", 
+                "Ticket #",
+                "New response to your ticket #",
+                "Ticket", # Más genérico para capturar otros formatos
+                "[ID:"    # Detectar el formato de ID que agregamos a los asuntos
+            ]
+            
             for email_data in emails:
                 email_id = email_data.get("id")
                 if not email_id: logger.warning("[MAIL SYNC] Skipping email with missing ID."); continue
                 try:
+                    # Verificar si el correo ya fue procesado
                     if self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first():
                         logger.info(f"[MAIL SYNC] Email ID {email_id} already processed. Skipping."); continue
+                    
+                    # Obtener el asunto del correo para verificar si es una notificación del sistema
+                    email_subject = email_data.get("subject", "")
+                    
+                    # Verificar si el correo es una notificación generada por el sistema
+                    is_system_notification = False
+                    
+                    # Obtener remitente para permitir respuestas de clientes/externos
+                    sender_email = email_data.get("from", {}).get("emailAddress", {}).get("address", "").lower()
+                    mailbox_email = user_email.lower()
+                    
+                    # Solo considerar como notificación del sistema si viene del propio buzón
+                    # o de una dirección conocida de Microsoft Exchange
+                    if (sender_email == mailbox_email or "microsoftexchange" in sender_email):
+                        for pattern in notification_subject_patterns:
+                            if pattern in email_subject:
+                                is_system_notification = True
+                                logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} appears to be a system notification with subject: '{email_subject}'. Skipping.")
+                                
+                                # Marcar como leído y mover a carpeta procesada sin crear ticket
+                                self._mark_email_as_read(app_token, user_email, email_id)
+                                if processed_folder_id:
+                                    self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                                break
+                    # Si el remitente no es el propio buzón y contiene Re: [ID:xyz], es una respuesta del cliente
+                    elif "Re: [ID:" in email_subject:
+                        logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} is a client reply with subject: '{email_subject}'. Processing...")
+                        is_system_notification = False
+                        
+                        # Extraer el ID del ticket del asunto si contiene [ID:123]
+                        ticket_id_match = re.search(r'\[ID:(\d+)\]', email_subject)
+                        if ticket_id_match:
+                            ticket_id = ticket_id_match.group(1)
+                            logger.info(f"[MAIL SYNC] Detected ticket ID {ticket_id} in email subject")
+                            
+                            # Buscar ticket directamente por el ID extraído del asunto
+                            existing_mapping = self.db.query(EmailTicketMapping).join(Task).filter(
+                                Task.id == ticket_id,
+                                EmailTicketMapping.ticket_id == ticket_id
+                            ).first()
+                            
+                            if existing_mapping:
+                                logger.info(f"[MAIL SYNC] Found existing ticket {ticket_id} from subject [ID:{ticket_id}]. Will process as reply.")
+                                email_content = self._get_full_email(app_token, user_email, email_id)
+                                # Asignar manualmente el conversationId para forzar que se procese como respuesta
+                                if email_content and not 'conversationId' in email_content:
+                                    email_content['conversationId'] = existing_mapping.email_conversation_id
+                                    logger.info(f"[MAIL SYNC] Manually setting conversationId to {existing_mapping.email_conversation_id} for ID in subject match.")
+                    
+                    if is_system_notification:
+                        continue
+                    
                     email_content = self._get_full_email(app_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     conversation_id = email_content.get("conversationId")
@@ -518,6 +581,17 @@ class MicrosoftGraphService:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
                         email = self._parse_email_data(email_content, user_email)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation."); continue
+                        
+                        # Verificación adicional del remitente para evitar bucles
+                        sender_email = email.sender.address if email.sender else ""
+                        # Si el remitente es el propio buzón o una dirección conocida del sistema
+                        if sender_email.lower() == user_email.lower() or "microsoftexchange" in sender_email.lower():
+                            logger.warning(f"[MAIL SYNC] Email from system address or self ({sender_email}). Marking as read and skipping ticket creation.")
+                            self._mark_email_as_read(app_token, user_email, email_id)
+                            if processed_folder_id:
+                                self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                            continue
+                        
                         task = self._create_task_from_email(email, sync_config, system_agent)
                         if task:
                             created_tasks_count += 1; logger.info(f"[MAIL SYNC] Created Task ID {task.id} from Email ID {email.id}.")
@@ -525,12 +599,42 @@ class MicrosoftGraphService:
                                 email_id=email.id, email_conversation_id=email.conversation_id, ticket_id=task.id,
                                 email_subject=email.subject, email_sender=f"{email.sender.name} <{email.sender.address}>",
                                 email_received_at=email.received_at, is_processed=True)
-                            self.db.add(email_mapping); self.db.commit()
-                            if processed_folder_id:
-                                new_id = self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
-                                if new_id and new_id != email_id: logger.info(f"[MAIL SYNC] Email ID changed from {email_id} to {new_id} after move. Updating mapping."); email_mapping.email_id = new_id; self.db.commit()
-                                elif new_id: logger.info(f"[MAIL SYNC] Successfully moved email ID {email_id} to 'Enque Processed' folder.")
-                                else: logger.warning(f"[MAIL SYNC] Failed to move email ID {email_id} to 'Enque Processed' folder.")
+                            self.db.add(email_mapping)
+                            try:
+                                self.db.commit()
+                                if processed_folder_id:
+                                    new_id = self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                                    if new_id and new_id != email_id:
+                                        logger.info(f"[MAIL SYNC] Email ID changed from {email_id} to {new_id} after move. Updating mapping.")
+                                        try:
+                                            # Actualización más segura con manejo de errores
+                                            # Verificar si el ID es demasiado largo para la columna
+                                            if len(new_id) > 255:  # Suponiendo que el campo tiene un límite de 255 caracteres
+                                                logger.warning(f"[MAIL SYNC] New email ID is too long ({len(new_id)} chars). Truncating to 255 chars.")
+                                                new_id = new_id[:255]
+                                            
+                                            # Verificar si ya existe un mapeo con ese ID
+                                            existing_mapping = self.db.query(EmailTicketMapping).filter(
+                                                EmailTicketMapping.email_id == new_id,
+                                                EmailTicketMapping.id != email_mapping.id
+                                            ).first()
+                                            
+                                            if existing_mapping:
+                                                logger.warning(f"[MAIL SYNC] Another mapping already exists with email_id={new_id}. Not updating.")
+                                            else:
+                                                email_mapping.email_id = new_id
+                                                self.db.commit()
+                                                logger.info(f"[MAIL SYNC] Successfully updated mapping with new email ID.")
+                                        except Exception as update_err:
+                                            logger.warning(f"[MAIL SYNC] Could not update email_id after move: {str(update_err)}. Continuing with original ID.")
+                                            self.db.rollback()  # Importante hacer rollback en caso de error
+                                    elif new_id: 
+                                        logger.info(f"[MAIL SYNC] Successfully moved email ID {email_id} to 'Enque Processed' folder.")
+                                    else: 
+                                        logger.warning(f"[MAIL SYNC] Failed to move email ID {email_id} to 'Enque Processed' folder.")
+                            except Exception as commit_err:
+                                logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
+                                self.db.rollback()
                         else: logger.warning(f"[MAIL SYNC] Failed to create task from email ID {email.id}.")
                 except Exception as e: logger.error(f"[MAIL SYNC] Error processing email ID {email_data.get('id', 'N/A')}: {str(e)}", exc_info=True); self.db.rollback(); continue
             sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
@@ -641,6 +745,108 @@ class MicrosoftGraphService:
             # Crear un TicketBody vacío (requerido pero no lo usaremos para mostrar contenido)
             ticket_body = TicketBody(ticket_id=task.id, email_body="")
             self.db.add(ticket_body)
+            
+            # Commit para asegurar que el ticket esté guardado antes de enviar notificaciones
+            self.db.commit()
+            
+            # Verificar si debemos enviar notificaciones (evitar bucles y spam)
+            should_send_notification = True
+            
+            # Evitar notificaciones para correos del sistema o notificaciones automáticas
+            notification_keywords = ["ticket", "created", "notification", "system", "auto", "automated", "no-reply", "noreply"]
+            system_domains = ["enque.cc", "microsoftexchange"]  # Eliminamos s-fx.com para permitir notificaciones normales
+            
+            # Verificar si el asunto parece una notificación automática
+            if email.subject:
+                subject_lower = email.subject.lower()
+                if any(keyword in subject_lower for keyword in notification_keywords):
+                    # Si el asunto parece una notificación, reducir la probabilidad de enviar otra notificación
+                    if any(domain in email.sender.address.lower() for domain in system_domains):
+                        logger.info(f"Skipping notifications for ticket {task.id} as it appears to be a system notification")
+                        should_send_notification = False
+            
+            # Enviar notificaciones de nuevo ticket solo si es apropiado
+            if should_send_notification:
+                try:
+                    import asyncio
+                    from app.services.notification_service import send_notification
+                    
+                    # 1. Notificar al usuario que creó el ticket (remitente del email)
+                    if user and user.email and not any(domain in user.email.lower() for domain in system_domains):
+                        template_vars = {
+                            "user_name": user.name,
+                            "ticket_id": task.id,
+                            "ticket_title": task.title
+                        }
+                        
+                        # Crear un nuevo bucle de eventos y ejecutar la corrutina de forma sincrónica
+                        loop = asyncio.new_event_loop()
+                        try:
+                            loop.run_until_complete(
+                                send_notification(
+                                    db=self.db,
+                                    workspace_id=workspace_id,
+                                    category="users",
+                                    notification_type="new_ticket_created",
+                                    recipient_email=user.email,
+                                    recipient_name=user.name,
+                                    template_vars=template_vars,
+                                    task_id=task.id
+                                )
+                            )
+                            logger.info(f"Notification for new ticket {task.id} sent to user {user.name}")
+                        finally:
+                            loop.close()
+                    
+                    # 2. Notificar a todos los agentes activos en el workspace
+                    active_agents = self.db.query(Agent).filter(
+                        Agent.workspace_id == workspace_id,
+                        Agent.is_active == True,
+                        Agent.email != None,
+                        Agent.email != ""
+                    ).all()
+                    
+                    # Preparar variables de plantilla para notificaciones de agentes
+                    agent_template_vars = {
+                        "ticket_id": task.id,
+                        "ticket_title": task.title,
+                        "user_name": user.name if user else "Unknown User"
+                    }
+                    
+                    # Notificar a cada agente activo
+                    for agent in active_agents:
+                        # Si el agente es el asignado, añadir información adicional 
+                        if assigned_agent and agent.id == assigned_agent.id:
+                            agent_template_vars["agent_name"] = agent.name
+                        else:
+                            agent_template_vars["agent_name"] = agent.name
+                        
+                        # Solo enviar si el agente no está en un dominio del sistema
+                        if not any(domain in agent.email.lower() for domain in system_domains):
+                            loop = asyncio.new_event_loop()
+                            try:
+                                loop.run_until_complete(
+                                    send_notification(
+                                        db=self.db,
+                                        workspace_id=workspace_id,
+                                        category="agents",
+                                        notification_type="new_ticket_created",
+                                        recipient_email=agent.email,
+                                        recipient_name=agent.name,
+                                        template_vars=agent_template_vars,
+                                        task_id=task.id
+                                    )
+                                )
+                                logger.info(f"Notification for new ticket {task.id} sent to agent {agent.name}")
+                            except Exception as agent_notify_err:
+                                logger.warning(f"Failed to send notification to agent {agent.name}: {str(agent_notify_err)}")
+                            finally:
+                                loop.close()
+                    
+                except Exception as e:
+                    logger.error(f"Error sending notifications for ticket {task.id} created from email: {str(e)}", exc_info=True)
+            else:
+                logger.info(f"Notifications suppressed for ticket {task.id} to prevent notification loops")
                 
             return task
         except Exception as e: logger.error(f"Error creating task from email ID {email.id}: {str(e)}", exc_info=True); self.db.rollback(); return None

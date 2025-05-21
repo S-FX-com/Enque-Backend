@@ -188,38 +188,25 @@ async def create_task(
     except Exception as e:
         logger.error(f"Failed to log activity for ticket creation {task.id}: {str(e)}")
         db.rollback() # Rollback activity commit if it failed
-    # --- End Log Activity ---
+    # --- End Activity Log ---
 
-    # --- Send Email Notification for Assigned Ticket ---
-    if task.assignee_id and task.assignee_id != current_user.id:
-        # Obtener la URL de origen para usar el subdominio correcto
-        origin_url = None
-        
-        # 1. Intenta obtener origin de los headers
-        origin_header = request.headers.get("origin")
-        if origin_header:
-            origin_url = origin_header
-            logger.info(f"Using origin header for notification: {origin_url}")
-        
-        # 2. Si no hay origin en headers, intenta obtener host y esquema
-        elif request.headers.get("host"):
-            scheme = request.headers.get("x-forwarded-proto", "https")
-            host = request.headers.get("host")
-            origin_url = f"{scheme}://{host}"
-            logger.info(f"Constructed origin from host header: {origin_url}")
-        
-        # 3. Si todo falla, usa la URL frontend de settings
-        if not origin_url:
-            origin_url = settings.FRONTEND_URL
-            logger.info(f"Using settings.FRONTEND_URL as fallback: {origin_url}")
-            
-        # Si el ticket se ha creado con un agente asignado y no es el creador, enviar notificación
+    # --- Assignment Notification ---
+    if task.assignee_id:
         try:
-            # Lanzar tarea en segundo plano para enviar la notificación
-            asyncio.create_task(send_assignment_notification(db, task, request_origin=origin_url))
-            logger.info(f"Notificación de asignación programada para ticket {task.id} al agente {task.assignee_id}")
+            # Load the assignee
+            task.assignee = db.query(Agent).filter(Agent.id == task.assignee_id).first()
+
+            request_origin = None
+            if request:
+                # Get the origin of the request (Frontend URL)
+                request_origin = str(request.headers.get("origin", ""))
+                logger.info(f"Request origin detected for notification: {request_origin}")
+            
+            # Send notification email to the assigned agent
+            from app.services.task_service import send_assignment_notification
+            await send_assignment_notification(db, task, request_origin)
         except Exception as e:
-            logger.error(f"Error al programar la notificación de asignación para ticket {task.id}: {str(e)}")
+            logger.error(f"Failed to send assignment notification for task {task.id}: {str(e)}")
     # --- End Assignment Notification ---
 
     # --- Send Email for Manually Created Ticket ---
@@ -266,6 +253,62 @@ async def create_task(
             logger.error(f"Error trying to send email for newly created ticket {task.id}: {str(email_error)}", exc_info=True)
             # Do not raise an exception here, ticket creation succeeded, email is secondary
     # --- End Send Email ---
+
+    # --- Send Notifications Based on Settings ---
+    try:
+        # Import notification service
+        from app.services.notification_service import send_notification
+
+        # 1. Notify user about ticket creation if enabled
+        if task.user and task.user.email:
+            template_vars = {
+                "user_name": task.user.name,
+                "ticket_id": task.id,
+                "ticket_title": task.title
+            }
+            
+            # Try to send notification
+            await send_notification(
+                db=db,
+                workspace_id=task.workspace_id,
+                category="users",
+                notification_type="new_ticket_created",
+                recipient_email=task.user.email,
+                recipient_name=task.user.name,
+                template_vars=template_vars,
+                task_id=task.id
+            )
+            
+        # 2. Notify agents about new ticket if enabled (to all agents)
+        agents = db.query(Agent).filter(
+            Agent.workspace_id == task.workspace_id,
+            Agent.is_active == True
+        ).all()
+        
+        for agent in agents:
+            if agent.email:
+                template_vars = {
+                    "agent_name": agent.name,
+                    "ticket_id": task.id,
+                    "ticket_title": task.title,
+                    "user_name": task.user.name if task.user else "Unknown User"
+                }
+                
+                # Try to send notification
+                await send_notification(
+                    db=db,
+                    workspace_id=task.workspace_id,
+                    category="agents",
+                    notification_type="new_ticket_created",
+                    recipient_email=agent.email,
+                    recipient_name=agent.name,
+                    template_vars=template_vars,
+                    task_id=task.id
+                )
+    
+    except Exception as notification_error:
+        logger.error(f"Error sending notifications for ticket {task.id}: {str(notification_error)}", exc_info=True)
+    # --- End Send Notifications ---
 
     return task
 
