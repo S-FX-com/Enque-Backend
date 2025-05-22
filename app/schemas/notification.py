@@ -155,3 +155,5 @@ class NotificationTemplateCreateRequest(BaseModel):
 class NotificationTemplateUpdateRequest(BaseModel):
     """Request schema for updating a notification template."""
     content: str 
+
+    

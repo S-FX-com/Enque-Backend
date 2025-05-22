@@ -234,7 +234,7 @@ async def send_notification(
         bool: Whether the notification was sent successfully
     """
     try:
-        logger.info(f"[NOTIFY] Starting notification sending: {category}/{notification_type} for {recipient_email} in workspace {workspace_id}")
+        logger.info(f"[NOTIFY] Iniciando envío de notificación: {category}/{notification_type} para {recipient_email} en workspace {workspace_id}")
         
         # Check if this notification type is enabled
         notification_setting = db.query(NotificationSetting).filter(
@@ -245,17 +245,17 @@ async def send_notification(
         ).first()
         
         if not notification_setting:
-            logger.warning(f"[NOTIFY] Notification {notification_type} for {category} is not enabled in workspace {workspace_id}")
+            logger.warning(f"[NOTIFY] Notificación {notification_type} para {category} no está habilitada en workspace {workspace_id}")
             return False
         
-        logger.info(f"[NOTIFY] Notification settings found: ID={notification_setting.id}, template_id={notification_setting.template_id}")
+        logger.info(f"[NOTIFY] Configuración de notificación encontrada: ID={notification_setting.id}, template_id={notification_setting.template_id}")
         
         # Check if email channel is enabled for this notification
         channels = json.loads(notification_setting.channels) if isinstance(notification_setting.channels, str) else notification_setting.channels
-        logger.info(f"[NOTIFY] Configured channels: {channels}")
+        logger.info(f"[NOTIFY] Canales configurados: {channels}")
         
         if "email" not in channels:
-            logger.warning(f"[NOTIFY] Email channel not enabled for notification {notification_type} in workspace {workspace_id}")
+            logger.warning(f"[NOTIFY] Canal de email no habilitado para notificación {notification_type} en workspace {workspace_id}")
             return False
         
         # Get the template
@@ -265,10 +265,10 @@ async def send_notification(
                 NotificationTemplate.id == notification_setting.template_id,
                 NotificationTemplate.is_enabled == True
             ).first()
-            logger.info(f"[NOTIFY] Template found: ID={template.id if template else 'None'}")
+            logger.info(f"[NOTIFY] Plantilla encontrada: ID={template.id if template else 'None'}")
         
         if not template:
-            logger.warning(f"[NOTIFY] No template found for notification {notification_type} in workspace {workspace_id}")
+            logger.warning(f"[NOTIFY] No se encontró plantilla para notificación {notification_type} en workspace {workspace_id}")
             return False
         
         # Find an active mailbox for the workspace to send from
@@ -278,13 +278,13 @@ async def send_notification(
                 MailboxConnection.is_active == True
             ).first()
             
-            logger.info(f"[NOTIFY] Mailbox connection found: {mailbox_conn is not None}")
+            logger.info(f"[NOTIFY] Mailbox connection encontrada: {mailbox_conn is not None}")
             
             if not mailbox_conn:
-                logger.warning(f"[NOTIFY] No active mailbox connection found for workspace {workspace_id}")
+                logger.warning(f"[NOTIFY] No se encontró conexión de mailbox activa para workspace {workspace_id}")
                 return False
         except Exception as mailbox_error:
-            logger.error(f"[NOTIFY] Error finding mailbox connection: {str(mailbox_error)}", exc_info=True)
+            logger.error(f"[NOTIFY] Error al buscar mailbox connection: {str(mailbox_error)}", exc_info=True)
             return False
         
         # Apply template variables
@@ -297,7 +297,7 @@ async def send_notification(
             subject = subject.replace(placeholder, str(var_value))
             html_body = html_body.replace(placeholder, str(var_value))
         
-        logger.info(f"[NOTIFY] Template rendered with variables: {list(template_vars.keys())}")
+        logger.info(f"[NOTIFY] Plantilla renderizada con variables: {list(template_vars.keys())}")
         
         # Get an admin with access to the mailbox to send the email
         try:
@@ -311,13 +311,13 @@ async def send_notification(
                     MicrosoftToken.access_token.isnot(None)
                 ).order_by(Agent.role.desc()).first()
             
-            logger.info(f"[NOTIFY] Admin with mailbox access found: {admin_sender_info is not None}")
+            logger.info(f"[NOTIFY] Admin con acceso al mailbox encontrado: {admin_sender_info is not None}")
             
             if not admin_sender_info:
-                logger.warning(f"[NOTIFY] No admin with mailbox access found for workspace {workspace_id}")
+                logger.warning(f"[NOTIFY] No se encontró admin con acceso al mailbox para workspace {workspace_id}")
                 return False
         except Exception as admin_error:
-            logger.error(f"[NOTIFY] Error finding admin with mailbox access: {str(admin_error)}", exc_info=True)
+            logger.error(f"[NOTIFY] Error al buscar admin con acceso al mailbox: {str(admin_error)}", exc_info=True)
             return False
         
         # Get current access token (refresh if needed)
@@ -326,17 +326,17 @@ async def send_notification(
         
         if ms_token.expires_at < datetime.utcnow():
             try:
-                logger.info(f"[NOTIFY] Refreshing token for mailbox {mailbox_connection.email}")
+                logger.info(f"[NOTIFY] Refrescando token para mailbox {mailbox_connection.email}")
                 graph_service = MicrosoftGraphService(db=db)
                 refreshed_ms_token = await graph_service.refresh_token_async(ms_token)
                 current_access_token = refreshed_ms_token.access_token
-                logger.info("[NOTIFY] Token refreshed successfully")
+                logger.info("[NOTIFY] Token refrescado exitosamente")
             except Exception as token_error:
-                logger.error(f"[NOTIFY] Error refreshing token: {str(token_error)}", exc_info=True)
+                logger.error(f"[NOTIFY] Error refrescando token: {str(token_error)}", exc_info=True)
                 return False
         
         # Send the email
-        logger.info(f"[NOTIFY] Attempting to send email from {mailbox_connection.email} to {recipient_email}")
+        logger.info(f"[NOTIFY] Intentando enviar email desde {mailbox_connection.email} a {recipient_email}")
         graph_service = MicrosoftGraphService(db=db)
         success = await graph_service.send_email_with_user_token(
             user_access_token=current_access_token,
@@ -348,12 +348,12 @@ async def send_notification(
         )
         
         if success:
-            logger.info(f"[NOTIFY] Notification {notification_type} sent successfully to {recipient_email}")
+            logger.info(f"[NOTIFY] Notificación {notification_type} enviada exitosamente a {recipient_email}")
             return True
         else:
-            logger.error(f"[NOTIFY] Failed to send notification {notification_type} to {recipient_email}")
+            logger.error(f"[NOTIFY] Falló el envío de notificación {notification_type} a {recipient_email}")
             return False
             
     except Exception as e:
-        logger.error(f"[NOTIFY] Error sending notification: {str(e)}", exc_info=True)
+        logger.error(f"[NOTIFY] Error enviando notificación: {str(e)}", exc_info=True)
         return False 

@@ -8,8 +8,8 @@ from app.database.base_class import Base
 
 class NotificationTemplate(Base):
     """Modelo para las plantillas de notificaciones"""
+
     __tablename__ = "notification_templates"
-    
     id = Column(Integer, primary_key=True, index=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     type = Column(String(100), nullable=False)  # 'ticket_created', 'ticket_resolved', etc.
@@ -34,8 +34,8 @@ class NotificationTemplate(Base):
 
 class NotificationSetting(Base):
     """Modelo para la configuración de notificaciones"""
-    __tablename__ = "notification_settings"
     
+    __tablename__ = "notification_settings"
     id = Column(Integer, primary_key=True, index=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     category = Column(String(100), nullable=False)  # 'agents', 'users', etc.

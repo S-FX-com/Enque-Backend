@@ -103,3 +103,14 @@ def get_current_workspace(
             detail="Workspace not found"
         )
     return workspace
+
+def check_workspace_access(user: Agent, workspace_id: int) -> None:
+    """
+    Check if a user has access to a specific workspace.
+    """
+    if user.workspace_id != workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have access to this workspace"
+        )
+    return None

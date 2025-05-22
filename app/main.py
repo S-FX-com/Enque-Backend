@@ -44,6 +44,7 @@ app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
 def allow_origin_regex(origin: str):
     allowed_patterns = [
         r"^https://app\.enque\.cc$",
+        r"^https://users\.enque\.cc$",
         r"^https://[a-zA-Z0-9-]+\.enque\.cc$",
         r"^http://localhost:\d+$"
     ]
@@ -55,7 +56,7 @@ def allow_origin_regex(origin: str):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Esto permite todos los orígenes, pero lo filtraremos con el middleware personalizado
     allow_origin_regex=None,
     allow_credentials=True,
     allow_methods=["*"],
@@ -69,8 +70,10 @@ async def cors_middleware(request, call_next):
     origin = request.headers.get("origin", "")
     response = await call_next(request)
 
-    if allow_origin_regex(origin):
+    # Asegurarse de agregar el origen a la respuesta si es permitido
+    if origin and (origin == "https://users.enque.cc" or allow_origin_regex(origin)):
         response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
 
