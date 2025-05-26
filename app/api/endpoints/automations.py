@@ -195,5 +195,5 @@ async def run_specific_automation(
             detail="Cannot run a disabled automation",
         )
     
-    result = run_automation(db, automation, current_user)
+    result = await run_automation(db, automation, current_user)
     return result 

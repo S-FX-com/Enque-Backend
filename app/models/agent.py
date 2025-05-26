@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, DateTime, func, Boolean, ForeignKey, Text 
+from sqlalchemy import Column, Integer, String, Enum, DateTime, func, Boolean, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.database.base_class import Base
 
@@ -7,7 +7,7 @@ class Agent(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     name = Column(String(100), nullable=False)
-    email = Column(String(100), nullable=False, unique=True, index=True)
+    email = Column(String(100), nullable=False, index=True)
     password = Column(String(255), nullable=True) 
     avatar = Column(String(255), nullable=True)
     role = Column(Enum('admin', 'agent', 'manager', name='agent_role'), default='agent', nullable=False)
@@ -24,6 +24,11 @@ class Agent(Base):
     last_login_origin = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Añadimos una restricción de unicidad compuesta por email y workspace_id
+    __table_args__ = (
+        UniqueConstraint('email', 'workspace_id', name='uix_agent_email_workspace'),
+    )
 
     # Relationships
     workspace = relationship("Workspace", back_populates="agents")

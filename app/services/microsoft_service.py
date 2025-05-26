@@ -446,14 +446,19 @@ class MicrosoftGraphService:
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
             
-            # Lista de filtros para identificar correos generados por notificaciones
+            # Lista mejorada de filtros para identificar correos generados por notificaciones
             notification_subject_patterns = [
                 "New ticket #", 
                 "Ticket #",
                 "New response to your ticket #",
-                "Ticket", # Más genérico para capturar otros formatos
-                "[ID:"    # Detectar el formato de ID que agregamos a los asuntos
+                "Ticket", 
+                "[ID:",     # Detectar el formato de ID que agregamos a los asuntos
+                "has been resolved",
+                "has been assigned"
             ]
+            
+            # Lista de dominios del sistema - detectados automáticamente por workspace
+            system_domains = self._get_system_domains_for_workspace(sync_config.workspace_id)
             
             for email_data in emails:
                 email_id = email_data.get("id")
@@ -464,7 +469,7 @@ class MicrosoftGraphService:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} already processed. Skipping."); continue
                     
                     # Obtener el asunto del correo para verificar si es una notificación del sistema
-                    email_subject = email_data.get("subject", "")
+                    email_subject = email_data.get("subject", "").lower()
                     
                     # Verificar si el correo es una notificación generada por el sistema
                     is_system_notification = False
@@ -473,11 +478,13 @@ class MicrosoftGraphService:
                     sender_email = email_data.get("from", {}).get("emailAddress", {}).get("address", "").lower()
                     mailbox_email = user_email.lower()
                     
-                    # Solo considerar como notificación del sistema si viene del propio buzón
-                    # o de una dirección conocida de Microsoft Exchange
-                    if (sender_email == mailbox_email or "microsoftexchange" in sender_email):
+                    # Verificación más estricta: 
+                    # 1. Si viene del mismo buzón o un dominio del sistema
+                    # 2. Y el asunto contiene patrones típicos de notificación
+                    if any(domain in sender_email for domain in system_domains) or sender_email == mailbox_email:
+                        # Si el remitente es del mismo dominio, verificar si el asunto coincide con patrones de notificación
                         for pattern in notification_subject_patterns:
-                            if pattern in email_subject:
+                            if pattern.lower() in email_subject:
                                 is_system_notification = True
                                 logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} appears to be a system notification with subject: '{email_subject}'. Skipping.")
                                 
@@ -486,31 +493,8 @@ class MicrosoftGraphService:
                                 if processed_folder_id:
                                     self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
                                 break
-                    # Si el remitente no es el propio buzón y contiene Re: [ID:xyz], es una respuesta del cliente
-                    elif "Re: [ID:" in email_subject:
-                        logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} is a client reply with subject: '{email_subject}'. Processing...")
-                        is_system_notification = False
-                        
-                        # Extraer el ID del ticket del asunto si contiene [ID:123]
-                        ticket_id_match = re.search(r'\[ID:(\d+)\]', email_subject)
-                        if ticket_id_match:
-                            ticket_id = ticket_id_match.group(1)
-                            logger.info(f"[MAIL SYNC] Detected ticket ID {ticket_id} in email subject")
-                            
-                            # Buscar ticket directamente por el ID extraído del asunto
-                            existing_mapping = self.db.query(EmailTicketMapping).join(Task).filter(
-                                Task.id == ticket_id,
-                                EmailTicketMapping.ticket_id == ticket_id
-                            ).first()
-                            
-                            if existing_mapping:
-                                logger.info(f"[MAIL SYNC] Found existing ticket {ticket_id} from subject [ID:{ticket_id}]. Will process as reply.")
-                                email_content = self._get_full_email(app_token, user_email, email_id)
-                                # Asignar manualmente el conversationId para forzar que se procese como respuesta
-                                if email_content and not 'conversationId' in email_content:
-                                    email_content['conversationId'] = existing_mapping.email_conversation_id
-                                    logger.info(f"[MAIL SYNC] Manually setting conversationId to {existing_mapping.email_conversation_id} for ID in subject match.")
                     
+                    # Si es una notificación del sistema, continuamos con el siguiente correo
                     if is_system_notification:
                         continue
                     
@@ -522,7 +506,7 @@ class MicrosoftGraphService:
                         existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
                     if existing_mapping_by_conv:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is part of existing conversation {conversation_id} (Ticket ID: {existing_mapping_by_conv.ticket_id}). Adding as comment.")
-                        email = self._parse_email_data(email_content, user_email)
+                        email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
                         reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown")
                         if not reply_user: logger.error(f"Could not get or create user for reply email sender: {email.sender.address}"); continue
@@ -562,6 +546,54 @@ class MicrosoftGraphService:
                                         logger.error(f"Error al procesar/decodificar adjunto '{att.name}' para comentario en ticket {existing_mapping_by_conv.ticket_id}: {e}", exc_info=True)
                         
                         self.db.add(new_comment)
+                        
+                        # NUEVO: Procesar workflows basados en el contenido del email
+                        try:
+                            from app.services.workflow_service import WorkflowService
+                            
+                            # Solo procesar si hay contenido significativo
+                            if email.body_content and email.body_content.strip():
+                                workflow_service = WorkflowService(self.db)
+                                
+                                # Preparar contexto para workflows
+                                workflow_context = {
+                                    'task_id': existing_mapping_by_conv.ticket_id,
+                                    'comment_id': None,  # Se establecerá después del commit
+                                    'agent_id': system_agent.id,  # Agente del sistema que procesa
+                                    'workspace_id': workspace.id,
+                                    'task_status': ticket_to_update.status if ticket_to_update else 'unknown',
+                                    'task_priority': getattr(ticket_to_update, 'priority', 'normal') if ticket_to_update else 'normal',
+                                    'is_private': False,
+                                    'is_from_email': True,
+                                    'email_sender': reply_user.email,
+                                    'email_sender_name': reply_user.name
+                                }
+                                
+                                # Procesar workflows basados en contenido del email
+                                workflow_results = workflow_service.process_message_for_workflows(
+                                    email.body_content,
+                                    workspace.id,
+                                    workflow_context
+                                )
+                                
+                                if workflow_results:
+                                    logger.info(f"[MAIL SYNC] Executed {len(workflow_results)} workflows for email reply on ticket {existing_mapping_by_conv.ticket_id}")
+                                    for result in workflow_results:
+                                        logger.info(f"[MAIL SYNC] Workflow executed: {result.get('workflow_name')} - {result.get('trigger')}")
+                                
+                        except Exception as workflow_error:
+                            logger.error(f"[MAIL SYNC] Error processing workflows for email reply: {str(workflow_error)}")
+                        
+                        # AGREGAR: Crear actividad para la respuesta del usuario por email
+                        user_activity = Activity(
+                            agent_id=None,  # No hay agente, es un usuario quien responde
+                            action=f"{reply_user.name} replied via email",  # Quitar "User" para simplificar
+                            source_type="Comment",
+                            source_id=existing_mapping_by_conv.ticket_id,  # Usar ticket_id como source_id
+                            workspace_id=workspace.id
+                        )
+                        self.db.add(user_activity)
+                        
                         reply_email_mapping = EmailTicketMapping(
                             email_id=email.id, email_conversation_id=email.conversation_id, ticket_id=existing_mapping_by_conv.ticket_id,
                             email_subject=email.subject, email_sender=f"{email.sender.name} <{email.sender.address}>",
@@ -579,7 +611,7 @@ class MicrosoftGraphService:
                         continue
                     else:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
-                        email = self._parse_email_data(email_content, user_email)
+                        email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation."); continue
                         
                         # Verificación adicional del remitente para evitar bucles
@@ -642,11 +674,35 @@ class MicrosoftGraphService:
             return []
         except Exception as e: logger.error(f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {str(e)}", exc_info=True); return []
 
-    def _parse_email_data(self, email_content: Dict, user_email: str) -> Optional[EmailData]:
+    def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
             sender = EmailAddress(name=sender_data.get("name", ""), address=sender_data.get("address", ""))
             if not sender.address: logger.warning(f"Could not parse sender from email content: {email_content.get('id')}"); return None
+            
+            # Verificar si el correo es una notificación del sistema o proviene del mismo dominio
+            sender_email = sender.address.lower()
+            
+            # Usar detección automática de dominios si tenemos workspace_id, sino usar básicos
+            if workspace_id:
+                system_domains = self._get_system_domains_for_workspace(workspace_id)
+            else:
+                system_domains = ["enque.cc", "microsoftexchange"]  # Fallback básico
+                
+            notification_subjects = ["new ticket #", "ticket #", "new response", "[id:"]
+            
+            # Si el remitente es de un dominio del sistema o es el mismo buzón
+            if sender_email == user_email.lower() or any(domain in sender_email for domain in system_domains):
+                logger.warning(f"Email from system address or company domain: {sender_email}")
+                # No rechazar completamente, pero marcar para que luego se pueda filtrar
+                
+            # Si el asunto parece ser una notificación del sistema
+            if email_content.get("subject", ""):
+                subject_lower = email_content.get("subject", "").lower()
+                if any(phrase in subject_lower for phrase in notification_subjects):
+                    logger.warning(f"Email subject appears to be a system notification: {email_content.get('subject')}")
+                    # No rechazar completamente, pero marcar para que luego se pueda filtrar
+            
             recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("toRecipients", []) if r.get("emailAddress")]
             if not recipients: recipients = [EmailAddress(name="", address=user_email)]
             body_data = email_content.get("body", {}); body_content = body_data.get("content", ""); body_type = body_data.get("contentType", "html")
@@ -671,6 +727,46 @@ class MicrosoftGraphService:
 
     def _create_task_from_email(self, email: EmailData, config: EmailSyncConfig, system_agent: Agent) -> Optional[Task]:
         if not system_agent: logger.error("System agent is required for _create_task_from_email but was not provided."); return None
+        
+        # Verificación más inteligente para evitar bucles de notificación
+        if email.subject:
+            subject_lower = email.subject.lower()
+            
+            # Lista completa de patrones de notificación
+            notification_patterns = [
+                "[id:", "new ticket #", "ticket #", "new response", 
+                "resolved", "assigned", "has been created", "notification:",
+                "automated message", "do not reply", "noreply"
+            ]
+            
+            # Si el asunto contiene patrones claros de notificación, rechazar
+            if any(pattern in subject_lower for pattern in notification_patterns):
+                logger.warning(f"Ignorando correo con asunto '{email.subject}' que parece ser una notificación del sistema")
+                return None
+        
+        # Verificación adicional por dominio solo para notificaciones obvias
+        sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
+        
+        # Obtener dominios del sistema para este workspace automáticamente
+        system_domains = self._get_system_domains_for_workspace(config.workspace_id)
+        
+        # Solo rechazar emails de dominios core del sistema (enque.cc, microsoftexchange)
+        core_system_domains = ["enque.cc", "microsoftexchange"]
+        if sender_domain in core_system_domains:
+            logger.warning(f"Ignorando correo del dominio del sistema core: {sender_domain} - {email.sender.address}")
+            return None
+        
+        # Para dominios del workspace (como s-fx.com, cliente1.com, etc.), 
+        # solo rechazar si es claramente una notificación (por asunto)
+        workspace_domains = [d for d in system_domains if d not in core_system_domains]
+        if sender_domain in workspace_domains and email.subject:
+            subject_lower = email.subject.lower()
+            if any(keyword in subject_lower for keyword in ["new ticket #", "ticket #", "[id:", "has been"]):
+                logger.warning(f"Ignorando notificación de dominio del workspace {sender_domain} con asunto '{email.subject}'")
+                return None
+            else:
+                logger.info(f"Permitiendo email legítimo de dominio del workspace {sender_domain} con asunto '{email.subject}'")
+        
         try:
             priority = config.default_priority
             if email.importance == "high": priority = "High"
@@ -749,12 +845,54 @@ class MicrosoftGraphService:
             # Commit para asegurar que el ticket esté guardado antes de enviar notificaciones
             self.db.commit()
             
+            # NUEVO: Procesar workflows basados en el contenido del email inicial
+            try:
+                from app.services.workflow_service import WorkflowService
+                
+                # Solo procesar si hay contenido significativo
+                if email.body_content and email.body_content.strip():
+                    workflow_service = WorkflowService(self.db)
+                    
+                    # Preparar contexto para workflows
+                    workflow_context = {
+                        'task_id': task.id,
+                        'comment_id': initial_comment.id,
+                        'agent_id': system_agent.id,  # Agente del sistema que procesa
+                        'workspace_id': workspace.id,
+                        'task_status': task.status,
+                        'task_priority': task.priority,
+                        'is_private': False,
+                        'is_from_email': True,
+                        'is_new_ticket': True,
+                        'email_sender': user.email,
+                        'email_sender_name': user.name,
+                        'assignee_id': task.assignee_id
+                    }
+                    
+                    # Procesar workflows basados en contenido del email inicial
+                    workflow_results = workflow_service.process_message_for_workflows(
+                        email.body_content,
+                        workspace.id,
+                        workflow_context
+                    )
+                    
+                    if workflow_results:
+                        logger.info(f"[MAIL SYNC] Executed {len(workflow_results)} workflows for new ticket {task.id}")
+                        for result in workflow_results:
+                            logger.info(f"[MAIL SYNC] Workflow executed: {result.get('workflow_name')} - {result.get('trigger')}")
+                        
+                        # Commit any changes made by workflows
+                        self.db.commit()
+                    
+            except Exception as workflow_error:
+                logger.error(f"[MAIL SYNC] Error processing workflows for new ticket: {str(workflow_error)}")
+            
             # Verificar si debemos enviar notificaciones (evitar bucles y spam)
             should_send_notification = True
             
             # Evitar notificaciones para correos del sistema o notificaciones automáticas
             notification_keywords = ["ticket", "created", "notification", "system", "auto", "automated", "no-reply", "noreply"]
-            system_domains = ["enque.cc", "microsoftexchange"]  # Eliminamos s-fx.com para permitir notificaciones normales
+            system_domains = self._get_system_domains_for_workspace(workspace.id)  # Detección automática
             
             # Verificar si el asunto parece una notificación automática
             if email.subject:
@@ -1424,6 +1562,15 @@ class MicrosoftGraphService:
     ) -> bool:
         logger.info(f"Attempting to send new email using user token from: {sender_mailbox_email} to: {recipient_email} with subject: {subject}")
         
+        if not user_access_token:
+            logger.error("Token is None or empty. Cannot send email.")
+            return False
+            
+        # Log de los primeros y últimos caracteres del token para debugging
+        token_start = user_access_token[:10] if len(user_access_token) > 10 else user_access_token
+        token_end = user_access_token[-5:] if len(user_access_token) > 5 else ""
+        logger.info(f"Token starts with: {token_start}... and ends with: ...{token_end}")
+        
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
         
@@ -1451,25 +1598,80 @@ class MicrosoftGraphService:
         try:
             send_mail_endpoint = f"{self.graph_url}/users/{sender_mailbox_email}/sendMail"
             headers = {"Authorization": f"Bearer {user_access_token}", "Content-Type": "application/json"}
+            logger.info(f"Calling Graph API endpoint: {send_mail_endpoint}")
+            
             async with httpx.AsyncClient() as client:
-                response = await client.post(send_mail_endpoint, headers=headers, json=email_payload)
+                logger.info("Sending request to Microsoft Graph API...")
+                response = await client.post(send_mail_endpoint, headers=headers, json=email_payload, timeout=30.0)
+                
+            logger.info(f"Graph API response status code: {response.status_code}")
+            
             if response.status_code not in [200, 202]:
                 error_details = "No details available"; 
-                try: error_details = response.json()
-                except Exception: error_details = response.text
+                try: 
+                    error_details = response.json()
+                    logger.error(f"Detailed error response: {error_details}")
+                except Exception: 
+                    error_details = response.text
+                    logger.error(f"Error response text: {error_details}")
+                    
                 logger.error(f"Failed to send email from {sender_mailbox_email} using user token. Status: {response.status_code}. Details: {error_details}")
                 response.raise_for_status() 
+                
             logger.info(f"Successfully sent email from {sender_mailbox_email} to {recipient_email} using user token.")
             return True
         except httpx.HTTPStatusError as e:
             error_details = "No details available"; 
-            try: error_details = e.response.json()
-            except Exception: error_details = e.response.text
+            try: 
+                error_details = e.response.json()
+                logger.error(f"Detailed error response in exception: {error_details}")
+            except Exception: 
+                error_details = e.response.text
+                logger.error(f"Error response text in exception: {error_details}")
+                
             logger.error(f"HTTP error sending email from {sender_mailbox_email} using user token. Status: {e.response.status_code}. Details: {error_details}. Error: {str(e)}")
+            return False
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout error sending email from {sender_mailbox_email}: {str(e)}")
             return False
         except Exception as e:
             logger.error(f"Error sending email from {sender_mailbox_email} using user token: {e}", exc_info=True)
             return False
+
+    def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:
+        """
+        Detecta automáticamente los dominios del sistema para un workspace específico
+        basándose en los buzones de correo conectados al workspace.
+        """
+        try:
+            # Dominios siempre considerados del sistema (core platform)
+            core_system_domains = ["enque.cc", "microsoftexchange"]
+            
+            # Obtener todos los buzones conectados a este workspace
+            mailbox_connections = self.db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == workspace_id,
+                MailboxConnection.is_active == True
+            ).all()
+            
+            # Extraer dominios únicos de los buzones
+            workspace_domains = set()
+            for mailbox in mailbox_connections:
+                if mailbox.email and '@' in mailbox.email:
+                    domain = mailbox.email.split('@')[-1].lower()
+                    workspace_domains.add(domain)
+            
+            # Combinar dominios core con dominios del workspace
+            all_system_domains = core_system_domains + list(workspace_domains)
+            
+            if workspace_domains:
+                logger.info(f"Detected system domains for workspace {workspace_id}: {all_system_domains}")
+            
+            return all_system_domains
+            
+        except Exception as e:
+            logger.error(f"Error detecting system domains for workspace {workspace_id}: {str(e)}")
+            # Fallback a dominios core si hay error
+            return ["enque.cc", "microsoftexchange"]
 
 def get_microsoft_service(db: Session) -> MicrosoftGraphService:
     return MicrosoftGraphService(db)

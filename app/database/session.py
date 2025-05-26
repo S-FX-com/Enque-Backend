@@ -11,8 +11,8 @@ if settings.DATABASE_URI:
         settings.DATABASE_URI,
         pool_pre_ping=True,
         pool_recycle=3600,
-        pool_size=4,
-        max_overflow=8,
+        pool_size=6,
+        max_overflow=10,
 
     )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

@@ -23,6 +23,13 @@ except ImportError:
     has_scheduler = False
     print("WARNING: Email sync scheduler not loaded due to missing dependencies")
 
+try:
+    from app.services.automation_scheduler import start_automation_scheduler
+    has_automation_scheduler = True
+except ImportError:
+    has_automation_scheduler = False
+    print("WARNING: Automation scheduler not loaded due to missing dependencies")
+
 from app.utils.logger import logger
 
 app = FastAPI(
@@ -136,6 +143,13 @@ def startup_events():
             start_scheduler()
         elif not engine:
             logger.warning("No se inició el sincronizador de emails porque no hay base de datos configurada")
+            
+        # Iniciar el programador de automatizaciones
+        if has_automation_scheduler and engine:
+            start_automation_scheduler()
+            logger.info("Automation scheduler started")
+        elif not engine:
+            logger.warning("No se inició el programador de automatizaciones porque no hay base de datos configurada")
     except Exception as e:
         logger.error(f"Error during startup events: {e}")
 

@@ -2,6 +2,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func 
+from sqlalchemy.exc import IntegrityError  # Añadimos la importación para el manejo del error
 
 from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
 from app.database.session import get_db
@@ -189,18 +190,33 @@ async def invite_agent(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Workspace ID in request does not match current admin's workspace."
         )
-    existing_agent = db.query(Agent).filter(
+    
+    # Primero verificamos si el agente ya existe en este workspace
+    existing_agent_in_workspace = db.query(Agent).filter(
         Agent.email == agent_invite_in.email,
         Agent.workspace_id == agent_invite_in.workspace_id
     ).first()
-    if existing_agent:
+    
+    if existing_agent_in_workspace:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Agent with email {agent_invite_in.email} already exists in this workspace.",
         )
 
+    # Luego verificamos si el agente existe en cualquier otro workspace
+    existing_agent = db.query(Agent).filter(
+        Agent.email == agent_invite_in.email
+    ).first()
+
     invitation_token = secrets.token_urlsafe(32)
     token_expires_at = datetime.utcnow() + timedelta(hours=settings.AGENT_INVITATION_TOKEN_EXPIRE_HOURS)
+    
+    # Si el agente ya existe en otro workspace, creamos uno nuevo solo para este workspace
+    # pero mantenemos la referencia al mismo email
+    if existing_agent:
+        logger.info(f"Agent with email {agent_invite_in.email} already exists in another workspace. Creating a new record for current workspace.")
+        
+    # Creamos el nuevo agente para este workspace
     new_agent_data = AgentCreate(
         name=agent_invite_in.name,
         email=agent_invite_in.email,
@@ -214,9 +230,18 @@ async def invite_agent(
     
     db_agent = Agent(**new_agent_data.dict()) 
 
-    db.add(db_agent)
-    db.commit()
-    db.refresh(db_agent)
+    try:
+        db.add(db_agent)
+        db.commit()
+        db.refresh(db_agent)
+    except IntegrityError as e:
+        db.rollback()
+        logger.error(f"IntegrityError while inviting agent {agent_invite_in.email}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Database error: {str(e)}. The agent may already exist in this workspace."
+        )
+    
     invitation_link = f"{settings.FRONTEND_URL}/accept-invitation?token={invitation_token}"
 
     admin_mailbox_connection = db.query(MailboxConnection).filter(

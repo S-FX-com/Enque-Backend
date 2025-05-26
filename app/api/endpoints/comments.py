@@ -1,7 +1,6 @@
 from typing import Any, List, Dict
 from datetime import datetime # Import datetime
 import asyncio
-from threading import Thread
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload # Re-import joinedload
@@ -22,6 +21,7 @@ from app.services.microsoft_service import get_microsoft_service, MicrosoftGraph
 from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
 from app.core.config import settings
+from app.services.workflow_service import WorkflowService
 
 router = APIRouter()
 
@@ -96,6 +96,7 @@ async def create_comment(
     """
     Create a new comment on a task.
     The comment can be private (visible only to agents) or public.
+    Now includes automatic workflow processing for content analysis.
     """
     
     # Fetch the task ensuring it belongs to the user's workspace
@@ -183,55 +184,138 @@ async def create_comment(
         db.commit()
         db.refresh(comment)
 
+    # NUEVO: Procesar workflows automáticamente para análisis de contenido
+    workflow_results = []
+    try:
+        # Solo procesar workflows si el comentario tiene contenido significativo
+        if comment_in.content and comment_in.content.strip() and not comment_in.is_attachment_upload:
+            workflow_service = WorkflowService(db)
+            
+            # Preparar contexto para workflows
+            workflow_context = {
+                'task_id': task_id,
+                'comment_id': comment.id,
+                'agent_id': current_user.id,
+                'workspace_id': current_user.workspace_id,
+                'task_status': task.status,
+                'task_priority': getattr(task, 'priority', 'normal'),
+                'is_private': comment_in.is_private,
+                'assignee_changed': assignee_changed,
+                'previous_assignee_id': previous_assignee_id,
+                'current_assignee_id': task.assignee_id
+            }
+            
+            # Procesar workflows basados en contenido
+            workflow_results = workflow_service.process_message_for_workflows(
+                comment_in.content,
+                current_user.workspace_id,
+                workflow_context
+            )
+            
+            if workflow_results:
+                logger.info(f"Executed {len(workflow_results)} workflows for comment {comment.id} on task {task_id}")
+                
+                # Aplicar resultados de workflows al ticket si es necesario
+                for result in workflow_results:
+                    try:
+                        execution_result = result.get('execution_result', {})
+                        if execution_result.get('status') == 'completed':
+                            # Procesar resultados de acciones
+                            for action_result in execution_result.get('results', []):
+                                if action_result.get('status') == 'success':
+                                    action_data = action_result.get('result', {})
+                                    
+                                    # Auto-asignación
+                                    if 'assigned_to' in action_data and not assignee_changed:
+                                        # Buscar el usuario por nombre/email
+                                        assignee = db.query(AgentModel).filter(
+                                            AgentModel.email == action_data['assigned_to'],
+                                            AgentModel.workspace_id == current_user.workspace_id
+                                        ).first()
+                                        if assignee:
+                                            task.assignee_id = assignee.id
+                                            assignee_changed = True
+                                            logger.info(f"Auto-assigned task {task_id} to {assignee.email} via workflow")
+                                    
+                                    # Auto-priorización
+                                    if 'priority' in action_data:
+                                        task.priority = action_data['priority']
+                                        logger.info(f"Auto-set priority of task {task_id} to {action_data['priority']} via workflow")
+                                    
+                                    # Auto-categorización
+                                    if 'category' in action_data:
+                                        task.category = action_data['category']
+                                        logger.info(f"Auto-categorized task {task_id} as {action_data['category']} via workflow")
+                                        
+                    except Exception as e:
+                        logger.error(f"Error applying workflow result {result.get('workflow_id')}: {str(e)}")
+                        continue
+                        
+                # Commit changes made by workflows
+                db.commit()
+                db.refresh(task)
+            
+    except Exception as e:
+        logger.error(f"Error processing workflows for comment {comment.id}: {str(e)}")
+        # Continue without failing the comment creation
+
     # Log the activity (agent created comment) - ahora comment.id no será None
     try:
+        # Crear actividad para el comentario con información del ticket
         activity = Activity(
             agent_id=current_user.id,
-            source_type="Ticket", 
-            source_id=comment.id,
-            action="created" if not comment_in.is_attachment_upload else "attachment_upload",
+            source_type="Comment",  # Cambiar a Comment para distinguir de creación de tickets
+            source_id=task_id,  # Usar task_id como source_id para mantener la referencia al ticket
+            action=f"commented on ticket #{task_id}" if not comment_in.is_attachment_upload else f"uploaded attachment to ticket #{task_id}",
             workspace_id=current_user.workspace_id
         )
         db.add(activity)
-        logger.info(f"Activity logged for comment creation: {comment.id} by {current_user.id}")
+        logger.info(f"Activity logged for comment creation: comment {comment.id} on task {task_id} by agent {current_user.id}")
     except Exception as e:
         logger.error(f"Error creating activity for comment {comment.id}: {e}")
         # No hacemos rollback aquí, solo registramos el error
 
-    # Send email notification when a public comment is created
-    # (but not for attachment uploads which are handled separately)
-    if not comment_in.is_private and not comment_in.is_attachment_upload:
-        # Necesitamos la ruta de la base de datos para el background thread
-        db_path = settings.DATABASE_URI
-        
-        if db_path:
-            # Add task to background tasks for email sending
-            try:
-                # Iniciar un thread para procesar el email en segundo plano
-                thread = Thread(
-                    target=send_email_in_background,
-                    args=(
-                        task_id,
-                        comment.id,
-                        comment.content,
-                        current_user.id,
-                        current_user.email,
-                        current_user.name,
-                        comment.is_private,
-                        processed_attachment_ids,
-                        db_path
-                    )
-                )
-                thread.daemon = True
-                thread.start()
-                logger.info(f"Started background thread for email sending for comment {comment.id} on task {task_id}")
-            except Exception as e:
-                logger.error(f"Error queuing email for task {task_id}: {e}", exc_info=True)
-    
     # Hacemos un commit final para guardar todo (activity)
     db.commit()
     db.refresh(task)  # Ensure the task is fresh
     db.refresh(comment)
+    
+    # Ejecutar workflows para comentarios
+    try:
+        context = {'ticket': task, 'comment': comment, 'agent': current_user}
+        
+        # Workflow general para comentarios agregados
+        executed_workflows = WorkflowService.execute_workflows(
+            db=db,
+            trigger='comment.added',
+            workspace_id=task.workspace_id,
+            context=context
+        )
+        
+        # Workflows específicos según el tipo de comentario
+        if not comment_in.is_private:
+            # Determinar si es respuesta de agente o cliente
+            if current_user:  # Es un agente
+                executed_workflows.extend(WorkflowService.execute_workflows(
+                    db=db,
+                    trigger='agent.replied',
+                    workspace_id=task.workspace_id,
+                    context=context
+                ))
+            else:
+                # Si fuera un cliente (aunque actualmente solo agentes pueden comentar)
+                executed_workflows.extend(WorkflowService.execute_workflows(
+                    db=db,
+                    trigger='customer.replied',
+                    workspace_id=task.workspace_id,
+                    context=context
+                ))
+        
+        if executed_workflows:
+            logger.info(f"Executed workflows for comment creation {comment.id}: {executed_workflows}")
+            
+    except Exception as e:
+        logger.error(f"Error executing workflows for comment creation {comment.id}: {str(e)}")
     
     # Si el ticket se asignó a un nuevo agente y no es el que está comentando
     if assignee_changed and task.assignee_id != current_user.id:
@@ -308,12 +392,67 @@ async def create_comment(
         logger.error(f"Error sending notifications for comment {comment.id} on task {task_id}: {str(notification_error)}", exc_info=True)
     # --- End Send Notifications ---
     
-    # Return both the comment and updated task
-    return {
-        "comment": comment,
-        "task": task,
-        "assignee_changed": assignee_changed  # Asegurarnos de incluir este campo requerido
-    }
+    # Final commit for any remaining changes
+    try:
+        db.commit()
+        db.refresh(comment)
+        db.refresh(task)
+    except Exception as e:
+        logger.error(f"Error in final commit for comment {comment.id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Error saving comment")
+
+    # Add email processing to background tasks if the comment is not private
+    if not comment_in.is_private:
+        try:
+            # Get the database path for background task
+            db_path = str(settings.DATABASE_URI)
+            
+            background_tasks.add_task(
+                send_email_in_background,
+                task_id=task_id,
+                comment_id=comment.id,
+                comment_content=comment_in.content,
+                agent_id=current_user.id,
+                agent_email=current_user.email,
+                agent_name=current_user.name,
+                is_private=comment_in.is_private,
+                processed_attachment_ids=processed_attachment_ids,
+                db_path=db_path
+            )
+            logger.info(f"Email background task queued for comment {comment.id} on task {task_id}")
+        except Exception as e:
+            logger.error(f"Error queuing email background task for comment {comment.id}: {e}")
+
+    # Load the task with all necessary relationships
+    task_with_details = db.query(TaskModel).options(
+        joinedload(TaskModel.assignee),
+        joinedload(TaskModel.comments).joinedload(CommentModel.agent),
+        joinedload(TaskModel.comments).joinedload(CommentModel.attachments),
+        joinedload(TaskModel.user)
+    ).filter(TaskModel.id == task_id).first()
+
+    # Load the comment with agent details
+    comment_with_agent = db.query(CommentModel).options(
+        joinedload(CommentModel.agent),
+        joinedload(CommentModel.attachments)
+    ).filter(CommentModel.id == comment.id).first()
+
+    # Prepare response with workflow information
+    response_data = CommentResponseModel(
+        comment=comment_with_agent,
+        task=task_with_details,
+        assignee_changed=assignee_changed
+    )
+    
+    # Add workflow results to response if any were executed
+    if workflow_results:
+        # Add to response as extra field (will be ignored by Pydantic but available in JSON)
+        response_dict = response_data.model_dump()
+        response_dict['workflow_results'] = workflow_results
+        return response_dict
+
+    return response_data
 
 
 @router.get("/comments/{comment_id}", response_model=CommentSchema)

@@ -1,7 +1,7 @@
-
 from typing import Optional, List, ForwardRef
 from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime
+import re
 WorkspaceRef = ForwardRef("Workspace")
 
 class AgentBase(BaseModel):
@@ -21,6 +21,7 @@ class AgentBase(BaseModel):
         if v not in allowed_roles:
             raise ValueError(f"Role must be one of {allowed_roles}")
         return v
+
 class AgentInviteCreate(BaseModel):
     name: str
     email: EmailStr
@@ -63,6 +64,47 @@ class AgentUpdate(BaseModel):
                 raise ValueError(f"Role must be one of {allowed_roles}")
         return v
 
+    @validator("password")
+    def validate_password(cls, v):
+        if v is not None:
+            return cls._validate_password_strength(v)
+        return v
+
+    @staticmethod
+    def _validate_password_strength(password: str) -> str:
+        """
+        Validates that the password meets security requirements
+        """
+        if len(password) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        
+        if len(password) > 128:
+            raise ValueError("Password cannot be more than 128 characters long")
+        
+        if not re.search(r"[a-z]", password):
+            raise ValueError("Password must contain at least one lowercase letter")
+        
+        if not re.search(r"[A-Z]", password):
+            raise ValueError("Password must contain at least one uppercase letter")
+        
+        if not re.search(r"\d", password):
+            raise ValueError("Password must contain at least one number")
+        
+        if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?~`]", password):
+            raise ValueError("Password must contain at least one special character (!@#$%^&*()_+-=[]{}|;':\"\\,.<>?/~`)")
+        
+        # Check that it's not a common password
+        common_passwords = [
+            "password", "123456", "password123", "admin", "qwerty", 
+            "letmein", "welcome", "monkey", "dragon", "master",
+            "hello", "freedom", "whatever", "qazwsx", "trustno1"
+        ]
+        
+        if password.lower() in common_passwords:
+            raise ValueError("Password cannot be a common password")
+        
+        return password
+
 class AgentInDBBase(AgentBase):
     id: int
     workspace_id: int
@@ -97,11 +139,22 @@ class Agent(AgentInDBBase):
 class AgentAcceptInvitation(BaseModel):
     token: str
     password: str
+
+    @validator("password")
+    def validate_password(cls, v):
+        return AgentUpdate._validate_password_strength(v)
+
 class AgentPasswordResetRequest(BaseModel):
     email: EmailStr
+
 class AgentResetPassword(BaseModel):
     token: str
     new_password: str
+
+    @validator("new_password")
+    def validate_new_password(cls, v):
+        return AgentUpdate._validate_password_strength(v)
+
 class AgentWithDetails(Agent):
     workspace: WorkspaceRef
 

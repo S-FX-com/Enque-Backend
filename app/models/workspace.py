@@ -35,6 +35,7 @@ class Workspace(Base):
     notification_templates = relationship("NotificationTemplate", back_populates="workspace", cascade="all, delete-orphan")
     notification_settings = relationship("NotificationSetting", back_populates="workspace", cascade="all, delete-orphan")
     automations = relationship("Automation", back_populates="workspace", cascade="all, delete-orphan")
+    workflows = relationship("Workflow", back_populates="workspace", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Workspace {self.name}>" 

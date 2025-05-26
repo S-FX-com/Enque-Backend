@@ -36,14 +36,14 @@ async def read_notifications(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Retrieve recent activities relevant for notifications (e.g., ticket creations).
+    Retrieve recent activities relevant for notifications (e.g., ticket creations, comments).
     Filters by the current user's workspace.
     """
     notifications = db.query(Activity).options(
         joinedload(Activity.agent) 
     ).filter(
         Activity.workspace_id == current_user.workspace_id,
-        Activity.source_type == 'Ticket',
+        Activity.source_type.in_(['Ticket', 'Comment']),  # Incluir tanto tickets como comentarios
     ).order_by(
         Activity.created_at.desc()
     ).limit(limit).all()
@@ -54,6 +54,8 @@ async def read_notifications(
         activity_detail.creator_user_name = None
         activity_detail.creator_user_email = None
         activity_detail.creator_user_id = None
+        
+        # Para actividades de tickets, obtener información del usuario que creó el ticket
         if activity.source_type == 'Ticket':
             task = db.query(Task).options(
                 joinedload(Task.user) 
@@ -62,7 +64,25 @@ async def read_notifications(
                 activity_detail.creator_user_name = task.user.name
                 activity_detail.creator_user_email = task.user.email 
                 activity_detail.creator_user_id = task.user.id 
+        
+        # Para actividades de comentarios, extraer el nombre del usuario desde el action
+        elif activity.source_type == 'Comment':
+            # El action contiene algo como "Juan Pérez replied via email"
+            # Extraer el nombre del usuario desde el texto del action
+            if activity.action and " replied via email" in activity.action:
+                # Extraer el nombre antes de " replied via email"
+                user_name_part = activity.action.replace(" replied via email", "")
+                activity_detail.creator_user_name = user_name_part
+                # Para comentarios de email, no tenemos el email/ID directamente aquí
+                # pero al menos tenemos el nombre
+            else:
+                # Si es un comentario pero no tiene el formato esperado, 
+                # probablemente sea de un agente, usar el agente
+                if activity.agent:
+                    activity_detail.creator_user_name = activity.agent.name
+        
         results.append(activity_detail)
+    
     background_tasks = BackgroundTasks()
     background_tasks.add_task(clean_old_notifications, db)
 
@@ -78,7 +98,7 @@ def clean_old_notifications(db: Session) -> None:
         cutoff_date = datetime.utcnow() - timedelta(days=2)
         old_notifications = db.query(Activity).filter(
             Activity.created_at < cutoff_date,
-            Activity.source_type == 'Ticket'  
+            Activity.source_type.in_(['Ticket', 'Comment'])  # Incluir comentarios en la limpieza
         ).all()
         if old_notifications:
             count = len(old_notifications)
@@ -106,7 +126,7 @@ async def manual_clean_old_notifications(
         cutoff_date = datetime.utcnow() - timedelta(days=2)
         deleted = db.query(Activity).filter(
             Activity.created_at < cutoff_date,
-            Activity.source_type == 'Ticket' 
+            Activity.source_type.in_(['Ticket', 'Comment'])  # Incluir comentarios en la limpieza manual
         ).delete(synchronize_session=False)
         
         db.commit()
@@ -199,7 +219,7 @@ async def delete_all_notifications(
     try:
         deleted = db.query(Activity).filter(
             Activity.workspace_id == current_user.workspace_id,
-            Activity.source_type == 'Ticket'  
+            Activity.source_type.in_(['Ticket', 'Comment'])  # Incluir comentarios al eliminar todas las notificaciones
         ).delete(synchronize_session=False)
         
         db.commit()

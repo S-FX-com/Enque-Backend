@@ -64,6 +64,20 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
     db.refresh(task) 
     db.refresh(task, attribute_names=['user']) 
     
+    # Ejecutar workflows para el evento 'ticket.created'
+    try:
+        from app.services.workflow_service import WorkflowService
+        context = {'ticket': task}
+        executed_workflows = WorkflowService.execute_workflows(
+            db=db,
+            trigger='ticket.created',
+            workspace_id=task.workspace_id,
+            context=context
+        )
+        if executed_workflows:
+            logger.info(f"Executed workflows for ticket creation {task.id}: {executed_workflows}")
+    except Exception as e:
+        logger.error(f"Error executing workflows for ticket creation {task.id}: {str(e)}")
 
     return task
 
@@ -96,6 +110,7 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         return None
     old_assignee_id = task.assignee_id
     old_status = task.status
+    old_priority = task.priority
 
     update_data = task_in.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -104,6 +119,59 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     db.commit()
     db.refresh(task)
     db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
+    
+    # Ejecutar workflows basados en los cambios realizados
+    try:
+        from app.services.workflow_service import WorkflowService
+        context = {'ticket': task, 'old_values': {'assignee_id': old_assignee_id, 'status': old_status, 'priority': old_priority}}
+        
+        # Workflow general de actualización
+        executed_workflows = WorkflowService.execute_workflows(
+            db=db,
+            trigger='ticket.updated',
+            workspace_id=task.workspace_id,
+            context=context
+        )
+        
+        # Workflows específicos según el tipo de cambio
+        if 'status' in update_data and old_status != task.status:
+            executed_workflows.extend(WorkflowService.execute_workflows(
+                db=db,
+                trigger='ticket.status_changed',
+                workspace_id=task.workspace_id,
+                context=context
+            ))
+        
+        if 'priority' in update_data and old_priority != task.priority:
+            executed_workflows.extend(WorkflowService.execute_workflows(
+                db=db,
+                trigger='ticket.priority_changed',
+                workspace_id=task.workspace_id,
+                context=context
+            ))
+        
+        if 'assignee_id' in update_data:
+            if old_assignee_id != task.assignee_id:
+                if task.assignee_id is not None:
+                    executed_workflows.extend(WorkflowService.execute_workflows(
+                        db=db,
+                        trigger='ticket.assigned',
+                        workspace_id=task.workspace_id,
+                        context=context
+                    ))
+                else:
+                    executed_workflows.extend(WorkflowService.execute_workflows(
+                        db=db,
+                        trigger='ticket.unassigned',
+                        workspace_id=task.workspace_id,
+                        context=context
+                    ))
+        
+        if executed_workflows:
+            logger.info(f"Executed workflows for ticket update {task.id}: {executed_workflows}")
+            
+    except Exception as e:
+        logger.error(f"Error executing workflows for ticket update {task.id}: {str(e)}")
     
     # Send assignment notification if the assignee has changed
     if 'assignee_id' in update_data and old_assignee_id != task.assignee_id and task.assignee_id is not None:
