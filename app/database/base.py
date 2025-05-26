@@ -14,6 +14,11 @@ from app.models.task import Task
 from app.models.comment import Comment
 from app.models.activity import Activity
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig
+from app.models.canned_reply import CannedReply
+from app.models.global_signature import GlobalSignature
+from app.models.notification import NotificationTemplate, NotificationSetting
+from app.models.automation import Automation
+from app.models.workflow import Workflow
 
 # Define all models in their own files and import them in app/models/__init__.py
 # DO NOT import models here to avoid circular imports 

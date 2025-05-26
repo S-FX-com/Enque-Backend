@@ -9,8 +9,12 @@ from pathlib import Path
 import os
 import re
 
-from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity
+from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity, CannedReply
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig
+from app.models.global_signature import GlobalSignature
+from app.models.notification import NotificationTemplate, NotificationSetting
+from app.models.automation import Automation
+from app.models.workflow import Workflow
 
 from app.core.config import settings
 from app.api.api import api_router
@@ -34,7 +38,8 @@ from app.utils.logger import logger
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.0.0"
+    version="1.0.0",
+    redirect_slashes=False
 )
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
