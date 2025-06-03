@@ -46,7 +46,21 @@ async def login_access_token(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid X-Workspace-ID header format.",
             )
-    user = db.query(Agent).filter(Agent.email == form_data.username).first()
+    
+    # Buscar usuario por email y workspace_id específico si se proporciona
+    user = None
+    if requested_workspace_id is not None:
+        # Buscar al usuario en el workspace específico
+        user = db.query(Agent).filter(
+            Agent.email == form_data.username,
+            Agent.workspace_id == requested_workspace_id
+        ).first()
+        logger.info(f"Searching for user {form_data.username} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
+    else:
+        # Si no se proporciona workspace_id, buscar solo por email (comportamiento original)
+        user = db.query(Agent).filter(Agent.email == form_data.username).first()
+        logger.info(f"Searching for user {form_data.username} without workspace restriction: {'Found' if user else 'Not found'}")
+    
     if not user or not verify_password(form_data.password, user.password):
         logger.warning(f"Authentication failed for user: {form_data.username} (User not found or incorrect password)")
         raise HTTPException(
@@ -54,13 +68,17 @@ async def login_access_token(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
     logger.info(f"User {user.email} (ID: {user.id}) found with matching password. Belongs to workspace {user.workspace_id}.")
-    if requested_workspace_id is not None and user.workspace_id != requested_workspace_id:
-        logger.error(f"ACCESS DENIED: User {user.email} (Workspace {user.workspace_id}) attempted login via Workspace {requested_workspace_id}. Header provided, but mismatch. Raising 403.")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail=f"User not authorized for workspace ID {requested_workspace_id}",
-        )
+    
+    # Ya no necesitamos verificar el mismatch porque buscamos específicamente en el workspace correcto
+    # if requested_workspace_id is not None and user.workspace_id != requested_workspace_id:
+    #     logger.error(f"ACCESS DENIED: User {user.email} (Workspace {user.workspace_id}) attempted login via Workspace {requested_workspace_id}. Header provided, but mismatch. Raising 403.")
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN, 
+    #         detail=f"User not authorized for workspace ID {requested_workspace_id}",
+    #     )
+    
     logger.info(f"User {user.email} successfully authenticated and authorized for workspace {user.workspace_id}.")
     
     user.last_login = datetime.utcnow()
@@ -109,9 +127,16 @@ async def get_current_user(current_user: Agent = Depends(get_current_active_user
 
 @router.post("/register/agent", response_model=AgentSchema)
 async def register_agent(user_in: AgentCreate, db: Session = Depends(get_db)) -> Any:
-    user = db.query(Agent).filter(Agent.email == user_in.email).first()
+    # Verificar si el agente ya existe en este workspace específico
+    user = db.query(Agent).filter(
+        Agent.email == user_in.email, 
+        Agent.workspace_id == user_in.workspace_id
+    ).first()
     if user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Email already registered in workspace {user_in.workspace_id}"
+        )
     workspace = db.query(Workspace).filter(Workspace.id == user_in.workspace_id).first()
     if not workspace:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Workspace with ID {user_in.workspace_id} not found")
@@ -151,17 +176,50 @@ async def verify_token(request: Request, token: str = Header(..., description="J
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid token format: {str(e)}")
 
 @router.post("/request-password-reset")
-async def request_password_reset(request_data: AgentPasswordResetRequest, db: Session = Depends(get_db)):
-    agent = db.query(Agent).filter(Agent.email == request_data.email, Agent.is_active == True).first()
+async def request_password_reset(
+    request_data: AgentPasswordResetRequest, 
+    db: Session = Depends(get_db),
+    x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID")
+):
+    requested_workspace_id: Optional[int] = None
+    if x_workspace_id:
+        try:
+            requested_workspace_id = int(x_workspace_id)
+        except ValueError:
+            logger.warning(f"Invalid X-Workspace-ID format provided in password reset: {x_workspace_id}")
+            return {"message": "If an account with that email exists, a password reset link has been sent."}
+    
+    # Buscar el agente en el workspace específico si se proporciona
+    if requested_workspace_id is not None:
+        agent = db.query(Agent).filter(
+            Agent.email == request_data.email, 
+            Agent.workspace_id == requested_workspace_id,
+            Agent.is_active == True
+        ).first()
+        logger.info(f"Password reset requested for {request_data.email} in workspace {requested_workspace_id}: {'Found' if agent else 'Not found'}")
+    else:
+        # Si no se proporciona workspace_id, buscar solo por email (comportamiento original)
+        agent = db.query(Agent).filter(Agent.email == request_data.email, Agent.is_active == True).first()
+        logger.info(f"Password reset requested for {request_data.email} without workspace restriction: {'Found' if agent else 'Not found'}")
+    
     if not agent:
         logger.info(f"Password reset requested for non-existent or inactive email: {request_data.email}")
+        return {"message": "If an account with that email exists, a password reset link has been sent."}
+
+    # Get the workspace information to construct the correct reset link
+    workspace = db.query(Workspace).filter(Workspace.id == agent.workspace_id).first()
+    if not workspace:
+        logger.error(f"Workspace not found for agent {agent.email} (workspace_id: {agent.workspace_id})")
         return {"message": "If an account with that email exists, a password reset link has been sent."}
 
     token = secrets.token_urlsafe(32)
     agent.password_reset_token = token
     agent.password_reset_token_expires_at = datetime.utcnow() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS)
     db.add(agent); db.commit()
-    reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+    
+    # Construct reset link using workspace subdomain, similar to invitation links
+    reset_link = f"https://{workspace.subdomain}.enque.cc/reset-password?token={token}"
+    
     admin_sender_mailbox_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
         .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
         .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\

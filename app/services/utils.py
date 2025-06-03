@@ -33,11 +33,10 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
         return user
     if not workspace_id:
         print(f"Error: workspace_id is required to create a new user for email {email}")
-        return None 
+        return None
 
     try:
         if not name:
-
             name = email.split('@')[0]
         new_user_obj = User(
             name=name,
@@ -56,8 +55,9 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
             if company_to_assign:
                 new_user_obj.company_id = company_to_assign.id
 
-
         db.add(new_user_obj)
+
+        # Handle unassigned_users with proper duplicate checking
         if new_user_obj.company_id is None:
             unassigned_user_exists = db.query(UnassignedUser).filter(
                 UnassignedUser.email == email,
@@ -71,6 +71,7 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
                 )
                 db.add(unassigned_user_entry)
 
+        # Single commit for both user and unassigned_user
         db.commit()
         db.refresh(new_user_obj) 
         return new_user_obj
@@ -81,17 +82,37 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
             error_code = e.orig.args[0]
             error_message = str(e.orig.args[1]) if len(e.orig.args) > 1 else ""
 
-            if error_code == 1062 and ('users.ix_users_email' in error_message or 'ix_users_email' in error_message):
-                print(f"Race condition handled: User {email} likely created by another process. Re-fetching.")
-                existing_user = user_query.first()
-                if existing_user:
-                    return existing_user
+            if error_code == 1062:
+                # Handle both users and unassigned_users duplicates
+                if ('users.ix_users_email' in error_message or 'ix_users_email' in error_message):
+                    print(f"Race condition handled: User {email} likely created by another process. Re-fetching.")
+                    existing_user = user_query.first()
+                    if existing_user:
+                        return existing_user
+                    else:
+                        print(f"Error: User {email} insert failed (duplicate), but not found on re-fetch.")
+                        return None
+                elif 'unassigned_users.ix_unassigned_users_email' in error_message:
+                    print(f"UnassignedUser {email} already exists, retrying user creation without unassigned_user")
+                    # Retry creating just the user without the unassigned_user entry
+                    try:
+                        db.add(new_user_obj)
+                        db.commit()
+                        db.refresh(new_user_obj)
+                        print(f"Successfully created user {email} (unassigned_user already existed)")
+                        return new_user_obj
+                    except Exception as retry_error:
+                        db.rollback()
+                        print(f"Retry failed for user {email}: {retry_error}")
+                        # Try to get existing user as fallback
+                        existing_user = user_query.first()
+                        return existing_user
                 else:
-                    print(f"Error: User {email} insert failed (duplicate), but not found on re-fetch.")
-                    return None
+                    print(f"Unhandled IntegrityError during user creation for {email}: {e}")
+                    raise 
             else:
-                print(f"Unhandled IntegrityError during user creation for {email}: {e}")
-                raise 
+                print(f"Non-duplicate IntegrityError for {email}: {e}")
+                raise
         else:
             print(f"Unexpected IntegrityError structure for {email}: {e}")
             raise

@@ -110,11 +110,11 @@ async def update_agent(
     agent_id: int,
     agent_in: AgentUpdate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_admin),
+    current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Update an agent (admin only)
+    Update an agent. Users can update their own profiles, admins can update any profile.
     """
     agent = db.query(Agent).filter(
         Agent.id == agent_id,
@@ -126,14 +126,35 @@ async def update_agent(
             detail="Agent not found",
         )
 
+    # Check permissions: users can only update their own profile, admins can update any
+    if current_user.role != "admin" and current_user.id != agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions to update this agent profile",
+        )
+
     update_data = agent_in.dict(exclude_unset=True)
 
+    # If user is not admin and trying to update someone else's profile (already caught above)
+    # or trying to change sensitive fields, restrict it
+    if current_user.role != "admin" and current_user.id == agent_id:
+        # Non-admin users can only update certain fields on their own profile
+        restricted_fields = ["role", "is_active", "workspace_id"]
+        for field in restricted_fields:
+            if field in update_data:
+                # For role specifically, allow if it's the same as current role (no change)
+                if field == "role" and update_data[field] == agent.role:
+                    continue
+                # Otherwise, remove the restricted field
+                del update_data[field]
+
+    # Hash password if it's being updated
     if "password" in update_data and update_data["password"]:
         update_data["password"] = get_password_hash(update_data["password"])
     elif "password" in update_data:
          del update_data["password"]
 
-
+    # Apply updates
     for field, value in update_data.items():
         setattr(agent, field, value)
 
@@ -242,7 +263,7 @@ async def invite_agent(
             detail=f"Database error: {str(e)}. The agent may already exist in this workspace."
         )
     
-    invitation_link = f"{settings.FRONTEND_URL}/accept-invitation?token={invitation_token}"
+    invitation_link = f"https://{current_workspace.subdomain}.enque.cc/accept-invitation?token={invitation_token}"
 
     admin_mailbox_connection = db.query(MailboxConnection).filter(
         MailboxConnection.created_by_agent_id == current_user.id,
@@ -306,13 +327,14 @@ async def invite_agent(
         agent_name=db_agent.name,
         invitation_link=invitation_link,
         sender_mailbox_email=admin_mailbox_connection.email,
-        user_access_token=ms_token.access_token
+        user_access_token=ms_token.access_token,
+        workspace_name=current_workspace.subdomain
     )
 
     if not email_sent:
         logger.error(f"Failed to send invitation email to {db_agent.email} from {admin_mailbox_connection.email} for agent ID {db_agent.id}. Agent created but invitation not sent.")
     
-    logger.info(f"Agent {db_agent.name} ({db_agent.email}) invited to workspace {current_workspace.name} by {current_user.email}. Invitation sent from {admin_mailbox_connection.email}. Token: {invitation_token}")
+    logger.info(f"Agent {db_agent.name} ({db_agent.email}) invited to workspace {current_workspace.subdomain} by {current_user.email}. Invitation sent from {admin_mailbox_connection.email}. Token: {invitation_token}")
     
     # The AgentSchema by default might try to hide invitation_token.
     # If you need to return it (e.g., for testing), ensure the schema allows it or use a different one.
@@ -368,7 +390,15 @@ async def accept_agent_invitation(
         extra_data=token_payload, 
         expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    
+    # Get workspace information to include subdomain in response
+    workspace = db.query(Workspace).filter(Workspace.id == agent.workspace_id).first()
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "workspace_subdomain": workspace.subdomain if workspace else None
+    }
 
 
 @router.get("/{agent_id}/teams", response_model=List[TeamSchema])

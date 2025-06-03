@@ -6,7 +6,7 @@ from app.models.agent import Agent
 from app.schemas.canned_reply import CannedReply, CannedReplyCreate, CannedReplyUpdate, CannedReplyStats
 from app.services.canned_reply_service import (
     create, get_by_id, get_by_workspace_id, get_enabled_by_workspace_id, 
-    update, delete, get_by_category, search_by_tags, get_stats
+    update, delete, get_stats
 )
 
 router = APIRouter()
@@ -53,50 +53,6 @@ def get_canned_reply_stats(
     
     stats = get_stats(db=db, workspace_id=workspace_id)
     return CannedReplyStats(**stats)
-
-
-@router.get("/category", response_model=List[CannedReply])
-def get_canned_replies_by_category(
-    *,
-    db: Session = Depends(get_db),
-    current_agent: Agent = Depends(get_current_active_agent),
-    workspace_id: int = Query(..., description="Workspace ID"),
-    category: str = Query(..., description="Category name"),
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of records to return"),
-) -> Any:
-    """Get canned replies by category."""
-    # Make sure the agent belongs to the workspace
-    if current_agent.workspace_id != workspace_id:
-        raise HTTPException(
-            status_code=403, detail="INSUFFICIENT_PERMISSIONS"
-        )
-    
-    return get_by_category(
-        db=db, workspace_id=workspace_id, category=category, skip=skip, limit=limit
-    )
-
-
-@router.get("/search", response_model=List[CannedReply])
-def search_canned_replies_by_tags(
-    *,
-    db: Session = Depends(get_db),
-    current_agent: Agent = Depends(get_current_active_agent),
-    workspace_id: int = Query(..., description="Workspace ID"),
-    tags: List[str] = Query(..., description="Tags to search for"),
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of records to return"),
-) -> Any:
-    """Search canned replies by tags."""
-    # Make sure the agent belongs to the workspace
-    if current_agent.workspace_id != workspace_id:
-        raise HTTPException(
-            status_code=403, detail="INSUFFICIENT_PERMISSIONS"
-        )
-    
-    return search_by_tags(
-        db=db, workspace_id=workspace_id, tags=tags, skip=skip, limit=limit
-    )
 
 
 @router.get("/", response_model=List[CannedReply])

@@ -1,63 +1,134 @@
-from typing import Dict, Any, Optional
+from typing import Optional, List
+from pydantic import BaseModel, validator, Field
 from datetime import datetime
-from pydantic import BaseModel, Field, validator
+from enum import Enum
 
-# Esquema para la programación de automatización
-class AutomationScheduleBase(BaseModel):
-    frequency: str = Field(..., description="Frequency of the automation (daily, weekly, monthly)")
-    day: Optional[str] = Field(None, description="Day of the week for weekly automations or day of the month for monthly")
-    time: str = Field(..., description="Time of day to run the automation (HH:MM)")
 
-# Esquema para la plantilla de correo electrónico
-class AutomationTemplateBase(BaseModel):
-    subject: str = Field(..., description="Email subject template")
-    content: str = Field(..., description="Email content template (HTML)")
+class ConditionType(str, Enum):
+    DESCRIPTION = "DESCRIPTION"
+    NOTE = "NOTE"
+    USER = "USER"
+    AGENT = "AGENT"
+    COMPANY = "COMPANY"
+    PRIORITY = "PRIORITY"
+    CATEGORY = "CATEGORY"
 
-# Esquema base para automatización
-class AutomationBase(BaseModel):
-    name: str = Field(..., description="Name of the automation")
-    description: Optional[str] = Field(None, description="Description of the automation")
-    type: str = Field(..., description="Type of automation (scheduled, event-based)")
-    is_enabled: bool = Field(False, description="Whether the automation is enabled")
-    schedule: AutomationScheduleBase
-    template: AutomationTemplateBase
-    filters: Dict[str, Any] = Field({}, description="Filters for the automation")
 
-    class Config:
-        from_attributes = True
+class ConditionOperator(str, Enum):
+    EQL = "eql"
+    NEQL = "neql"
+    CON = "con"
+    NCON = "ncon"
 
-# Esquema para crear una automatización
-class AutomationCreate(AutomationBase):
+
+class ActionType(str, Enum):
+    SET_AGENT = "SET_AGENT"
+    SET_PRIORITY = "SET_PRIORITY"
+    SET_STATUS = "SET_STATUS"
+    SET_TEAM = "SET_TEAM"
+
+
+# Condition schemas
+class AutomationConditionBase(BaseModel):
+    condition_type: ConditionType
+    condition_operator: Optional[ConditionOperator] = ConditionOperator.EQL
+    condition_value: Optional[str] = None
+
+
+class AutomationConditionCreate(AutomationConditionBase):
     pass
 
-# Esquema para actualizar una automatización
-class AutomationUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    type: Optional[str] = None
-    is_enabled: Optional[bool] = None
-    schedule: Optional[AutomationScheduleBase] = None
-    template: Optional[AutomationTemplateBase] = None
-    filters: Optional[Dict[str, Any]] = None
+
+class AutomationConditionUpdate(BaseModel):
+    condition_type: Optional[ConditionType] = None
+    condition_operator: Optional[ConditionOperator] = None
+    condition_value: Optional[str] = None
+
+
+class AutomationCondition(AutomationConditionBase):
+    id: int
+    automation_id: int
+    created_at: datetime
 
     class Config:
         from_attributes = True
 
-# Esquema para conmutar el estado de habilitado de una automatización
-class AutomationToggleEnable(BaseModel):
-    is_enabled: bool = Field(..., description="Whether the automation should be enabled or disabled")
 
-# Esquema completo de automatización que incluye ID y timestamps
-class AutomationInDB(AutomationBase):
+# Action schemas
+class AutomationActionBase(BaseModel):
+    action_type: ActionType
+    action_value: Optional[str] = None
+
+
+class AutomationActionCreate(AutomationActionBase):
+    pass
+
+
+class AutomationActionUpdate(BaseModel):
+    action_type: Optional[ActionType] = None
+    action_value: Optional[str] = None
+
+
+class AutomationAction(AutomationActionBase):
+    id: int
+    automation_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# Automation schemas
+class AutomationBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    workspace_id: int
+    is_active: Optional[bool] = True
+
+
+class AutomationCreate(AutomationBase):
+    conditions: List[AutomationConditionCreate] = Field(..., min_length=1)
+    actions: List[AutomationActionCreate] = Field(..., min_length=1)
+
+    @validator("conditions")
+    def validate_conditions(cls, v):
+        if not v:
+            raise ValueError("At least one condition is required")
+        return v
+
+    @validator("actions")
+    def validate_actions(cls, v):
+        if not v:
+            raise ValueError("At least one action is required")
+        return v
+
+
+class AutomationUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    is_active: Optional[bool] = None
+    conditions: Optional[List[AutomationConditionCreate]] = None
+    actions: Optional[List[AutomationActionCreate]] = None
+
+
+class AutomationInDBBase(AutomationBase):
     id: int
     workspace_id: int
     created_at: datetime
     updated_at: datetime
+    created_by: Optional[int] = None
 
     class Config:
         from_attributes = True
 
-# Esquema para la respuesta de ejecución de una automatización
-class AutomationRunResponse(BaseModel):
-    success: bool = Field(..., description="Whether the automation run was successful")
-    message: str = Field(..., description="Status message for the automation run") 
+
+class Automation(AutomationInDBBase):
+    conditions: List[AutomationCondition] = []
+    actions: List[AutomationAction] = []
+
+    class Config:
+        from_attributes = True
+
+
+class AutomationSummary(BaseModel):
+    total_automations: int
+    active_automations: int
+    inactive_automations: int 

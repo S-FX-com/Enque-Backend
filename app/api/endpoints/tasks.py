@@ -3,7 +3,7 @@ import asyncio  # Importar asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_ # Import 'or_' for OR condition
+from sqlalchemy import or_, and_ # Import 'or_' for OR condition and 'and_' for AND condition
 
 # Import dependencies
 from app.api.dependencies import get_current_active_user, get_current_active_admin_or_manager
@@ -12,7 +12,7 @@ from app.models.task import Task, TicketBody  # Importar TicketBody junto con Ta
 from app.models.agent import Agent
 from app.models.user import User # Import User model
 from app.models.team import TeamMember # Import TeamMember for filtering
-from app.models.microsoft import EmailTicketMapping, MailboxConnection # Import MailboxConnection
+from app.models.microsoft import EmailTicketMapping, MailboxConnection, mailbox_team_assignments # Import MailboxConnection
 from app.models.activity import Activity # Import Activity model
 # Use TaskWithDetails and the renamed TicketCreate/TicketUpdate schemas
 from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema
@@ -21,6 +21,7 @@ from app.utils.logger import logger
 # Import update_task service function and Microsoft service
 from app.services.task_service import update_task, send_assignment_notification # Importar función de notificación
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
+from app.services.automation_service import execute_automations_for_ticket # Import automation service
 from datetime import datetime # Import datetime
 from app.core.config import settings # Import settings
 
@@ -44,20 +45,19 @@ async def read_tasks(
 ) -> Any:
     """
     Retrieve tasks based on user role and optional filters:
-    - Admin/Manager: All tasks in the workspace, optionally filtered.
-    - Agent: Tasks assigned to them OR to any team they belong to, optionally filtered.
+    - All users (Admin/Manager/Agent): Can see ALL tasks in the workspace, optionally filtered.
+    - Team-specific filtering only applies when teamId filter is used explicitly.
+    
+    Note: All users can see ALL tickets in "All Tickets" view regardless of team membership.
     """
     base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
 
-    # For "All Tickets" view, all authenticated users in the workspace can see all tickets.
-    # Specific filtering for "My Tickets" (e.g., assigned to self or team) should be handled by a different endpoint or query parameters.
-    # The current dependency get_current_active_user already ensures the user is active and belongs to a workspace.
-    # The base_query already filters by current_user.workspace_id.
-    
-    query = base_query # All active users in the workspace see all tasks of that workspace.
+    # No team membership filtering in the main endpoint - all users see all tickets
+    # This ensures "All Tickets" shows everything for everyone
+    query = base_query
 
     # Apply optional filters to the query
     if subject:
@@ -66,7 +66,21 @@ async def read_tasks(
     if status:
         query = query.filter(Task.status == status)
     if team_id:
-        query = query.filter(Task.team_id == team_id)
+        # Include both direct team assignments and mailbox team assignments (avoiding duplicates)
+        query = query.filter(
+            or_(
+                Task.team_id == team_id,  # Direct team assignment
+                and_(  # Mailbox team assignment (only for tickets without direct team assignment)
+                    Task.team_id.is_(None),  # Only include mailbox tickets that don't have team_id
+                    Task.mailbox_connection_id.isnot(None),
+                    Task.mailbox_connection_id.in_(
+                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
+                            mailbox_team_assignments.c.team_id == team_id
+                        )
+                    )
+                )
+            )
+        )
     if assignee_id:
         query = query.filter(Task.assignee_id == assignee_id)
     if priority:
@@ -102,12 +116,15 @@ async def search_tickets(
 ) -> Any:
     """
     Search for tickets containing the search term in title, description or body.
+    All users can search ALL tickets in the workspace regardless of team membership.
     """
     # Base query for tickets in current workspace and not deleted
     base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
+    
+    # No team filtering - all users can search all tickets
     
     # Apply search on title, description and body
     search_term = f"%{q}%"  # Search term with wildcards for LIKE
@@ -135,9 +152,6 @@ async def search_tickets(
     
     # Order by creation date and apply pagination
     tickets = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    
-    # Log the search
-    logger.info(f"Ticket search: term='{q}', results={len(tickets)}, user_id={current_user.id}")
     
     return tickets
 
@@ -172,6 +186,29 @@ async def create_task(
     db.commit()
     db.refresh(task)
     logger.info(f"Task {task.id} created. Initial last_update set to {task.last_update}.")
+
+    # --- Execute Automations ---
+    try:
+        # Load the task with all relationships needed for automation conditions
+        task_with_relations = db.query(Task).options(
+            joinedload(Task.user),
+            joinedload(Task.assignee),
+            joinedload(Task.company),
+            joinedload(Task.category),
+            joinedload(Task.team)
+        ).filter(Task.id == task.id).first()
+        
+        if task_with_relations:
+            executed_actions = execute_automations_for_ticket(db, task_with_relations)
+            if executed_actions:
+                logger.info(f"Automations executed for ticket {task.id}: {executed_actions}")
+                # Refresh the task to get updated values from automations
+                db.refresh(task)
+        
+    except Exception as automation_error:
+        logger.error(f"Error executing automations for ticket {task.id}: {str(automation_error)}", exc_info=True)
+        # Don't fail ticket creation if automations fail
+    # --- End Execute Automations ---
 
     # --- Log Activity ---
     try:
@@ -380,17 +417,34 @@ async def update_task_endpoint(
     origin = request.headers.get("origin") or settings.FRONTEND_URL
 
     # Use the service function which handles the actual update logic
-    updated_task_obj = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
+    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
 
-    if not updated_task_obj: # Service function returns the updated ORM object or None
+    if not updated_task_dict: # Service function returns the updated dict or None
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
             detail="Task update failed", # Or more specific error from service
         )
     
-    # Ya no enviamos la notificación aquí porque update_task ya lo hace
+    # Load the complete task object with all relationships required by TaskWithDetails
+    updated_task_obj = db.query(Task).options(
+        joinedload(Task.workspace),
+        joinedload(Task.team),
+        joinedload(Task.company),
+        joinedload(Task.user),
+        joinedload(Task.sent_from),
+        joinedload(Task.sent_to),
+        joinedload(Task.assignee),
+        joinedload(Task.category),
+        joinedload(Task.body)
+    ).filter(Task.id == task_id).first()
 
-    # Return the updated ORM object
+    if not updated_task_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found after update",
+        )
+
+    # Return the updated ORM object with all relationships
     return updated_task_obj
 
 
@@ -401,7 +455,7 @@ async def delete_task(
     current_user: Agent = Depends(get_current_active_user), # Consider if only admin/manager should delete
 ) -> Any:
     """
-    Delete a task (soft delete)
+    Delete a task (hard delete - physical removal)
     """
     # Add permission check if needed (e.g., only admin/manager)
     # if current_user.role not in ["admin", "manager"]:
@@ -418,14 +472,14 @@ async def delete_task(
             detail="Task not found",
         )
 
-    # Soft delete (mark as deleted)
-    task.is_deleted = True
-    task.deleted_at = datetime.utcnow()
+    # Store task data for response before deletion
+    task_data = TaskSchema.from_orm(task)
 
+    # Hard delete (physical removal from database)
+    db.delete(task)
     db.commit()
-    db.refresh(task)
 
-    return task
+    return task_data
 
 
 @router.get("/user/{user_id}", response_model=List[TaskSchema])
@@ -496,11 +550,23 @@ async def read_team_tasks(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Retrieve tasks assigned to a specific team WITHIN the current user's workspace
+    Retrieve tasks assigned to a specific team WITHIN the current user's workspace.
+    Includes both direct team assignments and mailbox team assignments.
     """
-     # Add workspace filter
+    # Include both direct team assignments and mailbox team assignments (avoiding duplicates)
     tasks = db.query(Task).filter(
-        Task.team_id == team_id,
+        or_(
+            Task.team_id == team_id,  # Direct team assignment
+            and_(  # Mailbox team assignment (only for tickets without direct team assignment)
+                Task.team_id.is_(None),  # Only include mailbox tickets that don't have team_id
+                Task.mailbox_connection_id.isnot(None),
+                Task.mailbox_connection_id.in_(
+                    db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
+                        mailbox_team_assignments.c.team_id == team_id
+                    )
+                )
+            )
+        ),
         Task.workspace_id == current_user.workspace_id, # Filter by current user's workspace
         Task.is_deleted == False
     ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()

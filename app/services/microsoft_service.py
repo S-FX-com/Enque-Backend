@@ -67,7 +67,8 @@ class MicrosoftGraphService:
         client_id = self.integration.client_id if self.integration else settings.MICROSOFT_CLIENT_ID
         client_secret = self.integration.client_secret if self.integration else settings.MICROSOFT_CLIENT_SECRET
 
-        token_endpoint = self.token_url.replace("{tenant}", tenant_id)
+        # For application tokens, we still need to use the specific tenant endpoint
+        token_endpoint = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
         data = {
             "client_id": client_id,
             "client_secret": client_secret,
@@ -97,7 +98,6 @@ class MicrosoftGraphService:
         if not self.integration and not self.has_env_config:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft integration not configured")
 
-        tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
         client_id = self.integration.client_id if self.integration else settings.MICROSOFT_CLIENT_ID
 
         final_redirect_uri = redirect_uri or (self.integration.redirect_uri if self.integration else settings.MICROSOFT_REDIRECT_URI)
@@ -108,7 +108,10 @@ class MicrosoftGraphService:
         default_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
         final_scopes = scopes if scopes else default_scopes
         scope_string = " ".join(final_scopes)
-        auth_endpoint = self.auth_url.replace("{tenant}", tenant_id)
+        
+        # Use the common endpoint directly for multitenant support
+        auth_endpoint = self.auth_url  # This is now already set to /common in config
+        
         params = {
             "client_id": client_id, "response_type": "code", "redirect_uri": final_redirect_uri,
             "scope": scope_string, "response_mode": "query",
@@ -137,7 +140,9 @@ class MicrosoftGraphService:
             "client_id": client_id, "client_secret": client_secret, "code": code,
             "redirect_uri": correct_redirect_uri, "grant_type": "authorization_code"
         }
-        token_endpoint = self.token_url.replace("{tenant}", tenant_id)
+        
+        # Use the common endpoint directly for multitenant support
+        token_endpoint = self.token_url  # This is now already set to /common in config
         try:
             response = requests.post(token_endpoint, data=data)
             response.raise_for_status()
@@ -280,8 +285,9 @@ class MicrosoftGraphService:
             "grant_type": "refresh_token",
             "scope": "offline_access Mail.Read Mail.ReadWrite Mail.Send User.Read" 
         }
-        token_endpoint = self.token_url.replace("{tenant}", tenant_id)
-
+        
+        # Use the common endpoint directly for multitenant support
+        token_endpoint = self.token_url  # This is now already set to /common in config
         try:
             response = requests.post(token_endpoint, data=data)
             response.raise_for_status() 
@@ -332,8 +338,9 @@ class MicrosoftGraphService:
             "grant_type": "refresh_token",
             "scope": "offline_access Mail.Read Mail.ReadWrite Mail.Send User.Read"
         }
-        token_endpoint = self.token_url.replace("{tenant}", tenant_id)
-
+        
+        # Use the common endpoint directly for multitenant support
+        token_endpoint = self.token_url  # This is now already set to /common in config
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(token_endpoint, data=data)
@@ -434,14 +441,17 @@ class MicrosoftGraphService:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
             return []
         try:
-            app_token = self.get_application_token()
-            emails = self.get_mailbox_emails(app_token, user_email, sync_config.folder_name, filter_unread=True)
+            # Use user token instead of application token for multitenant support
+            user_access_token = token.access_token
+            logger.info(f"[MAIL SYNC] Using user access token for {user_email} (multitenant support)")
+            
+            emails = self.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, filter_unread=True)
             if not emails:
                 logger.info(f"[MAIL SYNC] No unread emails found for {user_email} in folder '{sync_config.folder_name}'.")
                 sync_config.last_sync_time = datetime.utcnow(); self.db.commit(); return []
             logger.info(f"[MAIL SYNC] Found {len(emails)} unread emails for {user_email}.")
             created_tasks_count = 0; added_comments_count = 0
-            processed_folder_id = self._get_or_create_processed_folder(app_token, user_email, "Enque Processed")
+            processed_folder_id = self._get_or_create_processed_folder(user_access_token, user_email, "Enque Processed")
             if not processed_folder_id: logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
@@ -489,16 +499,16 @@ class MicrosoftGraphService:
                                 logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} appears to be a system notification with subject: '{email_subject}'. Skipping.")
                                 
                                 # Marcar como leído y mover a carpeta procesada sin crear ticket
-                                self._mark_email_as_read(app_token, user_email, email_id)
+                                self._mark_email_as_read(user_access_token, user_email, email_id)
                                 if processed_folder_id:
-                                    self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                                    self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                 break
                     
                     # Si es una notificación del sistema, continuamos con el siguiente correo
                     if is_system_notification:
                         continue
                     
-                    email_content = self._get_full_email(app_token, user_email, email_id)
+                    email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     conversation_id = email_content.get("conversationId")
                     existing_mapping_by_conv = None
@@ -508,7 +518,7 @@ class MicrosoftGraphService:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is part of existing conversation {conversation_id} (Ticket ID: {existing_mapping_by_conv.ticket_id}). Adding as comment.")
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
-                        reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown")
+                        reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=sync_config.workspace_id)
                         if not reply_user: logger.error(f"Could not get or create user for reply email sender: {email.sender.address}"); continue
                         workspace = self.db.query(Workspace).filter(Workspace.id == sync_config.workspace_id).first()
                         if not workspace: logger.error(f"Workspace ID {sync_config.workspace_id} not found for reply. Skipping comment creation."); continue
@@ -607,7 +617,7 @@ class MicrosoftGraphService:
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
                         self.db.commit(); added_comments_count += 1
                         logger.info(f"[MAIL SYNC] Added comment to Ticket ID {existing_mapping_by_conv.ticket_id} from reply email ID {email.id}.")
-                        if processed_folder_id: self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                        if processed_folder_id: self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                         continue
                     else:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
@@ -619,9 +629,9 @@ class MicrosoftGraphService:
                         # Si el remitente es el propio buzón o una dirección conocida del sistema
                         if sender_email.lower() == user_email.lower() or "microsoftexchange" in sender_email.lower():
                             logger.warning(f"[MAIL SYNC] Email from system address or self ({sender_email}). Marking as read and skipping ticket creation.")
-                            self._mark_email_as_read(app_token, user_email, email_id)
+                            self._mark_email_as_read(user_access_token, user_email, email_id)
                             if processed_folder_id:
-                                self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                                self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                             continue
                         
                         task = self._create_task_from_email(email, sync_config, system_agent)
@@ -635,7 +645,7 @@ class MicrosoftGraphService:
                             try:
                                 self.db.commit()
                                 if processed_folder_id:
-                                    new_id = self._move_email_to_folder(app_token, user_email, email_id, processed_folder_id)
+                                    new_id = self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                     if new_id and new_id != email_id:
                                         logger.info(f"[MAIL SYNC] Email ID changed from {email_id} to {new_id} after move. Updating mapping.")
                                         try:
@@ -743,7 +753,7 @@ class MicrosoftGraphService:
             if any(pattern in subject_lower for pattern in notification_patterns):
                 logger.warning(f"Ignorando correo con asunto '{email.subject}' que parece ser una notificación del sistema")
                 return None
-        
+                
         # Verificación adicional por dominio solo para notificaciones obvias
         sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
         
@@ -782,11 +792,25 @@ class MicrosoftGraphService:
             if not workspace: logger.error(f"Workspace ID {config.workspace_id} not found. Skipping ticket creation."); return None
             due_date = datetime.utcnow() + timedelta(days=3)
             
+            # Determinar team_id basado en la asignación del mailbox
+            team_id = None
+            if config.mailbox_connection_id:
+                # Buscar si el mailbox está asignado a algún team
+                from app.models.microsoft import mailbox_team_assignments
+                team_assignment = self.db.query(mailbox_team_assignments).filter(
+                    mailbox_team_assignments.c.mailbox_connection_id == config.mailbox_connection_id
+                ).first()
+                
+                if team_assignment:
+                    team_id = team_assignment.team_id
+                    logger.info(f"Auto-assigning ticket to team {team_id} based on mailbox assignment")
+            
             # Crear el ticket sin descripción inicial
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
-                user_id=user.id, company_id=company_id, workspace_id=workspace.id, mailbox_connection_id=config.mailbox_connection_id)
+                user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
+                mailbox_connection_id=config.mailbox_connection_id, team_id=team_id)
             self.db.add(task); self.db.flush()
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")

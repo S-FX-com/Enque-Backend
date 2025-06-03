@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB sessi
 from typing import Optional
 
 # Placeholder for a more sophisticated HTML email template system
-def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url: str) -> str:
+def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url: str, workspace_name: str) -> str:
     """
     Generates an HTML content for the invitation email.
     """
@@ -68,6 +68,13 @@ def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url
             .link-text {{
                  word-break: break-all; /* Ensure long links don't break layout */
             }}
+            .workspace-info {{
+                background-color: #f8f9fa;
+                border-left: 4px solid #007bff;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 4px;
+            }}
         </style>
     </head>
     <body>
@@ -76,7 +83,12 @@ def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url
                 <img src="{logo_url}" alt="Enque Logo">
             </div>
             <p>Hello {agent_name},</p>
-            <p>You have been invited to join Enque. Please click the button below to set up your account and create your password:</p>
+            <p>You have been invited to join <strong>{workspace_name}</strong> on Enque. Please click the button below to set up your account and create your password:</p>
+            
+            <div class="workspace-info">
+                <p style="margin: 0;"><strong>Workspace:</strong> {workspace_name}</p>
+            </div>
+            
             <p style="text-align: center;">
                 <a href="{invitation_link}" class="button">Accept Invitation & Set Password</a>
             </p>
@@ -101,12 +113,13 @@ async def send_agent_invitation_email(
     agent_name: str,
     invitation_link: str,
     sender_mailbox_email: str, # Email of the mailbox to send from (e.g., admin's connected mailbox)
-    user_access_token: str    # Valid access token for the sender_mailbox_email
+    user_access_token: str,    # Valid access token for the sender_mailbox_email
+    workspace_name: str        # Name of the workspace the agent is being invited to
 ) -> bool:
     """
     Sends an invitation email to a new agent using a user's delegated token.
     """
-    subject = "You're invited to join Enque!" # Changed to English
+    subject = f"You're invited to join {workspace_name} on Enque!"
     # You need to provide a public URL for your logo.
     # For example, if you host it on your frontend's public folder and it's accessible via app.enque.cc/enque.png
     # Or better, a CDN or dedicated image hosting.
@@ -117,7 +130,7 @@ async def send_agent_invitation_email(
     # For now, using a placeholder. You MUST update this.
     logo_url = "https://app.enque.cc/enque.png" # Example: Replace with your actual public logo URL
 
-    html_content = create_invitation_email_html(agent_name, invitation_link, logo_url)
+    html_content = create_invitation_email_html(agent_name, invitation_link, logo_url, workspace_name)
 
     try:
         graph_service = MicrosoftGraphService(db=db)

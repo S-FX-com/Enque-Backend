@@ -66,9 +66,9 @@ class Settings(BaseSettings):
     MICROSOFT_REDIRECT_URI: str = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
     MICROSOFT_SCOPE: str = "offline_access Mail.Read Mail.ReadWrite"
     
-    # Microsoft Graph API URLs
-    MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
-    MICROSOFT_TOKEN_URL: str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    # Microsoft Graph API URLs - Using /common for multitenant support
+    MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    MICROSOFT_TOKEN_URL: str = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     MICROSOFT_GRAPH_URL: str = "https://graph.microsoft.com/v1.0"
     
     # Email Integration

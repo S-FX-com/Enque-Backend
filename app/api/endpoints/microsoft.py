@@ -2,7 +2,7 @@ from typing import Any, List, Optional
 from datetime import datetime, timedelta # Import datetime and timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request # Added Request
 from fastapi.responses import RedirectResponse # Added RedirectResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.api.dependencies import get_db, get_current_active_user
 from app.models.agent import Agent
 from app.core.config import settings # Import settings
@@ -54,14 +54,34 @@ def get_connections( # Renamed function
     if not current_agent or not current_agent.workspace_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
-    # Fetch all active connections for the workspace
-    connections = db.query(MailboxConnection).filter(
+    # Fetch all active connections for the workspace with team relationships
+    connections = db.query(MailboxConnection).options(
+        joinedload(MailboxConnection.teams)
+    ).filter(
         MailboxConnection.workspace_id == current_agent.workspace_id,
         MailboxConnection.is_active == True
     ).all()
 
+    # Convert to response format with team_ids
+    result = []
+    for conn in connections:
+        conn_dict = {
+            "id": conn.id,
+            "email": conn.email,
+            "display_name": conn.display_name,
+            "workspace_id": conn.workspace_id,
+            "created_by_agent_id": conn.created_by_agent_id,
+            "is_global": conn.is_global,
+            "is_active": conn.is_active,
+            "created_at": conn.created_at,
+            "updated_at": conn.updated_at,
+            "team_ids": [team.id for team in conn.teams],
+            "teams": [{"id": team.id, "name": team.name, "icon_name": team.icon_name} for team in conn.teams]
+        }
+        result.append(conn_dict)
+
     logger.info(f"Found {len(connections)} active connections for workspace {current_agent.workspace_id}")
-    return connections
+    return result
 
 
 # Updated DELETE endpoint to accept connection_id
@@ -567,4 +587,89 @@ def get_admin_consent_url(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
+        )
+
+
+@router.put("/connection/{connection_id}", response_model=MailboxConnectionSchema)
+def update_mailbox_connection(
+    connection_id: int,
+    connection_update: MailboxConnectionUpdate,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Update a mailbox connection, including team assignments and global visibility.
+    """
+    if not current_agent or not current_agent.workspace_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    # Find the connection
+    connection = db.query(MailboxConnection).options(
+        joinedload(MailboxConnection.teams)
+    ).filter(
+        MailboxConnection.id == connection_id,
+        MailboxConnection.workspace_id == current_agent.workspace_id
+    ).first()
+
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Mailbox connection not found"
+        )
+
+    try:
+        # Update basic fields
+        update_data = connection_update.dict(exclude_unset=True, exclude={'team_ids'})
+        
+        for field, value in update_data.items():
+            setattr(connection, field, value)
+
+        # Handle team assignments if provided
+        if connection_update.team_ids is not None:
+            # Clear existing team assignments
+            connection.teams.clear()
+            
+            # Add new team assignments (only if not global)
+            if not connection_update.is_global and connection_update.team_ids:
+                from app.models.team import Team
+                teams = db.query(Team).filter(
+                    Team.id.in_(connection_update.team_ids),
+                    Team.workspace_id == current_agent.workspace_id
+                ).all()
+                
+                if len(teams) != len(connection_update.team_ids):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="One or more team IDs are invalid"
+                    )
+                
+                connection.teams.extend(teams)
+
+        db.commit()
+        db.refresh(connection)
+        
+        # Prepare response
+        result = {
+            "id": connection.id,
+            "email": connection.email,
+            "display_name": connection.display_name,
+            "workspace_id": connection.workspace_id,
+            "created_by_agent_id": connection.created_by_agent_id,
+            "is_global": connection.is_global,
+            "is_active": connection.is_active,
+            "created_at": connection.created_at,
+            "updated_at": connection.updated_at,
+            "team_ids": [team.id for team in connection.teams],
+            "teams": [{"id": team.id, "name": team.name, "icon_name": team.icon_name} for team in connection.teams]
+        }
+        
+        logger.info(f"Updated mailbox connection {connection_id}: global={connection.is_global}, teams={[t.id for t in connection.teams]}")
+        return result
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating mailbox connection {connection_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update mailbox connection"
         )

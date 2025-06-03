@@ -22,6 +22,9 @@ class Team(Base):
     # Add cascade to delete tasks associated with the team
     tasks = relationship("Task", back_populates="team", cascade="all, delete-orphan")
     manager = relationship("Agent", foreign_keys=[manager_id])
+    # Import the table from microsoft.py to avoid circular imports
+    from app.models.microsoft import mailbox_team_assignments
+    mailbox_connections = relationship("MailboxConnection", secondary=mailbox_team_assignments, back_populates="teams")
 
 
 class TeamMember(Base):

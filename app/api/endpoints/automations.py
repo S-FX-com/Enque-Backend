@@ -1,199 +1,167 @@
-from typing import List, Any
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from typing import Any, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db, get_current_active_user, check_workspace_access
-from app.models.user import User
+from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
+from app.database.session import get_db
+from app.models.agent import Agent
+from app.models.workspace import Workspace
+from app.models.automation import Automation
 from app.schemas.automation import (
+    Automation as AutomationSchema,
     AutomationCreate,
-    AutomationUpdate,
-    AutomationInDB,
-    AutomationToggleEnable,
-    AutomationRunResponse,
+    AutomationUpdate
 )
-from app.services.automation_service import (
-    create_automation,
-    get_automation_by_id,
-    get_automations_by_workspace,
-    update_automation,
-    delete_automation,
-    toggle_automation_status,
-    run_automation,
-)
+from app.services import automation_service
+from app.utils.logger import logger
 
 router = APIRouter()
 
 
-@router.get("/{workspace_id}/automations", response_model=List[AutomationInDB])
+@router.get("/", response_model=List[AutomationSchema])
 async def read_automations(
-    workspace_id: int,
-    current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
-):
-    """Get all automations for a workspace."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    return get_automations_by_workspace(db, workspace_id)
-
-
-@router.get("/{workspace_id}/automations/{automation_id}", response_model=AutomationInDB)
-async def read_automation(
-    workspace_id: int,
-    automation_id: int,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """Get a specific automation by ID."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    automation = get_automation_by_id(db, workspace_id, automation_id)
-    if not automation:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Automation with ID {automation_id} not found",
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    active_only: bool = Query(False, description="Filter only active automations"),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Retrieve automations for the current workspace with pagination.
+    """
+    logger.info(f"Fetching automations for workspace {current_workspace.id} with skip={skip}, limit={limit}")
+    
+    if active_only:
+        automations = automation_service.get_active_by_workspace_id(
+            db=db, workspace_id=current_workspace.id, skip=skip, limit=limit
         )
+    else:
+        automations = automation_service.get_by_workspace_id(
+            db=db, workspace_id=current_workspace.id, skip=skip, limit=limit
+        )
+    
+    logger.info(f"Retrieved {len(automations)} automations.")
+    return automations
+
+
+@router.post("/", response_model=AutomationSchema)
+async def create_automation(
+    automation_in: AutomationCreate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Create a new automation.
+    """
+    logger.info(f"Creating automation '{automation_in.name}' for workspace {current_workspace.id}")
+    
+    # Set the workspace_id from the current workspace
+    automation_in.workspace_id = current_workspace.id
+    
+    automation = automation_service.create(
+        db=db, obj_in=automation_in, created_by_agent_id=current_user.id
+    )
+    
+    logger.info(f"Created automation with ID {automation.id}")
     return automation
 
 
-@router.post("/{workspace_id}/automations", response_model=AutomationInDB, status_code=status.HTTP_201_CREATED)
-async def create_new_automation(
-    workspace_id: int,
-    automation_data: AutomationCreate,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """Create a new automation for a workspace."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    
-    # Solo administradores y gestores pueden crear automatizaciones
-    if current_user.role not in ["admin", "manager"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions to create automations",
-        )
-    
-    return create_automation(db, workspace_id, automation_data)
-
-
-@router.put("/{workspace_id}/automations/{automation_id}", response_model=AutomationInDB)
-async def update_existing_automation(
-    workspace_id: int,
+@router.get("/{automation_id}", response_model=AutomationSchema)
+async def read_automation(
     automation_id: int,
-    automation_data: AutomationUpdate,
-    current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
-):
-    """Update an existing automation."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    
-    # Solo administradores y gestores pueden actualizar automatizaciones
-    if current_user.role not in ["admin", "manager"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions to update automations",
-        )
-    
-    automation = get_automation_by_id(db, workspace_id, automation_id)
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Get automation by ID.
+    """
+    automation = automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Automation with ID {automation_id} not found",
+            detail="Automation not found",
         )
     
-    return update_automation(db, automation, automation_data)
-
-
-@router.delete("/{workspace_id}/automations/{automation_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_existing_automation(
-    workspace_id: int,
-    automation_id: int,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """Delete an automation."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    
-    # Solo administradores y gestores pueden eliminar automatizaciones
-    if current_user.role not in ["admin", "manager"]:
+    # Check if automation belongs to current workspace
+    if automation.workspace_id != current_workspace.id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions to delete automations",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation not found",
         )
     
-    automation = get_automation_by_id(db, workspace_id, automation_id)
+    return automation
+
+
+@router.put("/{automation_id}", response_model=AutomationSchema)
+async def update_automation(
+    automation_id: int,
+    automation_in: AutomationUpdate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Update an automation.
+    """
+    automation = automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Automation with ID {automation_id} not found",
+            detail="Automation not found",
         )
     
-    delete_automation(db, automation)
-    return None
-
-
-@router.put("/{workspace_id}/automations/{automation_id}/toggle", response_model=AutomationInDB)
-async def toggle_automation_enabled(
-    workspace_id: int,
-    automation_id: int,
-    toggle_data: AutomationToggleEnable,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """Toggle the enabled status of an automation."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    
-    # Solo administradores y gestores pueden cambiar el estado de las automatizaciones
-    if current_user.role not in ["admin", "manager"]:
+    # Check if automation belongs to current workspace
+    if automation.workspace_id != current_workspace.id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions to toggle automation status",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation not found",
         )
     
-    automation = get_automation_by_id(db, workspace_id, automation_id)
+    automation = automation_service.update(db=db, db_obj=automation, obj_in=automation_in)
+    logger.info(f"Updated automation {automation_id}")
+    return automation
+
+
+@router.delete("/{automation_id}", response_model=AutomationSchema)
+async def delete_automation(
+    automation_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Delete an automation.
+    """
+    automation = automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Automation with ID {automation_id} not found",
+            detail="Automation not found",
         )
     
-    return toggle_automation_status(db, automation, toggle_data.is_enabled)
-
-
-@router.post("/{workspace_id}/automations/{automation_id}/run", response_model=AutomationRunResponse)
-async def run_specific_automation(
-    workspace_id: int,
-    automation_id: int,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db),
-):
-    """Run a specific automation immediately (for testing purposes)."""
-    # Verificar acceso al workspace
-    check_workspace_access(current_user, workspace_id)
-    
-    # Solo administradores y gestores pueden ejecutar automatizaciones manualmente
-    if current_user.role not in ["admin", "manager"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions to run automations",
-        )
-    
-    automation = get_automation_by_id(db, workspace_id, automation_id)
-    if not automation:
+    # Check if automation belongs to current workspace
+    if automation.workspace_id != current_workspace.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Automation with ID {automation_id} not found",
+            detail="Automation not found",
         )
     
-    # Si la automatización está deshabilitada, no permitir su ejecución manual
-    if not automation.is_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot run a disabled automation",
-        )
-    
-    result = await run_automation(db, automation, current_user)
-    return result 
+    automation_service.delete(db=db, db_obj=automation)
+    logger.info(f"Deleted automation {automation_id}")
+    return automation
+
+
+@router.get("/stats/summary")
+async def get_automation_stats(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+) -> Any:
+    """
+    Get automation statistics for the current workspace.
+    """
+    stats = automation_service.get_stats(db=db, workspace_id=current_workspace.id)
+    return stats 

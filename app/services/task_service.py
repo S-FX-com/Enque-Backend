@@ -120,6 +120,30 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     db.refresh(task)
     db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
     
+    # --- Execute Automations ---
+    try:
+        from app.services.automation_service import execute_automations_for_ticket
+        # Load the task with all relationships needed for automation conditions
+        task_with_relations = db.query(Task).options(
+            joinedload(Task.user),
+            joinedload(Task.assignee),
+            joinedload(Task.company),
+            joinedload(Task.category),
+            joinedload(Task.team)
+        ).filter(Task.id == task_id).first()
+        
+        if task_with_relations:
+            executed_actions = execute_automations_for_ticket(db, task_with_relations)
+            if executed_actions:
+                logger.info(f"Automations executed for ticket update {task.id}: {executed_actions}")
+                # Refresh the task to get updated values from automations
+                db.refresh(task)
+        
+    except Exception as automation_error:
+        logger.error(f"Error executing automations for ticket update {task.id}: {str(automation_error)}", exc_info=True)
+        # Don't fail ticket update if automations fail
+    # --- End Execute Automations ---
+    
     # Ejecutar workflows basados en los cambios realizados
     try:
         from app.services.workflow_service import WorkflowService

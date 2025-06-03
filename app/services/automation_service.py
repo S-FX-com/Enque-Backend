@@ -1,350 +1,356 @@
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
-import pytz
-from fastapi import HTTPException, status
+from typing import Any, Dict, Optional, List
 from sqlalchemy.orm import Session
-
-from app.models.automation import Automation
-from app.models.user import User
+from sqlalchemy import func, distinct
+from app.models.automation import Automation, AutomationCondition, AutomationAction, ConditionType, ConditionOperator, ActionType
+from app.schemas.automation import AutomationCreate, AutomationUpdate
+from app.models.task import Task
 from app.models.agent import Agent
-from app.models.workspace import Workspace
-from app.models.microsoft import MailboxConnection, MicrosoftToken
-from app.services.microsoft_service import MicrosoftGraphService
-from app.schemas.automation import AutomationCreate, AutomationUpdate, AutomationRunResponse
+from app.models.team import Team
 from app.utils.logger import logger
 
-def get_automations_by_workspace(db: Session, workspace_id: int) -> List[Automation]:
-    """Get all automations for a specific workspace."""
-    return db.query(Automation).filter(Automation.workspace_id == workspace_id).all()
 
-def get_automation_by_id(db: Session, workspace_id: int, automation_id: int) -> Optional[Automation]:
-    """Get a specific automation by ID."""
+def create(db: Session, *, obj_in: AutomationCreate, created_by_agent_id: int) -> Automation:
+    """Create a new automation in the database."""
+    # Create the main automation
+    db_obj = Automation(
+        name=obj_in.name,
+        workspace_id=obj_in.workspace_id,
+        is_active=obj_in.is_active,
+        created_by=created_by_agent_id,
+    )
+    db.add(db_obj)
+    db.flush()  # Flush to get the ID
+    
+    # Create conditions
+    for condition_data in obj_in.conditions:
+        condition = AutomationCondition(
+            automation_id=db_obj.id,
+            condition_type=condition_data.condition_type,
+            condition_operator=condition_data.condition_operator,
+            condition_value=condition_data.condition_value,
+        )
+        db.add(condition)
+    
+    # Create actions
+    for action_data in obj_in.actions:
+        action = AutomationAction(
+            automation_id=db_obj.id,
+            action_type=action_data.action_type,
+            action_value=action_data.action_value,
+        )
+        db.add(action)
+    
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+
+def get_by_id(db: Session, *, id: int) -> Optional[Automation]:
+    """Get automation by ID."""
+    return db.query(Automation).filter(Automation.id == id).first()
+
+
+def get_by_workspace_id(
+    db: Session, *, workspace_id: int, skip: int = 0, limit: int = 100
+) -> List[Automation]:
+    """Get all automations by workspace ID with pagination."""
     return (
         db.query(Automation)
-        .filter(Automation.workspace_id == workspace_id, Automation.id == automation_id)
-        .first()
+        .filter(Automation.workspace_id == workspace_id)
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
 
-def create_automation(
-    db: Session, workspace_id: int, automation_data: AutomationCreate
-) -> Automation:
-    """Create a new automation."""
-    # Verificar que el workspace existe
-    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
-    if not workspace:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found"
+
+def get_active_by_workspace_id(
+    db: Session, *, workspace_id: int, skip: int = 0, limit: int = 100
+) -> List[Automation]:
+    """Get active automations by workspace ID with pagination."""
+    return (
+        db.query(Automation)
+        .filter(
+            Automation.workspace_id == workspace_id,
+            Automation.is_active == True
         )
-    
-    # Crear la automatización
-    db_automation = Automation(
-        workspace_id=workspace_id,
-        name=automation_data.name,
-        description=automation_data.description,
-        type=automation_data.type,
-        is_enabled=automation_data.is_enabled,
-        schedule=automation_data.schedule.dict(),
-        template=automation_data.template.dict(),
-        filters=automation_data.filters,
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
-    
-    # Guardar en la base de datos
-    db.add(db_automation)
-    db.commit()
-    db.refresh(db_automation)
-    
-    return db_automation
 
-def update_automation(
-    db: Session, automation: Automation, automation_data: AutomationUpdate
+
+def update(
+    db: Session, *, db_obj: Automation, obj_in: AutomationUpdate
 ) -> Automation:
-    """Update an existing automation."""
-    # Actualizar los campos proporcionados
-    update_data = automation_data.dict(exclude_unset=True)
+    """Update automation in the database."""
+    update_data = obj_in.model_dump(exclude_unset=True)
     
+    # Handle conditions and actions separately
+    conditions_data = update_data.pop("conditions", None)
+    actions_data = update_data.pop("actions", None)
+    
+    # Update basic fields
     for field, value in update_data.items():
-        if field in ["schedule", "template"] and value is not None:
-            # Para campos JSON, convertir el objeto Pydantic a diccionario si es necesario
-            if hasattr(value, 'dict'):
-                setattr(automation, field, value.dict())
-            else:
-                # Si ya es un diccionario, usarlo directamente
-                setattr(automation, field, value)
-        else:
-            setattr(automation, field, value)
+        setattr(db_obj, field, value)
     
-    # Guardar en la base de datos
-    db.add(automation)
-    db.commit()
-    db.refresh(automation)
-    
-    return automation
-
-def delete_automation(db: Session, automation: Automation) -> None:
-    """Delete an automation."""
-    db.delete(automation)
-    db.commit()
-
-def toggle_automation_status(db: Session, automation: Automation, is_enabled: bool) -> Automation:
-    """Toggle the enabled status of an automation."""
-    automation.is_enabled = is_enabled
-    
-    # Guardar en la base de datos
-    db.add(automation)
-    db.commit()
-    db.refresh(automation)
-    
-    return automation
-
-async def run_automation(
-    db: Session, automation: Automation, current_agent: Agent
-) -> AutomationRunResponse:
-    """Run an automation immediately."""
-    try:
-        # Aquí iría la lógica para ejecutar la automatización según su tipo
-        if automation.type == "scheduled":
-            # Para automatizaciones programadas, ejecutamos la lógica de envío de correo
-            # Esta es una implementación básica que debería ser expandida según los requisitos
-            result = await _execute_email_automation(db, automation, current_agent)
-            if result:
-                return AutomationRunResponse(
-                    success=True,
-                    message=f"Automation '{automation.name}' executed successfully",
-                )
-            else:
-                return AutomationRunResponse(
-                    success=False,
-                    message=f"Automation '{automation.name}' failed to execute. Check server logs for details.",
-                )
-        else:
-            # Otros tipos de automatización
-            return AutomationRunResponse(
-                success=False,
-                message=f"Automation type '{automation.type}' not supported for manual execution",
+    # Update conditions if provided
+    if conditions_data is not None:
+        # Delete existing conditions
+        db.query(AutomationCondition).filter(
+            AutomationCondition.automation_id == db_obj.id
+        ).delete()
+        
+        # Create new conditions
+        for condition_data in conditions_data:
+            condition = AutomationCondition(
+                automation_id=db_obj.id,
+                condition_type=condition_data.get('condition_type') if isinstance(condition_data, dict) else condition_data.condition_type,
+                condition_operator=condition_data.get('condition_operator') if isinstance(condition_data, dict) else condition_data.condition_operator,
+                condition_value=condition_data.get('condition_value') if isinstance(condition_data, dict) else condition_data.condition_value,
             )
-    except Exception as e:
-        # Capturar cualquier error durante la ejecución
-        logger.error(f"Error executing automation {automation.id}: {str(e)}", exc_info=True)
-        return AutomationRunResponse(
-            success=False,
-            message=f"Error executing automation: {str(e)}",
+            db.add(condition)
+    
+    # Update actions if provided
+    if actions_data is not None:
+        # Delete existing actions
+        db.query(AutomationAction).filter(
+            AutomationAction.automation_id == db_obj.id
+        ).delete()
+        
+        # Create new actions
+        for action_data in actions_data:
+            action = AutomationAction(
+                automation_id=db_obj.id,
+                action_type=action_data.get('action_type') if isinstance(action_data, dict) else action_data.action_type,
+                action_value=action_data.get('action_value') if isinstance(action_data, dict) else action_data.action_value,
+            )
+            db.add(action)
+    
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+
+def delete(db: Session, *, db_obj: Automation) -> None:
+    """Delete automation from the database."""
+    db.delete(db_obj)
+    db.commit()
+
+
+def count_by_workspace_id(db: Session, *, workspace_id: int) -> int:
+    """Count total automations in a workspace."""
+    return db.query(Automation).filter(Automation.workspace_id == workspace_id).count()
+
+
+def count_active_by_workspace_id(db: Session, *, workspace_id: int) -> int:
+    """Count active automations in a workspace."""
+    return (
+        db.query(Automation)
+        .filter(
+            Automation.workspace_id == workspace_id,
+            Automation.is_active == True
         )
+        .count()
+    )
 
-async def _execute_email_automation(db: Session, automation: Automation, current_agent: Agent) -> bool:
-    """Execute an email automation using Microsoft Graph API."""
-    try:
-        logger.info(f"Starting execution of automation ID: {automation.id}, Name: {automation.name}")
-        
-        # Obtener los destinatarios según los filtros
-        recipients = []
-        if automation.filters and "recipients" in automation.filters:
-            recipient_ids = automation.filters.get("recipients", [])
-            logger.info(f"Found recipient IDs in automation filters: {recipient_ids}")
-            
-            if recipient_ids:
-                # Convertir a enteros si vienen como strings
-                parsed_ids = []
-                for id_str in recipient_ids:
-                    try:
-                        parsed_ids.append(int(id_str))
-                    except ValueError:
-                        logger.error(f"Invalid recipient ID format: {id_str}")
-                
-                if parsed_ids:
-                    logger.info(f"Querying for AGENTS with IDs: {parsed_ids}")
-                    recipients = db.query(Agent).filter(Agent.id.in_(parsed_ids)).all()
-                    logger.info(f"Found {len(recipients)} agent recipients: {[f'ID:{r.id}, Email:{r.email}' for r in recipients]}")
-                else:
-                    logger.error("No valid recipient IDs found after parsing")
-        else:
-            logger.error(f"No recipients field found in automation filters: {automation.filters}")
-        
-        # Si no hay destinatarios, la automatización no puede ejecutarse
-        if not recipients:
-            logger.error(f"No recipients found for automation: {automation.name}")
-            return False
-        
-        # Obtener información de la plantilla de correo
-        subject = automation.template.get('subject', '')
-        content = automation.template.get('content', '')
-        logger.info(f"Email template - Subject: '{subject}', Content length: {len(content)} chars")
-        
-        if not subject or not content:
-            logger.error(f"Missing subject or content for automation: {automation.name}")
-            return False
-        
-        # Buscar una conexión de mailbox válida para enviar el correo
-        # Primero intentamos usar la conexión del usuario que ejecuta la automatización
-        logger.info(f"Looking for mailbox connection for user ID: {current_agent.id}")
-        
-        # Corregido: Usamos created_by_agent_id en lugar de user_id
-        logger.info(f"Querying for mailbox with created_by_agent_id = {current_agent.id}")
-        mailbox_connection = db.query(MailboxConnection).filter(
-            MailboxConnection.created_by_agent_id == current_agent.id,
-            MailboxConnection.is_active == True
-        ).first()
-        
-        # Si no tiene mailbox, buscar algún otro mailbox activo en el workspace
-        if not mailbox_connection:
-            logger.info(f"No mailbox found for current user. Looking for any mailbox in workspace: {automation.workspace_id}")
-            mailbox_connection = db.query(MailboxConnection).filter(
-                MailboxConnection.workspace_id == automation.workspace_id,
-                MailboxConnection.is_active == True
-            ).first()
-        
-        if not mailbox_connection:
-            logger.error(f"No valid mailbox connection found for automation: {automation.name}")
-            return False
-        
-        logger.info(f"Found mailbox connection: ID:{mailbox_connection.id}, Email:{mailbox_connection.email}")
-        
-        # Obtener token válido para la conexión
-        logger.info(f"Getting token for mailbox: {mailbox_connection.email}")
-        graph_service = MicrosoftGraphService(db=db)
-        
-        # Debug: inspeccionar la conexión del buzón
-        mailbox = db.query(MailboxConnection).filter(
-            MailboxConnection.id == mailbox_connection.id
-        ).first()
-        
-        if not mailbox:
-            logger.error(f"Could not retrieve mailbox with ID: {mailbox_connection.id}")
-            return False
-            
-        # Obtener el token más reciente para este mailbox
-        token_record = db.query(MicrosoftToken).filter(
-            MicrosoftToken.mailbox_connection_id == mailbox.id
-        ).order_by(MicrosoftToken.expires_at.desc()).first()
-        
-        if not token_record:
-            logger.error(f"No token record found for mailbox: {mailbox.email}")
-            return False
-            
-        token = token_record.access_token
-        logger.info(f"Token retrieved for mailbox: {mailbox.email} - Token valid: {bool(token)}")
-        
-        if not token:
-            logger.error(f"No valid token found for mailbox: {mailbox_connection.email}")
-            return False
-        
-        # Enviar correo a cada destinatario
-        success_count = 0
-        for recipient in recipients:
-            try:
-                logger.info(f"Preparing to send email to: {recipient.email} (ID: {recipient.id})")
-                # Añadir personalización simple si se desea
-                personalized_content = content.replace("[User Name]", recipient.name)
-                
-                # Usar MicrosoftGraphService para enviar el correo
-                logger.info(f"Calling Microsoft Graph API to send email from {mailbox.email} to {recipient.email}")
-                success = await graph_service.send_email_with_user_token(
-                    user_access_token=token,
-                    sender_mailbox_email=mailbox.email,
-                    recipient_email=recipient.email,
-                    subject=subject,
-                    html_body=personalized_content
-                )
-                
-                if success:
-                    success_count += 1
-                    logger.info(f"✅ Email successfully sent to {recipient.email} for automation: {automation.name}")
-                else:
-                    logger.error(f"❌ Failed to send email to {recipient.email} for automation: {automation.name}")
-            except Exception as e:
-                logger.error(f"Error sending email to {recipient.email}: {str(e)}", exc_info=True)
-        
-        # Considerar exitosa la automatización si al menos un correo se envió
-        logger.info(f"Automation {automation.id} finished. Successfully sent {success_count}/{len(recipients)} emails")
-        return success_count > 0
-    except Exception as e:
-        logger.error(f"Error in _execute_email_automation for automation {automation.id}: {str(e)}", exc_info=True)
-        return False
 
-def get_due_automations(db: Session) -> List[Automation]:
-    """Get automations that are due to run (for scheduled tasks)."""
-    # Esta función sería utilizada por un trabajo programado para obtener
-    # las automatizaciones que deben ejecutarse según su programación
+def get_stats(db: Session, *, workspace_id: int) -> Dict[str, Any]:
+    """Get statistics for automations in a workspace."""
+    total_count = count_by_workspace_id(db=db, workspace_id=workspace_id)
+    active_count = count_active_by_workspace_id(db=db, workspace_id=workspace_id)
     
-    # Obtener solo automatizaciones habilitadas
-    automations = db.query(Automation).filter(Automation.is_enabled == True).all()
+    return {
+        "total_count": total_count,
+        "active_count": active_count
+    }
+
+
+def get_automations(db: Session, workspace_id: int, skip: int = 0, limit: int = 100) -> List[Automation]:
+    """Get all automations for a workspace"""
+    return db.query(Automation).filter(
+        Automation.workspace_id == workspace_id
+    ).offset(skip).limit(limit).all()
+
+
+def get_automation(db: Session, automation_id: int) -> Optional[Automation]:
+    """Get a specific automation by ID"""
+    return db.query(Automation).filter(Automation.id == automation_id).first()
+
+
+def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
+    """
+    Execute all active automations for a ticket
+    Returns list of actions that were executed
+    """
+    executed_actions = []
     
-    # Filtrar las que corresponden ejecutar ahora según su programación
-    now = datetime.now()
-    due_automations = []
+    # Get all active automations for the workspace
+    automations = db.query(Automation).filter(
+        Automation.workspace_id == ticket.workspace_id,
+        Automation.is_active == True
+    ).all()
+    
+    logger.info(f"Checking {len(automations)} active automations for ticket {ticket.id}")
     
     for automation in automations:
-        if _is_automation_due(automation, now):
-            due_automations.append(automation)
+        try:
+            # Check if all conditions match
+            if _check_automation_conditions(automation, ticket):
+                logger.info(f"Automation {automation.id} '{automation.name}' matches ticket {ticket.id}")
+                
+                # Execute all actions
+                actions_executed = _execute_automation_actions(db, automation, ticket)
+                executed_actions.extend(actions_executed)
+                
+                logger.info(f"Executed {len(actions_executed)} actions for automation {automation.id}")
+            else:
+                logger.debug(f"Automation {automation.id} conditions do not match ticket {ticket.id}")
+                
+        except Exception as e:
+            logger.error(f"Error executing automation {automation.id} for ticket {ticket.id}: {str(e)}")
+            continue
     
-    return due_automations
+    if executed_actions:
+        db.commit()
+        logger.info(f"Successfully executed {len(executed_actions)} automation actions for ticket {ticket.id}")
+    
+    return executed_actions
 
-def _is_automation_due(automation: Automation, current_time: datetime) -> bool:
-    """Check if an automation is due to run based on its schedule."""
-    # Esta es una implementación básica que debe adaptarse según los requisitos exactos
-    schedule = automation.schedule
-    automation_id = getattr(automation, 'id', 'unknown')
-    
-    # Usar pytz para manejar correctamente la zona horaria de Nueva Jersey (Eastern Time)
-    eastern_tz = pytz.timezone('America/New_York')
-    
-    # Si current_time no tiene zona horaria, asumimos que es UTC
-    if current_time.tzinfo is None:
-        current_time = pytz.utc.localize(current_time)
-    
-    # Convertir a hora de Nueva Jersey
-    adjusted_time = current_time.astimezone(eastern_tz)
-    adjusted_time_str = adjusted_time.strftime("%H:%M")
-    
-    # Convertir la hora actual a formato HH:MM para comparar
-    current_time_str = current_time.strftime("%H:%M")
-    scheduled_time = schedule.get("time", "")
-    
-    logger.info(f"Checking if automation {automation_id} is due. UTC time: {current_time_str}, ET time: {adjusted_time_str}, Scheduled time: {scheduled_time}")
-    
-    # Verificar si la automatización está programada para esta hora
-    if scheduled_time != adjusted_time_str:
-        logger.info(f"Automation {automation_id} is not due yet. Expected time: {scheduled_time}, Current ET time: {adjusted_time_str}")
+
+def _check_automation_conditions(automation: Automation, ticket: Task) -> bool:
+    """Check if all conditions of an automation match the ticket"""
+    if not automation.conditions:
         return False
     
-    frequency = schedule.get("frequency", "")
-    logger.info(f"Automation {automation_id} frequency: {frequency}")
+    for condition in automation.conditions:
+        if not _check_single_condition(condition, ticket):
+            return False
     
-    # Para las comparaciones de día, usamos la fecha ajustada a la zona horaria de Nueva Jersey
-    if frequency == "daily":
-        # Ejecutar diariamente a la hora especificada
-        logger.info(f"Automation {automation_id} is due (daily schedule matches current ET time)")
-        return True
-    
-    elif frequency == "weekly":
-        # Ejecutar en el día de la semana especificado
-        day_of_week = schedule.get("day", "").lower()
-        current_day = adjusted_time.strftime("%A").lower()
+    return True
+
+
+def _check_single_condition(condition: AutomationCondition, ticket: Task) -> bool:
+    """Check if a single condition matches the ticket"""
+    try:
+        # Get the value from the ticket based on condition type
+        ticket_value = _get_ticket_value(condition.condition_type, ticket)
+        condition_value = condition.condition_value or ""
         
-        logger.info(f"Automation {automation_id} weekly check: Scheduled day: {day_of_week}, Current ET day: {current_day}")
+        if ticket_value is None:
+            return False
         
-        if day_of_week == current_day:
-            logger.info(f"Automation {automation_id} is due (weekly schedule matches current ET day and time)")
-            return True
+        # Convert to strings for comparison
+        ticket_value_str = str(ticket_value).strip()
+        condition_value_str = str(condition_value).strip()
+        
+        # Apply the operator
+        if condition.condition_operator == ConditionOperator.EQL:
+            return ticket_value_str.lower() == condition_value_str.lower()
+        elif condition.condition_operator == ConditionOperator.NEQL:
+            return ticket_value_str.lower() != condition_value_str.lower()
+        elif condition.condition_operator == ConditionOperator.CON:
+            return condition_value_str.lower() in ticket_value_str.lower()
+        elif condition.condition_operator == ConditionOperator.NCON:
+            return condition_value_str.lower() not in ticket_value_str.lower()
         else:
-            logger.info(f"Automation {automation_id} is not due today (expecting day: {day_of_week}, current ET day: {current_day})")
+            logger.warning(f"Unknown condition operator: {condition.condition_operator}")
             return False
+            
+    except Exception as e:
+        logger.error(f"Error checking condition {condition.id}: {str(e)}")
+        return False
+
+
+def _get_ticket_value(condition_type: ConditionType, ticket: Task) -> Optional[str]:
+    """Get the value from the ticket based on the condition type"""
+    try:
+        if condition_type == ConditionType.DESCRIPTION:
+            return ticket.description or ""
+        elif condition_type == ConditionType.NOTE:
+            # For notes, we might need to check related comments/notes
+            return ""  # TODO: Implement note checking if needed
+        elif condition_type == ConditionType.USER:
+            return ticket.user.email if ticket.user else ""
+        elif condition_type == ConditionType.AGENT:
+            return ticket.assignee.email if ticket.assignee else ""
+        elif condition_type == ConditionType.COMPANY:
+            return ticket.company.name if ticket.company else ""
+        elif condition_type == ConditionType.PRIORITY:
+            return ticket.priority or ""
+        elif condition_type == ConditionType.CATEGORY:
+            return ticket.category.name if ticket.category else ""
+        else:
+            logger.warning(f"Unknown condition type: {condition_type}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting ticket value for condition type {condition_type}: {str(e)}")
+        return None
+
+
+def _execute_automation_actions(db: Session, automation: Automation, ticket: Task) -> List[str]:
+    """Execute all actions of an automation on a ticket"""
+    executed_actions = []
     
-    elif frequency == "monthly":
-        # Ejecutar en el día del mes especificado
-        day_of_month = schedule.get("day")
-        logger.info(f"Automation {automation_id} monthly check: Scheduled day: {day_of_month}, Current ET day: {adjusted_time.day}")
-        
+    for action in automation.actions:
         try:
-            day = int(day_of_month)
-            if day == adjusted_time.day:
-                logger.info(f"Automation {automation_id} is due (monthly schedule matches current ET day and time)")
-                return True
-            else:
-                logger.info(f"Automation {automation_id} is not due today (expecting day of month: {day}, current ET day: {adjusted_time.day})")
-                return False
-        except (ValueError, TypeError):
-            logger.error(f"Automation {automation_id} has invalid day value for monthly frequency: {day_of_month}")
-            return False
+            action_result = _execute_single_action(db, action, ticket)
+            if action_result:
+                executed_actions.append(f"Automation '{automation.name}': {action_result}")
+        except Exception as e:
+            logger.error(f"Error executing action {action.id}: {str(e)}")
+            continue
     
-    logger.warning(f"Automation {automation_id} has unknown frequency: {frequency}")
-    return False 
+    return executed_actions
+
+
+def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) -> Optional[str]:
+    """Execute a single action on a ticket"""
+    try:
+        if action.action_type == ActionType.SET_AGENT:
+            # Find agent by email
+            agent = db.query(Agent).filter(
+                Agent.email == action.action_value,
+                Agent.workspace_id == ticket.workspace_id
+            ).first()
+            
+            if agent:
+                old_assignee = ticket.assignee.email if ticket.assignee else "Unassigned"
+                ticket.assignee_id = agent.id
+                return f"Set agent from '{old_assignee}' to '{agent.email}'"
+            else:
+                logger.warning(f"Agent not found: {action.action_value}")
+                return None
+                
+        elif action.action_type == ActionType.SET_TEAM:
+            # Find team by name
+            team = db.query(Team).filter(
+                Team.name == action.action_value,
+                Team.workspace_id == ticket.workspace_id
+            ).first()
+            
+            if team:
+                old_team = ticket.team.name if ticket.team else "Unassigned"
+                ticket.team_id = team.id
+                return f"Set team from '{old_team}' to '{team.name}'"
+            else:
+                logger.warning(f"Team not found: {action.action_value}")
+                return None
+                
+        elif action.action_type == ActionType.SET_PRIORITY:
+            old_priority = ticket.priority or "Unassigned"
+            ticket.priority = action.action_value
+            return f"Set priority from '{old_priority}' to '{action.action_value}'"
+            
+        elif action.action_type == ActionType.SET_STATUS:
+            old_status = ticket.status or "Unassigned"
+            ticket.status = action.action_value
+            return f"Set status from '{old_status}' to '{action.action_value}'"
+            
+        else:
+            logger.warning(f"Unknown action type: {action.action_type}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error executing action {action.id}: {str(e)}")
+        return None 

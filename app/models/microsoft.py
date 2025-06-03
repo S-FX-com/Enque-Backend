@@ -1,8 +1,21 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, DateTime, Index, Enum
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, DateTime, Index, Enum, Table
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database.base_class import Base
 from datetime import datetime
+
+# Junction table for many-to-many relationship between mailboxes and teams
+mailbox_team_assignments = Table(
+    'mailbox_team_assignments',
+    Base.metadata,
+    Column('id', Integer, primary_key=True, autoincrement=True),
+    Column('mailbox_connection_id', Integer, ForeignKey('mailbox_connections.id', ondelete='CASCADE'), nullable=False),
+    Column('team_id', Integer, ForeignKey('teams.id', ondelete='CASCADE'), nullable=False),
+    Column('created_at', DateTime, default=func.now()),
+    Index('idx_mailbox_team_assignments_mailbox_id', 'mailbox_connection_id'),
+    Index('idx_mailbox_team_assignments_team_id', 'team_id'),
+    Index('idx_unique_mailbox_team', 'mailbox_connection_id', 'team_id', unique=True)
+)
 
 class MailboxConnection(Base):
     __tablename__ = "mailbox_connections"
@@ -12,6 +25,7 @@ class MailboxConnection(Base):
     display_name = Column(String(255), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
     created_by_agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    is_global = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
@@ -19,6 +33,7 @@ class MailboxConnection(Base):
     # Relaciones
     workspace = relationship("Workspace", back_populates="mailbox_connections")
     created_by_agent = relationship("Agent", back_populates="created_mailboxes")
+    teams = relationship("Team", secondary=mailbox_team_assignments, back_populates="mailbox_connections")
     tokens = relationship("MicrosoftToken", back_populates="mailbox_connection")
     sync_configs = relationship("EmailSyncConfig", back_populates="mailbox_connection")
     tasks = relationship("Task", back_populates="mailbox_connection") # Added inverse relationship

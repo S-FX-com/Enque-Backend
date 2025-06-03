@@ -38,5 +38,5 @@ class Agent(Base):
     comments = relationship("Comment", back_populates="agent", cascade="all, delete-orphan") 
     activities = relationship("Activity", back_populates="agent", cascade="all, delete-orphan")
     created_mailboxes = relationship("MailboxConnection", back_populates="created_by_agent") 
-    microsoft_tokens = relationship("MicrosoftToken", back_populates="agent", cascade="all, delete-orphan")
+    microsoft_tokens = relationship("MicrosoftToken", back_populates="agent", cascade="all, delete-orphan") 
     created_canned_replies = relationship("CannedReply", back_populates="created_by_agent", cascade="all, delete-orphan")

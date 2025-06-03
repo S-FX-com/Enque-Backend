@@ -7,10 +7,10 @@ from app.models.user import User, UnassignedUser
 from app.models.task import Task
 from app.models.comment import Comment
 from app.models.activity import Activity
+from app.models.canned_reply import CannedReply
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig 
 from .ticket_attachment import TicketAttachment 
 from app.models.global_signature import GlobalSignature 
 from app.models.notification import NotificationTemplate, NotificationSetting 
-from app.models.automation import Automation 
-from app.models.workflow import Workflow
-from app.models.canned_reply import CannedReply 
+from app.models.workflow import Workflow 
+from app.models.automation import Automation, AutomationCondition, AutomationAction 

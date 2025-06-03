@@ -1,22 +1,19 @@
 from typing import Optional
 from pydantic import BaseModel, Field, validator
+from datetime import datetime
 import re
 
 
 # Workspace schemas
 class WorkspaceBase(BaseModel):
     """Base schema for Workspace."""
-    name: str = Field(..., description="Workspace name")
     subdomain: str = Field(..., description="Unique subdomain to access the workspace")
-    email_domain: str = Field(..., description="Email domain associated with this workspace")
-    description: Optional[str] = Field(None, description="Workspace description")
-    logo_url: Optional[str] = Field(None, description="URL for the workspace logo")
     
     @validator("subdomain")
     def validate_subdomain(cls, v):
         """Validate that subdomain only contains alphanumeric characters and hyphens."""
-        if not re.match(r"^[a-z0-9\-]+$", v):
-            raise ValueError("Subdomain can only contain lowercase letters, numbers, and hyphens")
+        if not re.match(r"^[a-zA-Z0-9\-]+$", v):
+            raise ValueError("Subdomain can only contain letters, numbers, and hyphens")
         return v
 
 
@@ -27,23 +24,45 @@ class WorkspaceCreate(WorkspaceBase):
 
 class WorkspaceUpdate(BaseModel):
     """Schema for updating a Workspace."""
-    name: Optional[str] = None
     subdomain: Optional[str] = None
-    description: Optional[str] = None
-    email_domain: Optional[str] = None
-    logo_url: Optional[str] = None
     
     @validator("subdomain")
     def validate_subdomain(cls, v):
         """Validate that subdomain only contains alphanumeric characters and hyphens."""
-        if v is not None and not re.match(r"^[a-z0-9\-]+$", v):
-            raise ValueError("Subdomain can only contain lowercase letters, numbers, and hyphens")
+        if v is not None and not re.match(r"^[a-zA-Z0-9\-]+$", v):
+            raise ValueError("Subdomain can only contain letters, numbers, and hyphens")
         return v
 
 
 class Workspace(WorkspaceBase):
     """Schema for a Workspace response."""
     id: int
+    created_at: datetime
+    updated_at: datetime
     
     class Config:
-        from_attributes = True 
+        from_attributes = True
+
+
+# Schema para el setup inicial
+class WorkspaceSetupCreate(BaseModel):
+    """Schema for workspace setup with first admin."""
+    subdomain: str = Field(..., description="Unique subdomain for the workspace")
+    admin_name: str = Field(..., description="Name of the first admin user")
+    admin_email: str = Field(..., description="Email of the first admin user")
+    admin_password: str = Field(..., min_length=8, description="Password for the first admin user")
+    
+    @validator("subdomain")
+    def validate_subdomain(cls, v):
+        """Validate that subdomain only contains alphanumeric characters and hyphens."""
+        if not re.match(r"^[a-zA-Z0-9\-]+$", v):
+            raise ValueError("Subdomain can only contain letters, numbers, and hyphens")
+        return v
+
+
+class WorkspaceSetupResponse(BaseModel):
+    """Response for workspace setup."""
+    workspace: Workspace
+    admin: dict  # AgentSchema se importará más tarde para evitar dependencias circulares
+    access_token: str
+    token_type: str = "bearer" 

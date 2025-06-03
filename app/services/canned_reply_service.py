@@ -9,12 +9,11 @@ def create(db: Session, *, obj_in: CannedReplyCreate, created_by_agent_id: int) 
     """Create a new canned reply in the database."""
     db_obj = CannedReply(
         workspace_id=obj_in.workspace_id,
-        title=obj_in.title,
+        name=obj_in.name,
+        description=obj_in.description,
         content=obj_in.content,
         created_by_agent_id=created_by_agent_id,
         is_enabled=obj_in.is_enabled,
-        category=obj_in.category,
-        tags=obj_in.tags,
     )
     db.add(db_obj)
     db.commit()
@@ -54,40 +53,6 @@ def get_enabled_by_workspace_id(
         .limit(limit)
         .all()
     )
-
-
-def get_by_category(
-    db: Session, *, workspace_id: int, category: str, skip: int = 0, limit: int = 100
-) -> List[CannedReply]:
-    """Get canned replies by workspace ID and category with pagination."""
-    return (
-        db.query(CannedReply)
-        .filter(
-            CannedReply.workspace_id == workspace_id,
-            CannedReply.category == category,
-            CannedReply.is_enabled == True
-        )
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
-
-
-def search_by_tags(
-    db: Session, *, workspace_id: int, tags: List[str], skip: int = 0, limit: int = 100
-) -> List[CannedReply]:
-    """Search canned replies by tags within a workspace."""
-    query = db.query(CannedReply).filter(
-        CannedReply.workspace_id == workspace_id,
-        CannedReply.is_enabled == True
-    )
-    
-    # Filter by tags if provided
-    if tags:
-        for tag in tags:
-            query = query.filter(CannedReply.tags.contains([tag]))
-    
-    return query.offset(skip).limit(limit).all()
 
 
 def update(
@@ -131,28 +96,7 @@ def get_stats(db: Session, *, workspace_id: int) -> Dict[str, Any]:
     total_count = count_by_workspace_id(db=db, workspace_id=workspace_id)
     enabled_count = count_enabled_by_workspace_id(db=db, workspace_id=workspace_id)
     
-    # Get unique categories
-    categories_query = db.query(distinct(CannedReply.category)).filter(
-        CannedReply.workspace_id == workspace_id,
-        CannedReply.category.isnot(None)
-    )
-    categories = [cat[0] for cat in categories_query.all()]
-    
-    # Get unique tags (this is a bit more complex with JSON arrays)
-    tags_query = db.query(CannedReply.tags).filter(
-        CannedReply.workspace_id == workspace_id,
-        CannedReply.tags.isnot(None)
-    )
-    all_tags = []
-    for tag_list in tags_query.all():
-        if tag_list[0]:  # Check if tags is not None
-            all_tags.extend(tag_list[0])
-    
-    unique_tags = list(set(all_tags))
-    
     return {
         "total_count": total_count,
         "enabled_count": enabled_count,
-        "categories": categories,
-        "tags": unique_tags
     }

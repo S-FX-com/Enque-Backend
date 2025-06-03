@@ -262,16 +262,19 @@ class MailboxConnectionBase(BaseModel):
     display_name: Optional[str] = Field(None, description="Display name for the mailbox")
     workspace_id: int = Field(..., description="ID of the workspace this mailbox belongs to")
     created_by_agent_id: int = Field(..., description="ID of the agent who created this connection")
+    is_global: bool = Field(False, description="Whether this mailbox is visible to all users (true) or only specific teams (false)")
     is_active: bool = Field(True, description="Whether this mailbox connection is active")
     
     class Config:
         from_attributes = True
 
 class MailboxConnectionCreate(MailboxConnectionBase):
-    pass
+    team_ids: Optional[List[int]] = Field(default=[], description="List of team IDs this mailbox is assigned to (empty if global)")
     
 class MailboxConnectionUpdate(BaseModel):
     display_name: Optional[str] = None
+    is_global: Optional[bool] = None
+    team_ids: Optional[List[int]] = None
     is_active: Optional[bool] = None
     
     class Config:
@@ -286,5 +289,8 @@ class MailboxConnectionInDB(MailboxConnectionBase):
         from_attributes = True
 
 class MailboxConnection(MailboxConnectionInDB):
+    team_ids: List[int] = Field(default=[], description="List of team IDs this mailbox is assigned to")
+    teams: Optional[List[dict]] = Field(default=[], description="List of team details")
+    
     class Config:
         from_attributes = True

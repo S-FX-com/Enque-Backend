@@ -12,6 +12,7 @@ class AgentBase(BaseModel):
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
+    avatar: Optional[str] = None
 
     @validator("role")
     def validate_role(cls, v):
@@ -27,6 +28,7 @@ class AgentInviteCreate(BaseModel):
     email: EmailStr
     role: str = "agent" 
     workspace_id: int 
+    job_title: Optional[str] = None
 
     @validator("role")
     def validate_role(cls, v):
@@ -53,6 +55,7 @@ class AgentUpdate(BaseModel):
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
+    avatar: Optional[str] = None
 
     @validator("role")
     def validate_role(cls, v):
@@ -129,6 +132,7 @@ class Agent(AgentInDBBase):
                 "job_title": "Support Specialist",
                 "phone_number": "123-456-7890",
                 "email_signature": "Regards, John",
+                "avatar": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQ...",
                 "workspace_id": 1,
                 "created_at": "2023-01-01T12:00:00Z",
                 "updated_at": "2023-01-01T12:00:00Z",
