@@ -27,6 +27,7 @@ class CommentInDBBase(CommentBase):
     ticket_id: int
     agent_id: Optional[int] = None
     workspace_id: int
+    s3_html_url: Optional[str] = None  # URL del contenido en S3
     created_at: datetime
     updated_at: datetime
 

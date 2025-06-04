@@ -28,12 +28,13 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
 
     if user:
         if workspace_id and user.workspace_id != workspace_id:
-             print(f"Warning: Found user {email} but belongs to workspace {user.workspace_id}, expected {workspace_id}")
-             return None 
+            print(f"Warning: Found user {email} but belongs to workspace {user.workspace_id}, expected {workspace_id}")
+            return None 
         return user
+    
     if not workspace_id:
         print(f"Error: workspace_id is required to create a new user for email {email}")
-        return None
+        return None 
 
     try:
         if not name:
@@ -112,7 +113,7 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
                     raise 
             else:
                 print(f"Non-duplicate IntegrityError for {email}: {e}")
-                raise
+                raise 
         else:
             print(f"Unexpected IntegrityError structure for {email}: {e}")
             raise

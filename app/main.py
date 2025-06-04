@@ -4,8 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 import os
 import re
 
@@ -34,16 +32,8 @@ app = FastAPI(
     redirect_slashes=False
 )
 
-STATIC_DIR = Path(__file__).parent.parent / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-(STATIC_DIR / "uploads" / "images").mkdir(parents=True, exist_ok=True)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-# Configurar directorio de uploads como contenido estático
-uploads_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
-os.makedirs(uploads_dir, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+# Static files and uploads are now handled by S3
+# Removed static file mounting as files are stored in S3
 
 def allow_origin_regex(origin: str):
     allowed_patterns = [

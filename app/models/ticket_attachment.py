@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, LargeBinary, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, LargeBinary, DateTime, ForeignKey, func, Text
 from sqlalchemy.orm import relationship
 from app.database.base_class import Base
 
@@ -10,7 +10,8 @@ class TicketAttachment(Base):
     file_name = Column(String, nullable=False)
     content_type = Column(String, nullable=False)
     file_size = Column(Integer, nullable=False)
-    content_bytes = Column(LargeBinary, nullable=False)
+    content_bytes = Column(LargeBinary, nullable=True)
+    s3_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
     # Relationships

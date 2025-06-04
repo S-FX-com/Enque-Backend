@@ -1,6 +1,10 @@
 from fastapi import APIRouter, Response
 
-from app.api.endpoints import auth, users, agents, tasks, teams, companies, microsoft, profile, workspaces, comments, activities, uploads, categories, reports, attachments, global_signatures, notifications, workflows, canned_replies, automations
+from app.api.endpoints import (
+    agents, auth, comments, microsoft, tasks, users, workspaces, teams, attachments, 
+    workflows, canned_replies, automations, companies, profile, activities, uploads, 
+    categories, reports, global_signatures, notifications
+)
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["authentication"])

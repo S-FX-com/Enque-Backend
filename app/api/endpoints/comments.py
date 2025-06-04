@@ -1,6 +1,7 @@
 from typing import Any, List, Dict
 from datetime import datetime # Import datetime
 import asyncio
+import base64
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload # Re-import joinedload
@@ -22,6 +23,9 @@ from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
 from app.core.config import settings
 from app.services.workflow_service import WorkflowService
+from app.services.s3_service import get_s3_service
+from app.utils.image_processor import extract_base64_images
+from app.models.ticket_attachment import TicketAttachment
 
 router = APIRouter()
 
@@ -142,12 +146,54 @@ async def create_comment(
     task.last_update = datetime.utcnow()  # Use import
     db.add(task)
 
+    # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
+    content_to_store = comment_in.content
+    s3_html_url = None
+    
+    try:
+        if comment_in.content and comment_in.content.strip():
+            from app.services.s3_service import get_s3_service
+            s3_service = get_s3_service()
+            
+            # Verificar si el contenido es muy grande o debe ir a S3
+            content_length = len(comment_in.content)
+            should_migrate_to_s3 = (
+                content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                s3_service.should_store_html_in_s3(comment_in.content)
+            )
+            
+            if should_migrate_to_s3:
+                logger.info(f"🚀 Pre-migrating large comment content ({content_length} chars) to S3...")
+                
+                # Generar un ID temporal para el archivo S3
+                import uuid
+                temp_id = str(uuid.uuid4())
+                
+                # Almacenar en S3 con ID temporal
+                s3_url = s3_service.upload_html_content(
+                    html_content=comment_in.content,
+                    filename=f"temp-comment-{temp_id}.html",
+                    folder="comments"
+                )
+                
+                # Actualizar variables para la BD
+                s3_html_url = s3_url
+                content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
+                
+                logger.info(f"✅ Comment content pre-migrated to S3: {s3_url}")
+    except Exception as e:
+        logger.error(f"❌ Error pre-migrating comment content to S3: {str(e)}")
+        # Continue with original content if S3 fails
+        content_to_store = comment_in.content
+        s3_html_url = None
+
     # Create the comment
     comment = CommentModel(
         ticket_id=task_id,
         agent_id=current_user.id,
         workspace_id=current_user.workspace_id,
-        content=comment_in.content,
+        content=content_to_store,  # Usar contenido procesado
+        s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
         is_private=comment_in.is_private
     )
     db.add(comment)
@@ -183,6 +229,28 @@ async def create_comment(
         # Si no hay adjuntos, hacemos commit para asegurar que el comentario tenga ID
         db.commit()
         db.refresh(comment)
+
+    # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
+    if s3_html_url and comment.id:
+        try:
+            # Renombrar archivo en S3 con el ID real del comentario
+            s3_service = get_s3_service()
+            
+            # Obtener el contenido original para almacenar con el nombre correcto
+            original_content = comment_in.content
+            
+            # Crear nueva URL con ID real
+            final_s3_url = s3_service.store_comment_html(comment.id, original_content)
+            
+            # Actualizar la URL en el comentario
+            comment.s3_html_url = final_s3_url
+            comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
+            db.add(comment)
+            
+            logger.info(f"✅ S3 file renamed for comment {comment.id}: {final_s3_url}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not rename S3 file for comment {comment.id}: {str(e)}")
+            # Continue with temp filename - not critical
 
     # NUEVO: Procesar workflows automáticamente para análisis de contenido
     workflow_results = []
@@ -455,7 +523,7 @@ async def create_comment(
     return response_data
 
 
-@router.get("/comments/{comment_id}", response_model=CommentSchema)
+@router.get("/{comment_id}", response_model=CommentSchema)
 async def read_comment(
     comment_id: int,
     db: Session = Depends(get_db),
@@ -486,7 +554,7 @@ async def read_comment(
     return comment
 
 
-@router.put("/comments/{comment_id}", response_model=CommentSchema)
+@router.put("/{comment_id}", response_model=CommentSchema)
 async def update_comment(
     comment_id: int,
     comment_in: CommentUpdate,
@@ -536,7 +604,7 @@ async def update_comment(
     return comment
 
 
-@router.delete("/comments/{comment_id}", response_model=CommentSchema)
+@router.delete("/{comment_id}", response_model=CommentSchema)
 async def delete_comment(
     comment_id: int,
     db: Session = Depends(get_db),
@@ -670,3 +738,124 @@ def send_email_in_background(
         logger.error(f"[BACKGROUND] Error en el envío de correo para comment_id: {comment_id}: {str(e)}", exc_info=True)
     finally:
         db.close()
+
+@router.get("/comments/{comment_id}/s3-content")
+def get_comment_s3_content(
+    comment_id: int,
+    db: Session = Depends(get_db),
+    current_user: AgentModel = Depends(get_current_active_user)
+):
+    """
+    Get comment content from S3 when it's stored there
+    Optimized for fast loading with caching headers
+    """
+    try:
+        # Get comment
+        comment = db.query(CommentModel).filter(CommentModel.id == comment_id).first()
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        
+        # Check workspace access
+        if comment.workspace_id != current_user.workspace_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this comment")
+        
+        # Check if comment has S3 URL
+        if not comment.s3_html_url:
+            return {
+                "status": "content_in_database",
+                "content": comment.content,
+                "message": "Comment content is stored in database, not S3"
+            }
+        
+        # Get content from S3 with optimized settings
+        s3_service = get_s3_service()
+        s3_content = s3_service.get_comment_html(comment.s3_html_url)
+        
+        if not s3_content:
+            # Fallback to database content if S3 fails
+            logger.warning(f"Failed to retrieve content from S3 for comment {comment_id}, falling back to database")
+            return {
+                "status": "s3_error_fallback",
+                "content": comment.content,
+                "message": "Failed to retrieve from S3, showing database content"
+            }
+        
+        # NUEVO: Procesar imágenes CID que puedan estar en el contenido de S3
+        try:
+            # Buscar el ticket asociado para obtener el ID
+            ticket = db.query(TaskModel).filter(TaskModel.id == comment.ticket_id).first()
+            if ticket:
+                # Procesar el HTML para las imágenes CID
+                from app.services.microsoft_service import MicrosoftGraphService
+                ms_service = MicrosoftGraphService(db)
+                
+                # Como no tenemos attachments reales, buscamos imágenes CID en el HTML
+                # que podrían no haberse procesado correctamente
+                processed_content = s3_content
+                
+                # Buscar patrones de imágenes CID no procesadas en el HTML
+                import re
+                from bs4 import BeautifulSoup
+                
+                soup = BeautifulSoup(s3_content, 'html.parser')
+                cid_images_found = soup.find_all('img', src=re.compile(r'^cid:'))
+                
+                if cid_images_found:
+                    logger.info(f"Found {len(cid_images_found)} unprocessed CID images in S3 content for comment {comment_id}")
+                    
+                    # Buscar adjuntos inline del comentario para procesar CID
+                    inline_attachments = db.query(TicketAttachment).filter(
+                        TicketAttachment.comment_id == comment_id
+                    ).all()
+                    
+                    # Convertir a EmailAttachment format para compatibility
+                    email_attachments = []
+                    for att in inline_attachments:
+                        if att.content_bytes and att.content_type and att.content_type.startswith('image/'):
+                            # Crear EmailAttachment compatible
+                            email_att = type('EmailAttachment', (), {
+                                'contentId': att.file_name.replace('.', '_'),  # Usar filename como contentId
+                                'is_inline': True,
+                                'contentBytes': base64.b64encode(att.content_bytes).decode('utf-8'),
+                                'content_type': att.content_type
+                            })()
+                            email_attachments.append(email_att)
+                    
+                    if email_attachments:
+                        # Procesar con el método existente
+                        processed_content = ms_service._process_html_body(
+                            s3_content, 
+                            email_attachments, 
+                            f"s3_comment_{comment_id}"
+                        )
+                        logger.info(f"Processed CID images for S3 comment {comment_id}")
+                
+                # También procesar imágenes base64 que podrían estar en el contenido
+                final_content, extracted_images = extract_base64_images(processed_content, ticket.id)
+                
+                if extracted_images:
+                    logger.info(f"Extracted {len(extracted_images)} base64 images from S3 content for comment {comment_id}")
+                    processed_content = final_content
+                
+            else:
+                processed_content = s3_content
+                
+        except Exception as img_process_error:
+            logger.warning(f"Error processing images in S3 content for comment {comment_id}: {str(img_process_error)}")
+            processed_content = s3_content
+        
+        from fastapi import Response
+        
+        # Create response with caching headers for better performance
+        response_data = {
+            "status": "loaded_from_s3",
+            "content": processed_content,  # Usar contenido procesado
+            "s3_url": comment.s3_html_url,
+            "message": "Content loaded from S3"
+        }
+        
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting S3 content for comment {comment_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get comment content: {str(e)}")

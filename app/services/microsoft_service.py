@@ -28,6 +28,7 @@ import time
 from sqlalchemy import or_, and_, desc
 import re
 from app.utils.image_processor import extract_base64_images  # Importamos nuestra nueva utilidad
+import boto3  # For S3 file downloads
 
 
 class MicrosoftGraphService:
@@ -54,6 +55,37 @@ class MicrosoftGraphService:
     def _get_active_integration(self) -> Optional[MicrosoftIntegration]:
         """Get the active Microsoft integration"""
         return self.db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
+
+    def _download_file_from_s3(self, s3_url: str) -> Optional[bytes]:
+        """Download file content from S3 URL"""
+        try:
+            # Initialize S3 client (using hardcoded credentials for now)
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id="AKIAQ3EGRIILJHGBQJOZ",
+                aws_secret_access_key="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",
+                region_name="us-east-2"
+            )
+            
+            # Extract bucket and key from S3 URL
+            # Format: https://enque.s3.us-east-2.amazonaws.com/path/to/file
+            parts = s3_url.replace("https://", "").split("/", 1)
+            if len(parts) < 2:
+                logger.error(f"Invalid S3 URL format: {s3_url}")
+                return None
+                
+            bucket_name = parts[0].split(".")[0]  # Extract bucket name from hostname
+            s3_key = parts[1]  # Everything after first slash is the key
+            
+            # Download file from S3
+            response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
+            file_content = response['Body'].read()
+            
+            return file_content
+            
+        except Exception as e:
+            logger.error(f"❌ Error downloading file from S3: {str(e)}")
+            return None
 
     def get_application_token(self) -> str:
         """Get an application token using client credentials flow"""
@@ -530,11 +562,53 @@ class MicrosoftGraphService:
                         # Usar el formato con metadatos especiales para el remitente
                         special_metadata = f'<original-sender>{reply_user.name}|{reply_user.email}</original-sender>'
                         
+                        # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
+                        content_to_store = special_metadata + processed_reply_html
+                        s3_html_url = None
+                        
+                        try:
+                            if content_to_store and content_to_store.strip():
+                                from app.services.s3_service import get_s3_service
+                                s3_service = get_s3_service()
+                                
+                                # Verificar si el contenido es muy grande o debe ir a S3
+                                content_length = len(content_to_store)
+                                should_migrate_to_s3 = (
+                                    content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                                    s3_service.should_store_html_in_s3(content_to_store)
+                                )
+                                
+                                if should_migrate_to_s3:
+                                    logger.info(f"🚀 [MAIL SYNC] Pre-migrating large content ({content_length} chars) to S3...")
+                                    
+                                    # Generar un ID temporal para el archivo S3
+                                    import uuid
+                                    temp_id = str(uuid.uuid4())
+                                    
+                                    # Almacenar en S3 con ID temporal
+                                    s3_url = s3_service.upload_html_content(
+                                        html_content=content_to_store,
+                                        filename=f"temp-comment-{temp_id}.html",
+                                        folder="comments"
+                                    )
+                                    
+                                    # Actualizar variables para la BD
+                                    s3_html_url = s3_url
+                                    content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
+                                    
+                                    logger.info(f"✅ [MAIL SYNC] Content pre-migrated to S3: {s3_url}")
+                        except Exception as e:
+                            logger.error(f"❌ [MAIL SYNC] Error pre-migrating content to S3: {str(e)}")
+                            # Continue with original content if S3 fails
+                            content_to_store = special_metadata + processed_reply_html
+                            s3_html_url = None
+
                         new_comment = Comment(
-                            ticket_id=existing_mapping_by_conv.ticket_id, 
-                            agent_id=system_agent.id, # Seguimos usando system_agent pero con formato especial
-                            workspace_id=workspace.id, 
-                            content=special_metadata + processed_reply_html,
+                            ticket_id=existing_mapping_by_conv.ticket_id,
+                            agent_id=system_agent.id,
+                            workspace_id=workspace.id,
+                            content=content_to_store,  # Usar contenido procesado
+                            s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
                             is_private=False
                         )
 
@@ -556,6 +630,31 @@ class MicrosoftGraphService:
                                         logger.error(f"Error al procesar/decodificar adjunto '{att.name}' para comentario en ticket {existing_mapping_by_conv.ticket_id}: {e}", exc_info=True)
                         
                         self.db.add(new_comment)
+                        
+                        # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
+                        if s3_html_url and not s3_html_url.endswith(f"comment-{new_comment.id}.html"):
+                            try:
+                                # Hacer flush para obtener el ID real del comentario
+                                self.db.flush()
+                                
+                                # Renombrar archivo en S3 con el ID real del comentario
+                                from app.services.s3_service import get_s3_service
+                                s3_service = get_s3_service()
+                                
+                                # ARREGLO: Usar el contenido original, no el placeholder
+                                original_content = special_metadata + processed_reply_html
+                                
+                                # Crear nueva URL con ID real
+                                final_s3_url = s3_service.store_comment_html(new_comment.id, original_content)
+                                
+                                # Actualizar la URL en el comentario
+                                new_comment.s3_html_url = final_s3_url
+                                new_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
+                                
+                                logger.info(f"✅ [MAIL SYNC] S3 file renamed for comment {new_comment.id}: {final_s3_url}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for comment {new_comment.id}: {str(e)}")
+                                # Continue with temp filename - not critical
                         
                         # NUEVO: Procesar workflows basados en el contenido del email
                         try:
@@ -678,7 +777,25 @@ class MicrosoftGraphService:
                                 logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
                                 self.db.rollback()
                         else: logger.warning(f"[MAIL SYNC] Failed to create task from email ID {email.id}.")
-                except Exception as e: logger.error(f"[MAIL SYNC] Error processing email ID {email_data.get('id', 'N/A')}: {str(e)}", exc_info=True); self.db.rollback(); continue
+                except Exception as e: 
+                    logger.error(f"[MAIL SYNC] Error processing email ID {email_data.get('id', 'N/A')}: {str(e)}", exc_info=True)
+                    
+                    # Manejo mejorado de errores de sesión
+                    try:
+                        self.db.rollback()
+                        logger.info(f"[MAIL SYNC] Successfully rolled back transaction after error")
+                    except Exception as rollback_error:
+                        logger.error(f"[MAIL SYNC] Error during rollback: {str(rollback_error)}")
+                        # Si el rollback falla, crear nueva sesión
+                        try:
+                            self.db.close()
+                            from app.database.session import SessionLocal
+                            self.db = SessionLocal()
+                            logger.info(f"[MAIL SYNC] Created new database session after failed rollback")
+                        except Exception as session_error:
+                            logger.error(f"[MAIL SYNC] Error creating new session: {str(session_error)}")
+                    
+                    continue
             sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
             log_important(f"[MAIL SYNC] Finished sync for config ID: {sync_config.id}. Created {created_tasks_count} tasks, Added {added_comments_count} comments.")
             return []
@@ -847,12 +964,54 @@ class MicrosoftGraphService:
             # <original-sender>User_Name|user_email@example.com</original-sender>
             special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
             
+            # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
+            content_to_store = special_metadata + processed_html
+            s3_html_url = None
+            
+            try:
+                if content_to_store and content_to_store.strip():
+                    from app.services.s3_service import get_s3_service
+                    s3_service = get_s3_service()
+                    
+                    # Verificar si el contenido es muy grande o debe ir a S3
+                    content_length = len(content_to_store)
+                    should_migrate_to_s3 = (
+                        content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                        s3_service.should_store_html_in_s3(content_to_store)
+                    )
+                    
+                    if should_migrate_to_s3:
+                        logger.info(f"🚀 [MAIL SYNC] Pre-migrating large initial content ({content_length} chars) to S3...")
+                        
+                        # Generar un ID temporal para el archivo S3
+                        import uuid
+                        temp_id = str(uuid.uuid4())
+                        
+                        # Almacenar en S3 con ID temporal
+                        s3_url = s3_service.upload_html_content(
+                            html_content=content_to_store,
+                            filename=f"temp-initial-comment-{temp_id}.html",
+                            folder="comments"
+                        )
+                        
+                        # Actualizar variables para la BD
+                        s3_html_url = s3_url
+                        content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
+                        
+                        logger.info(f"✅ [MAIL SYNC] Initial content pre-migrated to S3: {s3_url}")
+            except Exception as e:
+                logger.error(f"❌ [MAIL SYNC] Error pre-migrating initial content to S3: {str(e)}")
+                # Continue with original content if S3 fails
+                content_to_store = special_metadata + processed_html
+                s3_html_url = None
+            
             # El comentario principal con metadatos + contenido HTML + adjuntos
             initial_comment = Comment(
                 ticket_id=task.id,
                 agent_id=system_agent.id,  # Seguimos usando system_agent (requerido)
                 workspace_id=workspace.id,
-                content=special_metadata + processed_html,  # Metadatos + HTML
+                content=content_to_store,  # Usar contenido procesado
+                s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
                 is_private=False
             )
             
@@ -862,6 +1021,34 @@ class MicrosoftGraphService:
                 
             self.db.add(initial_comment)
                 
+            # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
+            if s3_html_url and not s3_html_url.endswith(f"comment-{initial_comment.id}.html"):
+                try:
+                    # Hacer flush para obtener el ID real del comentario
+                    self.db.flush()
+                    
+                    # Renombrar archivo en S3 con el ID real del comentario
+                    from app.services.s3_service import get_s3_service
+                    s3_service = get_s3_service()
+                    
+                    # Obtener el contenido original para almacenar con el nombre correcto
+                    if '[MIGRATED_TO_S3] Content moved to S3: ' in content_to_store:
+                        original_content = special_metadata + processed_html
+                    else:
+                        original_content = content_to_store
+                    
+                    # Crear nueva URL con ID real
+                    final_s3_url = s3_service.store_comment_html(initial_comment.id, original_content)
+                    
+                    # Actualizar la URL en el comentario
+                    initial_comment.s3_html_url = final_s3_url
+                    initial_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
+                    
+                    logger.info(f"✅ [MAIL SYNC] S3 file renamed for initial comment {initial_comment.id}: {final_s3_url}")
+                except Exception as e:
+                    logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for initial comment {initial_comment.id}: {str(e)}")
+                    # Continue with temp filename - not critical
+            
             # Crear un TicketBody vacío (requerido pero no lo usaremos para mostrar contenido)
             ticket_body = TicketBody(ticket_id=task.id, email_body="")
             self.db.add(ticket_body)
@@ -1259,19 +1446,32 @@ class MicrosoftGraphService:
         attachments_data = []
         if attachment_ids and len(attachment_ids) > 0:
             # Retrieve attachment data from provided IDs
-            logger.info(f"Processing {len(attachment_ids)} attachment IDs for email reply: {attachment_ids}")
             for attachment_id in attachment_ids:
                 attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
                 if attachment:
-                    # Convert binary content to base64 for MS Graph API
-                    content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                    # Get file content - either from content_bytes or download from S3
+                    file_content = None
+                    if attachment.content_bytes:
+                        # Use existing content_bytes (legacy)
+                        file_content = attachment.content_bytes
+                    elif attachment.s3_url:
+                        # Download from S3
+                        file_content = self._download_file_from_s3(attachment.s3_url)
+                        if not file_content:
+                            logger.error(f"Failed to download attachment {attachment.file_name} from S3")
+                            continue
+                    else:
+                        logger.error(f"Attachment {attachment.file_name} (ID: {attachment_id}) has no content_bytes or s3_url")
+                        continue
+                    
+                    # Convert file content to base64 for MS Graph API
+                    content_b64 = base64.b64encode(file_content).decode('utf-8')
                     attachments_data.append({
                         "@odata.type": "#microsoft.graph.fileAttachment",
                         "name": attachment.file_name,
                         "contentType": attachment.content_type,
                         "contentBytes": content_b64
                     })
-                    logger.info(f"Added attachment {attachment.file_name} (ID: {attachment_id}) to email reply")
                 else:
                     logger.warning(f"Attachment ID {attachment_id} not found when preparing email reply")
         
@@ -1290,10 +1490,24 @@ class MicrosoftGraphService:
                 ).all()
                 
                 if attachments:
-                    logger.info(f"Found {len(attachments)} attachments for comment ID {latest_comment.id} (fallback method)")
                     for attachment in attachments:
-                        # Convert binary content to base64 for MS Graph API
-                        content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                        # Get file content - either from content_bytes or download from S3
+                        file_content = None
+                        if attachment.content_bytes:
+                            # Use existing content_bytes (legacy)
+                            file_content = attachment.content_bytes
+                        elif attachment.s3_url:
+                            # Download from S3
+                            file_content = self._download_file_from_s3(attachment.s3_url)
+                            if not file_content:
+                                logger.error(f"Failed to download attachment {attachment.file_name} from S3 (fallback method)")
+                                continue
+                        else:
+                            logger.error(f"Attachment {attachment.file_name} has no content_bytes or s3_url (fallback method)")
+                            continue
+                        
+                        # Convert file content to base64 for MS Graph API
+                        content_b64 = base64.b64encode(file_content).decode('utf-8')
                         attachments_data.append({
                             "@odata.type": "#microsoft.graph.fileAttachment",
                             "name": attachment.file_name,
@@ -1316,7 +1530,6 @@ class MicrosoftGraphService:
                 # Step 1: Create a draft reply
                 create_reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/createReply"
                 headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
-                logger.debug(f"Creating draft reply via endpoint: {create_reply_endpoint}")
                 
                 # Just create the draft
                 response = requests.post(create_reply_endpoint, headers=headers)
@@ -1345,11 +1558,9 @@ class MicrosoftGraphService:
                         new_subject = f"Re: {ticket_id_tag} {original_subject[3:].strip()}"
                     else:
                         new_subject = f"{ticket_id_tag} {original_subject}"
-                    
-                    logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
                 else:
+                    # Subject already has the tag, use as is
                     new_subject = original_subject
-                    logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
                 
                 # Step 3: Update the draft with our content, subject, and attachments
                 update_payload = {
@@ -1375,8 +1586,6 @@ class MicrosoftGraphService:
                     attachment_response = requests.post(attachments_endpoint, headers=headers, json=attachment_data)
                     if attachment_response.status_code not in [200, 201, 202]:
                         logger.warning(f"Failed to add attachment to draft message for task_id: {task_id}. Status Code: {attachment_response.status_code}")
-                    else:
-                        logger.info(f"Successfully added attachment '{attachment_data['name']}' to draft message")
                 
                 # Step 5: Send the message
                 send_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/send"
@@ -1390,7 +1599,6 @@ class MicrosoftGraphService:
                 
                 logger.info(f"Successfully sent email reply with {len(attachments_data)} attachments for task_id: {task_id}")
                 return True
-                
             except requests.exceptions.RequestException as e:
                 error_details = "No details available"; status_code = 'N/A'
                 if e.response is not None:
@@ -1472,7 +1680,6 @@ class MicrosoftGraphService:
                     response = requests.post(send_endpoint, headers=headers)
                     response.raise_for_status()
                     
-                    logger.info(f"Successfully sent email reply with modified subject for task_id: {task_id}")
                     return True
             except requests.exceptions.RequestException as e:
                 error_details = "No details available"; status_code = 'N/A'
@@ -1512,7 +1719,25 @@ class MicrosoftGraphService:
             for attachment_id in attachment_ids:
                 attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
                 if attachment:
-                    content_b64 = base64.b64encode(attachment.content_bytes).decode('utf-8')
+                    # Get file content - either from content_bytes or download from S3
+                    file_content = None
+                    if attachment.content_bytes:
+                        # Use existing content_bytes (legacy)
+                        file_content = attachment.content_bytes
+                        logger.info(f"Using content_bytes for attachment {attachment.file_name} (ID: {attachment_id}) in new email")
+                    elif attachment.s3_url:
+                        # Download from S3
+                        logger.info(f"Downloading attachment {attachment.file_name} from S3: {attachment.s3_url} for new email")
+                        file_content = self._download_file_from_s3(attachment.s3_url)
+                        if not file_content:
+                            logger.error(f"Failed to download attachment {attachment.file_name} from S3 for new email")
+                            continue
+                    else:
+                        logger.error(f"Attachment {attachment.file_name} (ID: {attachment_id}) has no content_bytes or s3_url for new email")
+                        continue
+                    
+                    # Convert file content to base64 for MS Graph API
+                    content_b64 = base64.b64encode(file_content).decode('utf-8')
                     attachments_data.append({
                         "@odata.type": "#microsoft.graph.fileAttachment",
                         "name": attachment.file_name,
