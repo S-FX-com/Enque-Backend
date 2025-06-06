@@ -7,17 +7,36 @@ from app.api.dependencies import get_current_active_user, get_current_active_adm
 from app.database.session import get_db
 from app.models.agent import Agent
 from app.models.workspace import Workspace
-from app.schemas.workspace import Workspace as WorkspaceSchema, WorkspaceCreate, WorkspaceUpdate
+from app.schemas.workspace import (
+    Workspace as WorkspaceSchema, 
+    WorkspaceCreate, 
+    WorkspaceUpdate,
+    WorkspaceSetupCreate,
+    WorkspaceSetupResponse
+)
 from app.services.workspace_service import (
     get_workspaces, 
     get_workspace, 
     get_workspace_by_subdomain,
     create_workspace, 
     update_workspace,
-    delete_workspace
+    delete_workspace,
+    setup_workspace
 )
 
 router = APIRouter()
+
+
+@router.post("/setup", response_model=WorkspaceSetupResponse)
+async def setup_workspace_endpoint(
+    setup_data: WorkspaceSetupCreate,
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Setup initial workspace with first admin user.
+    This is a public endpoint that doesn't require authentication.
+    """
+    return setup_workspace(db, setup_data)
 
 
 @router.get("/", response_model=List[WorkspaceSchema])
@@ -67,30 +86,12 @@ async def read_current_workspace(
 
 
 @router.get("/by-subdomain/{subdomain}", response_model=WorkspaceSchema)
-async def read_workspace_by_subdomain_path(
-    subdomain: str,
-    db: Session = Depends(get_db),
-) -> Any:
-    """
-    Get workspace by subdomain (public endpoint, no authentication required)
-    This endpoint is compatible with the frontend path convention
-    """
-    workspace = get_workspace_by_subdomain(db, subdomain)
-    if not workspace:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workspace with subdomain '{subdomain}' not found",
-        )
-    return workspace
-
-
-@router.get("/subdomain/{subdomain}", response_model=WorkspaceSchema)
 async def read_workspace_by_subdomain(
     subdomain: str,
     db: Session = Depends(get_db),
 ) -> Any:
     """
-    Get workspace by subdomain (public endpoint, no authentication required)
+    Retrieve workspace by subdomain (public endpoint)
     """
     workspace = get_workspace_by_subdomain(db, subdomain)
     if not workspace:
@@ -102,13 +103,13 @@ async def read_workspace_by_subdomain(
 
 
 @router.get("/{workspace_id}", response_model=WorkspaceSchema)
-async def read_workspace_endpoint(
+async def read_workspace(
     workspace_id: int,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
 ) -> Any:
     """
-    Get workspace by ID (admin only)
+    Retrieve workspace by ID (admin only)
     """
     workspace = get_workspace(db, workspace_id)
     if not workspace:
@@ -152,18 +153,19 @@ async def update_workspace_endpoint(
     return updated_workspace
 
 
-@router.delete("/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{workspace_id}")
 async def delete_workspace_endpoint(
     workspace_id: int,
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
-):
+) -> Any:
     """
     Delete a workspace (admin only)
     """
-    success = delete_workspace(db, workspace_id)
-    if not success:
+    deleted = delete_workspace(db, workspace_id)
+    if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
-        ) 
+        )
+    return {"message": "Workspace deleted successfully"} 

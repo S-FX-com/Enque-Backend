@@ -9,7 +9,9 @@ class Team(Base):
     name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
     logo_url = Column(String(255), nullable=True)
+    icon_name = Column(String(50), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    manager_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     
@@ -17,7 +19,12 @@ class Team(Base):
     workspace = relationship("Workspace", back_populates="teams")
     # Add cascade="all, delete-orphan" to automatically delete members when a team is deleted
     members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
-    tasks = relationship("Task", back_populates="team")
+    # Add cascade to delete tasks associated with the team
+    tasks = relationship("Task", back_populates="team", cascade="all, delete-orphan")
+    manager = relationship("Agent", foreign_keys=[manager_id])
+    # Import the table from microsoft.py to avoid circular imports
+    from app.models.microsoft import mailbox_team_assignments
+    mailbox_connections = relationship("MailboxConnection", secondary=mailbox_team_assignments, back_populates="teams")
 
 
 class TeamMember(Base):

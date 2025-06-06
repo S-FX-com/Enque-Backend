@@ -6,6 +6,7 @@ class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: Optional[int] = None # Add expires_in to match the actual response
+    workspace_subdomain: Optional[str] = None # Add workspace subdomain for redirection
 
 
 class TokenPayload(BaseModel):

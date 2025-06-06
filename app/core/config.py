@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "temporarysecret"  # Valor predeterminado temporal
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    AGENT_INVITATION_TOKEN_EXPIRE_HOURS: int = 72 # Agent invitation token validity in hours
+    PASSWORD_RESET_TOKEN_EXPIRE_HOURS: int = 2 # Password reset token validity in hours
+
 
     # Database Configuration
     MYSQL_HOST: Optional[str] = None
@@ -63,9 +66,9 @@ class Settings(BaseSettings):
     MICROSOFT_REDIRECT_URI: str = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
     MICROSOFT_SCOPE: str = "offline_access Mail.Read Mail.ReadWrite"
     
-    # Microsoft Graph API URLs
-    MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
-    MICROSOFT_TOKEN_URL: str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    # Microsoft Graph API URLs - Using /common for multitenant support
+    MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    MICROSOFT_TOKEN_URL: str = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     MICROSOFT_GRAPH_URL: str = "https://graph.microsoft.com/v1.0"
     
     # Email Integration
@@ -76,9 +79,33 @@ class Settings(BaseSettings):
     
     # Base URL for API
     API_BASE_URL: str = "https://enque-backend-production.up.railway.app"
-    
+
+    # System Email Sender
+    SYSTEM_SENDER_EMAIL: str = "noreply@enque.cc" # Default system sender email, ensure this mailbox exists or app has send-as permission
+
     # Token Management
     CLEANUP_OLD_TOKENS: bool = True  # Limpiar tokens antiguos excepto los 5 más recientes
+
+    # ⚡ Performance & Caching Configuration
+    REDIS_URL: Optional[str] = None  # Redis connection URL for caching
+    CACHE_EXPIRE_MICROSOFT_GRAPH: int = 300  # Microsoft Graph cache expiration (5 minutes)
+    CACHE_EXPIRE_USER_INFO: int = 3600  # User info cache (1 hour)
+    CACHE_EXPIRE_MAILBOX_LIST: int = 600  # Mailbox list cache (10 minutes)
+    CACHE_EXPIRE_FOLDERS: int = 1800  # Folder list cache (30 minutes)
+    
+    # Database Connection Pool
+    DB_POOL_SIZE: int = 10  # Connection pool size
+    DB_MAX_OVERFLOW: int = 20  # Max overflow connections
+    DB_POOL_TIMEOUT: int = 30  # Pool timeout in seconds
+    DB_POOL_RECYCLE: int = 3600  # Recycle connections after 1 hour
+    
+    # Rate Limiting for Microsoft Graph
+    MS_GRAPH_RATE_LIMIT: int = 10  # Requests per second to Microsoft Graph
+    MS_GRAPH_BURST_LIMIT: int = 50  # Burst limit
+    
+    # Background Job Configuration
+    EMAIL_SYNC_BATCH_SIZE: int = 25  # Process emails in batches
+    EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 3  # Max concurrent mailbox syncs
 
     class Config:
         # Leer variables de entorno directamente, sin depender de archivos .env

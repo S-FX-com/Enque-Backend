@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from alembic import context
 
 # Import all models to ensure they're registered with SQLAlchemy metadata
-from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity
+from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity, CannedReply
 from app.database.session import engine
 from app.core.config import settings
 
@@ -35,6 +35,7 @@ from app.models.company import Base as CompanyBase
 from app.models.user import Base as UserBase
 from app.models.comment import Base as CommentBase
 from app.models.activity import Base as ActivityBase
+from app.models.canned_reply import Base as CannedReplyBase
 
 # target_metadata = None
 target_metadata = [
@@ -44,7 +45,8 @@ target_metadata = [
     CompanyBase.metadata,
     UserBase.metadata,
     CommentBase.metadata,
-    ActivityBase.metadata
+    ActivityBase.metadata,
+    CannedReplyBase.metadata 
 ]
 
 
