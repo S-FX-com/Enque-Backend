@@ -1,5 +1,6 @@
 from typing import Any, List, Optional
 import asyncio  # Importar asyncio
+from concurrent.futures import ThreadPoolExecutor  # Importar ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session, joinedload
@@ -24,6 +25,7 @@ from app.services.microsoft_service import MicrosoftGraphService # Import the se
 from app.services.automation_service import execute_automations_for_ticket # Import automation service
 from datetime import datetime # Import datetime
 from app.core.config import settings # Import settings
+from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_deleted, emit_comment_update # Import Socket.IO functions
 
 router = APIRouter()
 
@@ -164,28 +166,28 @@ async def create_task(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Create a new task
+    Create a new task. All roles can create tasks.
     """
-    # Set the current user as the sent_from user if not specified
-    # Note: The schema might enforce user_id, adjust if needed
-    # task_in.user_id = task_in.user_id or current_user.id # Assuming user_id refers to creator
-
-    # Assuming workspace_id comes from the input or should be set from current_user
-    if not hasattr(task_in, 'workspace_id') or not task_in.workspace_id:
-         task_in.workspace_id = current_user.workspace_id
-
-    # Pass category_id if present in task_in
-    task_data = task_in.dict()
-    task = Task(**task_data)
-    db.add(task)
-    db.commit()
-    db.refresh(task)
+    # Create the task
+    task = Task(
+        title=task_in.title,
+        description=task_in.description,
+        status=task_in.status,
+        priority=task_in.priority,
+        assignee_id=task_in.assignee_id,
+        team_id=task_in.team_id,
+        due_date=task_in.due_date,
+        sent_from_id=current_user.id, # Automatically set the current user as the sender
+        sent_to_id=task_in.sent_to_id,
+        user_id=task_in.user_id,
+        company_id=task_in.company_id,
+        workspace_id=current_user.workspace_id, # Use the workspace from current user
+        category_id=task_in.category_id # Use the category from input
+    )
     
-    task.last_update = task.created_at 
     db.add(task)
     db.commit()
     db.refresh(task)
-    logger.info(f"Task {task.id} created. Initial last_update set to {task.last_update}.")
 
     # --- Execute Automations ---
     try:
@@ -246,106 +248,68 @@ async def create_task(
             logger.error(f"Failed to send assignment notification for task {task.id}: {str(e)}")
     # --- End Assignment Notification ---
 
-    # --- Send Email for Manually Created Ticket ---
-    if task.description and task.user: # Check if description exists and user is loaded
-        try:
-            # Get recipient email
-            recipient_email = task.user.email
-            if not recipient_email:
-                 logger.warning(f"Cannot send email for ticket {task.id}: User {task.user_id} has no email address.") # Corrected indentation
-            else:
-                 # Find an active mailbox connection for the workspace to use as sender
-                 mailbox = db.query(MailboxConnection).filter(
-                     MailboxConnection.workspace_id == task.workspace_id,
-                     MailboxConnection.is_active == True
-                 ).first()
-
-                 if not mailbox:
-                     logger.warning(f"Cannot send email for ticket {task.id}: No active MailboxConnection found for workspace {task.workspace_id}.")
-                 else:
-                     sender_mailbox = mailbox.email
-                     # Prepare email content - Use only the task title as the subject
-                     subject = task.title
-                     # Use the description as the HTML body (assuming it's HTML from Tiptap)
-                     html_body = task.description
-
-                     # Get Microsoft Service instance
-                     microsoft_service = MicrosoftGraphService(db=db)
-
-                     # Send the email
-                     logger.info(f"Attempting to send new ticket email for task {task.id} from {sender_mailbox} to {recipient_email}")
-                     email_sent = microsoft_service.send_new_email(
-                         mailbox_email=sender_mailbox,
-                         recipient_email=recipient_email,
-                         subject=subject,
-                         html_body=html_body,
-                         task_id=task.id  # Pass the task ID to include in the subject
-                     )
-                     if not email_sent:
-                         logger.error(f"Failed to send new ticket email for task {task.id}")
-                     else:
-                         logger.info(f"Successfully sent new ticket email for task {task.id}")
-
-        except Exception as email_error:
-            logger.error(f"Error trying to send email for newly created ticket {task.id}: {str(email_error)}", exc_info=True)
-            # Do not raise an exception here, ticket creation succeeded, email is secondary
-    # --- End Send Email ---
-
-    # --- Send Notifications Based on Settings ---
+    # --- Socket.IO Event ---
     try:
-        # Import notification service
-        from app.services.notification_service import send_notification
+        # Emit new ticket event to all workspace clients
+        task_data = {
+            'id': task.id,
+            'title': task.title,
+            'status': task.status,
+            'priority': task.priority,
+            'workspace_id': task.workspace_id,
+            'assignee_id': task.assignee_id,
+            'team_id': task.team_id,
+            'user_id': task.user_id,
+            'created_at': task.created_at.isoformat() if task.created_at else None
+        }
+        await emit_new_ticket(task.workspace_id, task_data)
+    except Exception as e:
+        logger.error(f"Failed to emit new_ticket event for task {task.id}: {str(e)}")
+    # --- End Socket.IO Event ---
 
-        # 1. Notify user about ticket creation if enabled
-        if task.user and task.user.email:
-            template_vars = {
-                "user_name": task.user.name,
-                "ticket_id": task.id,
-                "ticket_title": task.title
-            }
+    # --- Email Sending Logic ---
+    try:
+        # Get the user associated with the task
+        user = db.query(User).filter(User.id == task.user_id).first()
+        if user and user.email:
+            recipient_email = user.email
+            logger.info(f"Recipient email found: {recipient_email}")
             
-            # Try to send notification
-            await send_notification(
-                db=db,
-                workspace_id=task.workspace_id,
-                category="users",
-                notification_type="new_ticket_created",
-                recipient_email=task.user.email,
-                recipient_name=task.user.name,
-                template_vars=template_vars,
-                task_id=task.id
-            )
+            # Get the mailbox connections associated with the current workspace
+            mailbox = db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == current_user.workspace_id
+            ).first()
             
-        # 2. Notify agents about new ticket if enabled (to all agents)
-        agents = db.query(Agent).filter(
-            Agent.workspace_id == task.workspace_id,
-            Agent.is_active == True
-        ).all()
-        
-        for agent in agents:
-            if agent.email:
-                template_vars = {
-                    "agent_name": agent.name,
-                    "ticket_id": task.id,
-                    "ticket_title": task.title,
-                    "user_name": task.user.name if task.user else "Unknown User"
-                }
-                
-                # Try to send notification
-                await send_notification(
-                    db=db,
-                    workspace_id=task.workspace_id,
-                    category="agents",
-                    notification_type="new_ticket_created",
-                    recipient_email=agent.email,
-                    recipient_name=agent.name,
-                    template_vars=template_vars,
-                    task_id=task.id
+            if not mailbox:
+                logger.warning(f"No mailbox connection found for workspace {current_user.workspace_id}. Cannot send email.")
+            else:
+                sender_mailbox = mailbox.email
+                # Prepare email content - Use only the task title as the subject
+                subject = task.title
+                # Use the description as the HTML body (assuming it's HTML from Tiptap)
+                html_body = task.description
+
+                # Get Microsoft Service instance
+                microsoft_service = MicrosoftGraphService(db=db)
+
+                # Send the email
+                logger.info(f"Attempting to send new ticket email for task {task.id} from {sender_mailbox} to {recipient_email}")
+                email_sent = microsoft_service.send_new_email(
+                    mailbox_email=sender_mailbox,
+                    recipient_email=recipient_email,
+                    subject=subject,
+                    html_body=html_body,
+                    task_id=task.id  # Pass the task ID to include in the subject
                 )
-    
-    except Exception as notification_error:
-        logger.error(f"Error sending notifications for ticket {task.id}: {str(notification_error)}", exc_info=True)
-    # --- End Send Notifications ---
+                if not email_sent:
+                    logger.error(f"Failed to send new ticket email for task {task.id}")
+                else:
+                    logger.info(f"Successfully sent new ticket email for task {task.id}")
+
+    except Exception as email_error:
+        logger.error(f"Error trying to send email for newly created ticket {task.id}: {str(email_error)}", exc_info=True)
+        # Do not raise an exception here, ticket creation succeeded, email is secondary
+    # --- End Email Logic ---
 
     return task
 
@@ -444,42 +408,64 @@ async def update_task_endpoint(
             detail="Task not found after update",
         )
 
+    # --- Socket.IO Event ---
+    try:
+        # Emit ticket update event to all workspace clients
+        task_data = {
+            'id': updated_task_obj.id,
+            'title': updated_task_obj.title,
+            'status': updated_task_obj.status,
+            'priority': updated_task_obj.priority,
+            'workspace_id': updated_task_obj.workspace_id,
+            'assignee_id': updated_task_obj.assignee_id,
+            'team_id': updated_task_obj.team_id,
+            'user_id': updated_task_obj.user_id,
+            'updated_at': updated_task_obj.updated_at.isoformat() if updated_task_obj.updated_at else None
+        }
+        await emit_ticket_update(updated_task_obj.workspace_id, task_data)
+    except Exception as e:
+        logger.error(f"Failed to emit ticket_updated event for task {task_id}: {str(e)}")
+    # --- End Socket.IO Event ---
+
     # Return the updated ORM object with all relationships
     return updated_task_obj
 
 
-@router.delete("/{task_id}", response_model=TaskSchema)
+@router.delete("/{task_id}")
 async def delete_task(
     task_id: int,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user), # Consider if only admin/manager should delete
+    current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Delete a task (hard delete - physical removal)
+    Delete a task. All roles can delete tasks.
     """
-    # Add permission check if needed (e.g., only admin/manager)
-    # if current_user.role not in ["admin", "manager"]:
-    #     raise HTTPException(status_code=403, detail="Permission denied")
-
     task = db.query(Task).filter(
         Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id, # Check workspace
-        Task.is_deleted == False
-        ).first()
+        Task.workspace_id == current_user.workspace_id
+    ).first()
+    
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
 
-    # Store task data for response before deletion
-    task_data = TaskSchema.from_orm(task)
-
-    # Hard delete (physical removal from database)
-    db.delete(task)
+    workspace_id = task.workspace_id  # Store workspace_id before deletion
+    
+    # Mark as deleted instead of actual deletion
+    task.is_deleted = True
     db.commit()
 
-    return task_data
+    # --- Socket.IO Event ---
+    try:
+        # Emit ticket deleted event to all workspace clients
+        await emit_ticket_deleted(workspace_id, task_id)
+    except Exception as e:
+        logger.error(f"Failed to emit ticket_deleted event for task {task_id}: {str(e)}")
+    # --- End Socket.IO Event ---
+
+    return {"message": "Task deleted successfully"}
 
 
 @router.get("/user/{user_id}", response_model=List[TaskSchema])
@@ -572,3 +558,361 @@ async def read_team_tasks(
     ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
     return tasks
+
+
+@router.get("/{task_id}/initial-content")
+def get_task_initial_content(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user)
+):
+    """
+    Get initial ticket content from S3 when it's migrated there.
+    Falls back to description or email_body if not in S3.
+    """
+    try:
+        # Verify the task exists and user has access
+        task = db.query(Task).filter(
+            Task.id == task_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Ticket not found"
+            )
+
+        # First, check if we have description (for manual tickets)
+        if task.description and not task.description.startswith('[MIGRATED_TO_S3]'):
+            return {
+                "status": "content_in_database",
+                "content": task.description,
+                "message": "Content loaded from ticket description"
+            }
+
+        # Check email_body in TicketBody
+        if task.body and task.body.email_body:
+            if not task.body.email_body.startswith('[MIGRATED_TO_S3]'):
+                return {
+                    "status": "content_in_database", 
+                    "content": task.body.email_body,
+                    "message": "Content loaded from ticket body"
+                }
+
+        # If we reach here, content is likely in S3 via the initial comment
+        # Find the initial comment (the oldest comment for this ticket)
+        from app.models.comment import Comment as CommentModel
+        initial_comment = db.query(CommentModel).filter(
+            CommentModel.ticket_id == task_id
+        ).order_by(CommentModel.created_at.asc()).first()
+
+        if not initial_comment:
+            # No comments found, return empty or fallback content
+            fallback_content = task.description or task.body.email_body if task.body else ""
+            if fallback_content and fallback_content.startswith('[MIGRATED_TO_S3]'):
+                # Clean the migrated message
+                clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
+                # Remove the URL part
+                import re
+                clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
+                fallback_content = clean_content or "Content not available"
+            
+            return {
+                "status": "no_initial_comment",
+                "content": fallback_content or "No initial content found",
+                "message": "No initial comment found for this ticket"
+            }
+
+        # Check if initial comment has S3 content
+        if not initial_comment.s3_html_url:
+            return {
+                "status": "content_in_database",
+                "content": initial_comment.content or "",
+                "message": "Initial content loaded from comment in database"
+            }
+
+        # Get content from S3
+        from app.services.s3_service import get_s3_service
+        s3_service = get_s3_service()
+        s3_content = s3_service.get_comment_html(initial_comment.s3_html_url)
+
+        if not s3_content:
+            # Fallback to comment content in database
+            logger.warning(f"Failed to retrieve initial content from S3 for ticket {task_id}, falling back to database")
+            fallback_content = initial_comment.content or ""
+            if fallback_content.startswith('[MIGRATED_TO_S3]'):
+                # Clean the migrated message
+                clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
+                import re
+                clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
+                fallback_content = clean_content or "Content temporarily unavailable"
+            
+            return {
+                "status": "s3_error_fallback",
+                "content": fallback_content,
+                "message": "Failed to retrieve from S3, showing database content"
+            }
+
+        # Process S3 content for images and attachments
+        try:
+            # Process images if needed (similar to comment S3 processing)
+            from app.services.microsoft_service import MicrosoftGraphService
+            from app.utils.image_processor import extract_base64_images
+            
+            ms_service = MicrosoftGraphService(db)
+            processed_content = s3_content
+            
+            # Process base64 images that might be in the content
+            final_content, extracted_images = extract_base64_images(processed_content, task.id)
+            
+            if extracted_images:
+                logger.info(f"Extracted {len(extracted_images)} base64 images from initial S3 content for ticket {task_id}")
+                processed_content = final_content
+                
+        except Exception as img_process_error:
+            logger.warning(f"Error processing images in initial S3 content for ticket {task_id}: {str(img_process_error)}")
+            processed_content = s3_content
+
+        return {
+            "status": "loaded_from_s3",
+            "content": processed_content,
+            "s3_url": initial_comment.s3_html_url,
+            "message": "Initial content loaded from S3"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting initial content for ticket {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get initial ticket content: {str(e)}")
+
+
+@router.get("/{task_id}/html-content")
+def get_ticket_html_content(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user)
+):
+    """
+    Get complete ticket HTML content directly from S3 URLs stored in comments.
+    This is MUCH simpler - just reads the s3_html_url field and fetches from S3.
+    """
+    try:
+        # Verify the task exists and user has access
+        task = db.query(Task).filter(
+            Task.id == task_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Ticket not found"
+            )
+
+        from app.models.comment import Comment as CommentModel
+        from app.services.s3_service import get_s3_service
+        
+        s3_service = get_s3_service()
+        
+        # Get all comments with their S3 URLs, ordered by creation date
+        comments = db.query(CommentModel).options(
+            joinedload(CommentModel.agent),
+            joinedload(CommentModel.attachments)
+        ).filter(
+            CommentModel.ticket_id == task_id
+        ).order_by(CommentModel.created_at.asc()).all()
+
+        # Prepare results
+        html_contents = []
+        
+        # 1. Handle initial ticket content (first comment or ticket description)
+        initial_content = None
+        initial_sender = None
+        
+        # Check if we have comments first - initial content is usually the first comment
+        if comments and comments[0].s3_html_url:
+            # First comment has S3 content - this is the initial message
+            try:
+                s3_content = s3_service.get_comment_html(comments[0].s3_html_url)
+                if s3_content:
+                    initial_content = s3_content
+                    
+                    # ✅ EXTRAER INFORMACIÓN DEL ORIGINAL-SENDER (como hacía el frontend)
+                    import re
+                    original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', s3_content)
+                    
+                    if original_sender_match:
+                        # Es un mensaje de usuario con información extraída
+                        initial_sender = {
+                            "type": "user", 
+                            "name": original_sender_match.group(1).strip(),
+                            "email": original_sender_match.group(2).strip(),
+                            "created_at": comments[0].created_at
+                        }
+                    elif comments[0].agent:
+                        # Es un mensaje de agente real
+                        initial_sender = {
+                            "type": "agent", 
+                            "name": comments[0].agent.name,
+                            "email": comments[0].agent.email,
+                            "created_at": comments[0].created_at
+                        }
+            except Exception as e:
+                logger.warning(f"Failed to get initial S3 content: {e}")
+        
+        # Fallback to ticket description if no S3 content in first comment
+        if not initial_content:
+            if task.description:
+                initial_content = task.description
+            elif task.body and task.body.email_body:
+                initial_content = task.body.email_body
+            
+            if initial_content:
+                initial_sender = {
+                    "type": "user",
+                    "name": task.user.name if task.user else "Unknown User",
+                    "email": task.user.email if task.user else "unknown",
+                    "created_at": task.created_at
+                }
+
+        # Add initial content if we have it
+        if initial_content:
+            html_contents.append({
+                "id": "initial",
+                "content": initial_content,
+                "sender": initial_sender,
+                "is_private": False,
+                "attachments": [],
+                "created_at": comments[0].created_at if comments else task.created_at
+            })
+
+        # 2. Process ALL comments - much simpler approach
+        
+        # First, collect all S3 URLs that need to be fetched
+        s3_urls_needed = []
+        comment_mapping = {}
+        
+        for comment in comments:
+            if comment.s3_html_url:
+                s3_urls_needed.append(comment.s3_html_url)
+                comment_mapping[comment.s3_html_url] = comment
+        
+        # Fetch all S3 content in parallel if we have any S3 URLs
+        s3_content_cache = {}
+        if s3_urls_needed:
+            logger.info(f"Fetching {len(s3_urls_needed)} S3 contents in parallel for ticket {task_id}")
+            
+            # Simple concurrent fetching using ThreadPoolExecutor
+            from concurrent.futures import as_completed
+            
+            def fetch_s3_content(s3_url):
+                try:
+                    content = s3_service.get_comment_html(s3_url)
+                    return s3_url, content
+                except Exception as e:
+                    logger.warning(f"Failed to fetch S3 content from {s3_url}: {e}")
+                    return s3_url, None
+            
+            # Use ThreadPoolExecutor for parallel S3 fetching
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_url = {executor.submit(fetch_s3_content, url): url for url in s3_urls_needed}
+                
+                for future in as_completed(future_to_url):
+                    s3_url, content = future.result()
+                    s3_content_cache[s3_url] = content
+        
+        # Now process all comments with cached S3 content
+        for comment in comments:
+            content = None
+            
+            # Skip the first comment if it was already used as initial content
+            if (initial_content and comments and comment.id == comments[0].id and 
+                comments[0].s3_html_url and initial_content != "Content not available"):
+                continue
+            
+            # Get content from S3 cache if available
+            if comment.s3_html_url and comment.s3_html_url in s3_content_cache:
+                content = s3_content_cache[comment.s3_html_url]
+                
+                # Process base64 images if the content has them
+                if content and 'data:image/' in content:
+                    try:
+                        from app.utils.image_processor import extract_base64_images
+                        processed_content, extracted_images = extract_base64_images(content, task.id)
+                        content = processed_content
+                        if extracted_images:
+                            logger.info(f"Processed {len(extracted_images)} base64 images in comment {comment.id}")
+                    except Exception as e:
+                        logger.warning(f"Error processing images in comment {comment.id}: {e}")
+            
+            # If no S3 content, use database content
+            if not content:
+                content = comment.content or "Content not available"
+
+            # ✅ DETERMINAR SENDER INFO - extraer de original-sender si existe
+            import re
+            original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
+            
+            if original_sender_match:
+                # Es un mensaje de usuario con información extraída del HTML
+                sender = {
+                    "type": "user",
+                    "name": original_sender_match.group(1).strip(),
+                    "email": original_sender_match.group(2).strip(),
+                    "created_at": comment.created_at
+                }
+            elif comment.agent:
+                # Es un mensaje de agente real
+                sender = {
+                    "type": "agent",
+                    "name": comment.agent.name,
+                    "email": comment.agent.email,
+                    "created_at": comment.created_at
+                }
+            else:
+                # Fallback
+                sender = {
+                    "type": "unknown",
+                    "name": "Unknown",
+                    "email": "unknown",
+                    "created_at": comment.created_at
+                }
+
+            # Process attachments
+            attachments = []
+            if comment.attachments:
+                for att in comment.attachments:
+                    attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": f"/api/v1/attachments/{att.id}"
+                    })
+
+            html_contents.append({
+                "id": comment.id,
+                "content": content,
+                "sender": sender,
+                "is_private": comment.is_private,
+                "attachments": attachments,
+                "created_at": comment.created_at
+            })
+
+        logger.info(f"Successfully retrieved HTML content for ticket {task_id}: {len(html_contents)} items")
+        
+        return {
+            "status": "success",
+            "ticket_id": task_id,
+            "ticket_title": task.title,
+            "total_items": len(html_contents),
+            "contents": html_contents,
+            "message": f"Ticket HTML content retrieved with {len(html_contents)} items"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting HTML content for ticket {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get ticket HTML content: {str(e)}")

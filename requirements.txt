@@ -22,3 +22,6 @@ schedule>=1.2.0
 beautifulsoup4>=4.9.0 # Added for HTML parsing
 httpx>=0.20.0 # Added for async HTTP requests
 boto3>=1.26.0 # Added for AWS S3 integration
+websockets>=10.4 # Required for WebSocket support in uvicorn
+python-socketio==5.8.0 # Version estable compatible con FastAPI + uvicorn
+python-engineio==4.7.1 # Version compatible con socketio 5.8.0

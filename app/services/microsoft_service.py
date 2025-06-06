@@ -16,6 +16,7 @@ from app.models.workspace import Workspace
 from app.models.ticket_attachment import TicketAttachment
 from app.services.utils import get_or_create_user
 from app.utils.logger import logger, log_important
+from app.core.socketio import emit_comment_update_sync # Import Socket.IO sync function
 import base64
 import json # Ensure json is imported
 from bs4 import BeautifulSoup
@@ -716,6 +717,31 @@ class MicrosoftGraphService:
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
                         self.db.commit(); added_comments_count += 1
                         logger.info(f"[MAIL SYNC] Added comment to Ticket ID {existing_mapping_by_conv.ticket_id} from reply email ID {email.id}.")
+                        
+                        # ✅ EMIT SOCKET.IO EVENT para actualización en tiempo real
+                        try:
+                            # Hacer flush para obtener el ID del comentario
+                            self.db.flush()
+                            
+                            comment_data = {
+                                'id': new_comment.id,
+                                'ticket_id': existing_mapping_by_conv.ticket_id,
+                                'agent_id': None,  # Es un usuario, no un agente
+                                'user_name': reply_user.name,
+                                'content': email.body_content[:100] + '...' if len(email.body_content) > 100 else email.body_content,
+                                'is_private': False,
+                                'created_at': new_comment.created_at.isoformat() if new_comment.created_at else None
+                            }
+                            
+                            # Emitir evento de forma síncrona (compatible con email sync)
+                            emit_comment_update_sync(
+                                workspace_id=workspace.id,
+                                comment_data=comment_data
+                            )
+                            
+                            logger.info(f"📤 [MAIL SYNC] Socket.IO comment_updated event queued for workspace {workspace.id}")
+                        except Exception as e:
+                            logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for comment {new_comment.id}: {str(e)}")
                         if processed_folder_id: self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                         continue
                     else:
@@ -1055,6 +1081,31 @@ class MicrosoftGraphService:
             
             # Commit para asegurar que el ticket esté guardado antes de enviar notificaciones
             self.db.commit()
+            
+            # ✅ EMIT SOCKET.IO EVENT para notificar nuevo ticket en tiempo real
+            try:
+                from app.core.socketio import emit_new_ticket_sync
+                
+                task_data = {
+                    'id': task.id,
+                    'title': task.title,
+                    'status': task.status,
+                    'priority': task.priority,
+                    'workspace_id': task.workspace_id,
+                    'assignee_id': task.assignee_id,
+                    'team_id': task.team_id,
+                    'user_id': task.user_id,
+                    'created_at': task.created_at.isoformat() if task.created_at else None,
+                    'user_name': user.name if user else 'Unknown',
+                    'user_email': user.email if user else ''
+                }
+                
+                # Emitir evento de forma síncrona para email sync
+                emit_new_ticket_sync(workspace.id, task_data)
+                
+                logger.info(f"📤 [MAIL SYNC] Socket.IO new_ticket event queued for workspace {workspace.id}")
+            except Exception as e:
+                logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for new ticket {task.id}: {str(e)}")
             
             # NUEVO: Procesar workflows basados en el contenido del email inicial
             try:

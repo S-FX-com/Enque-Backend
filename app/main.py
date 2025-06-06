@@ -1,11 +1,12 @@
 # backend/app/main.py
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import os
 import re
+import socketio
 
 from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity, CannedReply
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig
@@ -16,6 +17,7 @@ from app.models.workflow import Workflow
 from app.core.config import settings
 from app.api.api import api_router
 from app.database.session import get_db, engine
+from app.core.socketio import sio
 
 try:
     from app.services.email_sync_task import start_scheduler
@@ -71,11 +73,26 @@ async def cors_middleware(request, call_next):
 
     return response
 
+# Crear app Socket.IO con configuración correcta
+socket_app = socketio.ASGIApp(sio, app)
+
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
-@app.get("/", tags=["system"])
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    return {"message": f"Welcome to {settings.PROJECT_NAME}. Visit /docs for API documentation."}
+    return """
+    <html>
+        <head>
+            <title>Enque API</title>
+        </head>
+        <body>
+            <h1>🎯 Enque API Server</h1>
+            <p>✅ API is running successfully!</p>
+            <p>📡 Real-time updates enabled with Socket.IO</p>
+            <p>🔗 <a href="/docs">View API Documentation</a></p>
+        </body>
+    </html>
+    """
 
 @app.get("/v1/health", tags=["system"])
 async def health_check_v1():
@@ -84,6 +101,14 @@ async def health_check_v1():
 @app.get("/api/health", tags=["system"])
 async def health_check_legacy():
     return {"status": "ok", "database": "available" if engine else "not configured"}
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "Enque API",
+        "socketio": "enabled"
+    }
 
 def init_microsoft_integration():
     """
@@ -133,7 +158,18 @@ def startup_events():
     except Exception as e:
         logger.error(f"Error during startup events: {e}")
 
+# Configurar logging
+logger.info("🚀 Enque API server starting...")
+logger.info("🚀 Socket.IO enabled with perfect configuration!")
+logger.info(f"�� API docs available at /docs")
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+    uvicorn.run(
+        "app.main:socket_app",  # Usar socket_app en lugar de app
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+        access_log=False
+    )

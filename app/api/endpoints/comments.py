@@ -21,6 +21,7 @@ from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails #
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
 from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
+from app.core.socketio import emit_comment_update_sync # Import Socket.IO sync function
 from app.core.config import settings
 from app.services.workflow_service import WorkflowService
 from app.services.s3_service import get_s3_service
@@ -512,6 +513,28 @@ async def create_comment(
         task=task_with_details,
         assignee_changed=assignee_changed
     )
+    
+    # ✅ EMIT SOCKET.IO EVENT para actualización en tiempo real
+    try:
+        comment_data = {
+            'id': comment.id,
+            'ticket_id': task_id,
+            'agent_id': current_user.id,
+            'agent_name': current_user.name,
+            'content': comment_in.content[:100] + '...' if len(comment_in.content) > 100 else comment_in.content,
+            'is_private': comment_in.is_private,
+            'created_at': comment.created_at.isoformat() if comment.created_at else None
+        }
+        
+        # Emitir evento de forma síncrona
+        emit_comment_update_sync(
+            workspace_id=current_user.workspace_id,
+            comment_data=comment_data
+        )
+        
+        logger.info(f"📤 Socket.IO comment_updated event queued for workspace {current_user.workspace_id}")
+    except Exception as e:
+        logger.error(f"❌ Error emitting Socket.IO event for comment {comment.id}: {str(e)}")
     
     # Add workflow results to response if any were executed
     if workflow_results:
