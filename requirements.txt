@@ -25,3 +25,12 @@ boto3>=1.26.0 # Added for AWS S3 integration
 websockets>=10.4 # Required for WebSocket support in uvicorn
 python-socketio==5.8.0 # Version estable compatible con FastAPI + uvicorn
 python-engineio==4.7.1 # Version compatible con socketio 5.8.0
+# ⚡ Performance & Caching optimizations
+redis>=4.5.0 # Redis for caching Microsoft Graph responses
+hiredis>=2.2.0 # C parser for Redis performance
+asyncio-throttle>=1.0.2 # Rate limiting for API calls
+aiocache>=0.12.2 # Async caching framework
+ujson>=5.7.0 # Ultra-fast JSON parsing (2x faster than standard json)
+orjson>=3.8.0 # Fastest JSON library for Python
+cachetools>=5.3.0 # Additional caching utilities
+async-lru>=2.0.0 # LRU cache for async functions

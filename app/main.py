@@ -119,7 +119,7 @@ def init_microsoft_integration():
         integration = db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
 
         if integration:
-            logger.info("Microsoft integration already exists, skipping initialization")
+            # Microsoft integration exists
             return
 
         if not (settings.MICROSOFT_CLIENT_ID and settings.MICROSOFT_CLIENT_SECRET and settings.MICROSOFT_TENANT_ID):
@@ -145,23 +145,33 @@ def init_microsoft_integration():
 @app.on_event("startup")
 def startup_events():
     """
-    Run events when the application starts
+    ⚡ Run events when the application starts with performance optimizations
     """
     try:
         if engine:
             init_microsoft_integration()
 
+        # ⚡ Initialize performance services (sync version)
+        try:
+            from app.services.cache_service import cache_service
+            # Cache will initialize when first used
+            # Cache service ready
+        except Exception as e:
+            logger.warning(f"Cache service setup failed: {e}")
+
         if has_scheduler and engine:
             start_scheduler()
         elif not engine:
             logger.warning("No se inició el sincronizador de emails porque no hay base de datos configurada")
+            
+        logger.info("Services ready")
     except Exception as e:
         logger.error(f"Error during startup events: {e}")
 
 # Configurar logging
-logger.info("🚀 Enque API server starting...")
-logger.info("🚀 Socket.IO enabled with perfect configuration!")
-logger.info(f"�� API docs available at /docs")
+    logger.info("Server starting")
+logger.info("Socket.IO enabled")
+logger.info("API docs at /docs")
 
 if __name__ == "__main__":
     import uvicorn

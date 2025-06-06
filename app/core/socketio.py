@@ -4,12 +4,12 @@ import logging
 import json
 from app.utils.logger import logger
 
-# Configurar Socket.IO server con configuración PERFECTA
+# Configurar Socket.IO server con logging MÍNIMO
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins="*",
-    logger=True,
-    engineio_logger=True,
+    logger=False,  # Desactivar logging interno
+    engineio_logger=False,  # Desactivar engine logging
     ping_timeout=20,
     ping_interval=10
 )
@@ -21,7 +21,7 @@ workspace_connections: Dict[int, Set[str]] = {}
 async def connect(sid, environ, auth):
     """Manejar nueva conexión"""
     try:
-        logger.info(f"🔌 Socket connection attempt: {sid}")
+        # Socket connection attempt
         
         # Obtener workspace_id del auth o query params
         workspace_id = None
@@ -46,8 +46,7 @@ async def connect(sid, environ, auth):
             # Unir al room del workspace
             sio.enter_room(sid, f'workspace_{workspace_id}')
             
-            logger.info(f"✅ Socket {sid} connected to workspace {workspace_id}")
-            logger.info(f"📊 Workspace {workspace_id} now has {len(workspace_connections[workspace_id])} connections")
+            # Socket connected successfully
         else:
             logger.warning(f"⚠️ Socket {sid} connected without workspace_id")
             
@@ -58,14 +57,13 @@ async def connect(sid, environ, auth):
 async def disconnect(sid):
     """Manejar desconexión"""
     try:
-        logger.info(f"🔌 Socket disconnect: {sid}")
+        # Socket disconnect
         
         # Remover de todos los workspaces
         for workspace_id, connections in workspace_connections.items():
             if sid in connections:
                 connections.remove(sid)
                 sio.leave_room(sid, f'workspace_{workspace_id}')
-                logger.info(f"📊 Workspace {workspace_id} now has {len(connections)} connections")
                 break
                 
     except Exception as e:
@@ -147,7 +145,7 @@ def emit_comment_update_sync(workspace_id: int, comment_data: dict):
             finally:
                 loop.close()
                 
-        logger.info(f"📤 Sync emit comment_updated queued for workspace {workspace_id}")
+        # Comment update queued
     except Exception as e:
         logger.error(f"❌ Error in sync emit comment_updated: {str(e)}")
 
@@ -170,6 +168,6 @@ def emit_new_ticket_sync(workspace_id: int, ticket_data: dict):
             finally:
                 loop.close()
                 
-        logger.info(f"📤 Sync emit new_ticket queued for workspace {workspace_id}")
+        # New ticket queued
     except Exception as e:
         logger.error(f"❌ Error in sync emit new_ticket: {str(e)}") 

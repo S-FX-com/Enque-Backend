@@ -86,6 +86,27 @@ class Settings(BaseSettings):
     # Token Management
     CLEANUP_OLD_TOKENS: bool = True  # Limpiar tokens antiguos excepto los 5 más recientes
 
+    # ⚡ Performance & Caching Configuration
+    REDIS_URL: Optional[str] = None  # Redis connection URL for caching
+    CACHE_EXPIRE_MICROSOFT_GRAPH: int = 300  # Microsoft Graph cache expiration (5 minutes)
+    CACHE_EXPIRE_USER_INFO: int = 3600  # User info cache (1 hour)
+    CACHE_EXPIRE_MAILBOX_LIST: int = 600  # Mailbox list cache (10 minutes)
+    CACHE_EXPIRE_FOLDERS: int = 1800  # Folder list cache (30 minutes)
+    
+    # Database Connection Pool
+    DB_POOL_SIZE: int = 10  # Connection pool size
+    DB_MAX_OVERFLOW: int = 20  # Max overflow connections
+    DB_POOL_TIMEOUT: int = 30  # Pool timeout in seconds
+    DB_POOL_RECYCLE: int = 3600  # Recycle connections after 1 hour
+    
+    # Rate Limiting for Microsoft Graph
+    MS_GRAPH_RATE_LIMIT: int = 10  # Requests per second to Microsoft Graph
+    MS_GRAPH_BURST_LIMIT: int = 50  # Burst limit
+    
+    # Background Job Configuration
+    EMAIL_SYNC_BATCH_SIZE: int = 25  # Process emails in batches
+    EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 3  # Max concurrent mailbox syncs
+
     class Config:
         # Leer variables de entorno directamente, sin depender de archivos .env
         env_file = None

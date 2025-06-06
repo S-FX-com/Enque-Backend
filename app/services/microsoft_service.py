@@ -1,9 +1,29 @@
+# ⚡ Optimized imports for performance
+import orjson  # Ultra-fast JSON (2-4x faster than standard json)
+import asyncio
 import requests
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
+
+# 🚀 Import performance services
+try:
+    from app.services.cache_service import cache_service, cached_microsoft_graph
+    from app.services.rate_limiter import rate_limiter, rate_limited
+    PERFORMANCE_SERVICES_AVAILABLE = True
+except ImportError:
+    PERFORMANCE_SERVICES_AVAILABLE = False
+    # Fallback decorators when services not available
+    def cached_microsoft_graph(ttl=300, key_prefix="msg"):
+        def decorator(func):
+            return func
+        return decorator
+    def rate_limited(tenant_id_arg="tenant_id", resource="graph"):
+        def decorator(func):
+            return func
+        return decorator
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig, MailboxConnection
 from app.schemas.microsoft import EmailData, EmailAddress, EmailAttachment, MicrosoftTokenCreate, EmailTicketMappingCreate
 from app.schemas.task import TaskStatus # Import TaskStatus Enum
@@ -45,13 +65,33 @@ class MicrosoftGraphService:
         self.graph_url = settings.MICROSOFT_GRAPH_URL
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
+        
+        # ⚡ Initialize performance services
+        self.tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
 
         if self.integration:
-            logger.info("Microsoft service initialized with database integration")
+            pass  # Microsoft service initialized
         elif self.has_env_config:
             logger.info("Microsoft service initialized with environment variables (no DB integration)")
         else:
             logger.warning("Microsoft service initialized without integration or environment variables")
+
+    def _init_cache_if_needed(self):
+        """Initialize cache service if needed"""
+        if PERFORMANCE_SERVICES_AVAILABLE:
+            try:
+                # Try to initialize cache in sync context
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if not loop.is_running():
+                        loop.run_until_complete(cache_service.connect())
+                        logger.info("🚀 Cache service connected for Microsoft Graph")
+                except RuntimeError:
+                    # No event loop, will use memory cache only
+                    pass
+            except Exception as e:
+                logger.warning(f"Cache initialization failed: {e}")
 
     def _get_active_integration(self) -> Optional[MicrosoftIntegration]:
         """Get the active Microsoft integration"""
@@ -408,11 +448,46 @@ class MicrosoftGraphService:
             logger.error(f"Unexpected error refreshing token ID {token.id}: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error refreshing token: {str(e)}")
 
-    def _get_user_info(self, access_token: str) -> Dict[str, Any]:
+    @cached_microsoft_graph(ttl=3600, key_prefix="user_info")  # Cache for 1 hour
+    @rate_limited(resource="user_info")
+    async def _get_user_info_cached(self, access_token: str) -> Dict[str, Any]:
+        """Get user info with caching and rate limiting"""
         try:
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+            
+            # Use httpx for async requests
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{self.graph_url}/me", headers=headers)
+                response.raise_for_status()
+                
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to get user info: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get user info: {str(e)}")
+
+    def _get_user_info(self, access_token: str) -> Dict[str, Any]:
+        """Legacy sync version - tries cache first, then calls API"""
+        try:
+            # Try to use cached version in sync context
+            if PERFORMANCE_SERVICES_AVAILABLE:
+                try:
+                    # Run async method in sync context
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # Create new task if loop is already running
+                        task = asyncio.create_task(self._get_user_info_cached(access_token))
+                        return asyncio.run_coroutine_threadsafe(task, loop).result(timeout=10)
+                    else:
+                        return loop.run_until_complete(self._get_user_info_cached(access_token))
+                except Exception as cache_error:
+                    logger.warning(f"Cache failed, falling back to direct API: {cache_error}")
+            
+            # Fallback to direct API call
+            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
             response = requests.get(f"{self.graph_url}/me", headers=headers)
-            response.raise_for_status(); return response.json()
+            response.raise_for_status()
+            return response.json()
+            
         except Exception as e:
             logger.error(f"Failed to get user info: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get user info: {str(e)}")
@@ -468,7 +543,7 @@ class MicrosoftGraphService:
             return html_content
 
     def sync_emails(self, sync_config: EmailSyncConfig):
-        log_important(f"[MAIL SYNC] Starting sync for config ID: {sync_config.id}, Mailbox ID: {sync_config.mailbox_connection_id}")
+        # Starting sync
         user_email, token = self._get_user_email_for_sync(sync_config) # This calls the sync check_and_refresh_all_tokens
         if not user_email or not token:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
@@ -476,13 +551,13 @@ class MicrosoftGraphService:
         try:
             # Use user token instead of application token for multitenant support
             user_access_token = token.access_token
-            logger.info(f"[MAIL SYNC] Using user access token for {user_email} (multitenant support)")
+            # Using user access token
             
             emails = self.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, filter_unread=True)
             if not emails:
-                logger.info(f"[MAIL SYNC] No unread emails found for {user_email} in folder '{sync_config.folder_name}'.")
+                # No unread emails
                 sync_config.last_sync_time = datetime.utcnow(); self.db.commit(); return []
-            logger.info(f"[MAIL SYNC] Found {len(emails)} unread emails for {user_email}.")
+            # Found unread emails
             created_tasks_count = 0; added_comments_count = 0
             processed_folder_id = self._get_or_create_processed_folder(user_access_token, user_email, "Enque Processed")
             if not processed_folder_id: logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
@@ -509,7 +584,7 @@ class MicrosoftGraphService:
                 try:
                     # Verificar si el correo ya fue procesado
                     if self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first():
-                        logger.info(f"[MAIL SYNC] Email ID {email_id} already processed. Skipping."); continue
+                        continue
                     
                     # Obtener el asunto del correo para verificar si es una notificación del sistema
                     email_subject = email_data.get("subject", "").lower()
@@ -529,7 +604,7 @@ class MicrosoftGraphService:
                         for pattern in notification_subject_patterns:
                             if pattern.lower() in email_subject:
                                 is_system_notification = True
-                                logger.info(f"[MAIL SYNC] Email ID {email_id} from {sender_email} appears to be a system notification with subject: '{email_subject}'. Skipping.")
+                                # System notification detected, skipping
                                 
                                 # Marcar como leído y mover a carpeta procesada sin crear ticket
                                 self._mark_email_as_read(user_access_token, user_email, email_id)
@@ -548,7 +623,7 @@ class MicrosoftGraphService:
                     if conversation_id:
                         existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
                     if existing_mapping_by_conv:
-                        logger.info(f"[MAIL SYNC] Email ID {email_id} is part of existing conversation {conversation_id} (Ticket ID: {existing_mapping_by_conv.ticket_id}). Adding as comment.")
+                        logger.info(f"📧 Adding comment to existing ticket {existing_mapping_by_conv.ticket_id}")
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
                         reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=sync_config.workspace_id)
@@ -580,7 +655,7 @@ class MicrosoftGraphService:
                                 )
                                 
                                 if should_migrate_to_s3:
-                                    logger.info(f"🚀 [MAIL SYNC] Pre-migrating large content ({content_length} chars) to S3...")
+                                    # Pre-migrating large content to S3
                                     
                                     # Generar un ID temporal para el archivo S3
                                     import uuid
@@ -597,7 +672,7 @@ class MicrosoftGraphService:
                                     s3_html_url = s3_url
                                     content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
                                     
-                                    logger.info(f"✅ [MAIL SYNC] Content pre-migrated to S3: {s3_url}")
+                                    # Content migrated to S3
                         except Exception as e:
                             logger.error(f"❌ [MAIL SYNC] Error pre-migrating content to S3: {str(e)}")
                             # Continue with original content if S3 fails
@@ -652,7 +727,7 @@ class MicrosoftGraphService:
                                 new_comment.s3_html_url = final_s3_url
                                 new_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
                                 
-                                logger.info(f"✅ [MAIL SYNC] S3 file renamed for comment {new_comment.id}: {final_s3_url}")
+                                # S3 file renamed
                             except Exception as e:
                                 logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for comment {new_comment.id}: {str(e)}")
                                 # Continue with temp filename - not critical
@@ -711,12 +786,12 @@ class MicrosoftGraphService:
                         self.db.add(reply_email_mapping)
                         ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
                         if ticket_to_update and ticket_to_update.status == TaskStatus.WITH_USER:
-                             logger.info(f"[MAIL SYNC] User replied to Ticket ID {ticket_to_update.id} (status: {ticket_to_update.status}). Updating status to '{TaskStatus.IN_PROGRESS}'.")
+                             # User replied, updating status
                              ticket_to_update.status = TaskStatus.IN_PROGRESS; self.db.add(ticket_to_update)
-                        elif ticket_to_update: logger.info(f"[MAIL SYNC] User replied to Ticket ID {ticket_to_update.id}. Status is '{ticket_to_update.status}', no automatic update needed.")
+                        elif ticket_to_update: pass  # User replied, no status update needed
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
                         self.db.commit(); added_comments_count += 1
-                        logger.info(f"[MAIL SYNC] Added comment to Ticket ID {existing_mapping_by_conv.ticket_id} from reply email ID {email.id}.")
+                        # Comment added to ticket
                         
                         # ✅ EMIT SOCKET.IO EVENT para actualización en tiempo real
                         try:
@@ -772,7 +847,7 @@ class MicrosoftGraphService:
                                 if processed_folder_id:
                                     new_id = self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                     if new_id and new_id != email_id:
-                                        logger.info(f"[MAIL SYNC] Email ID changed from {email_id} to {new_id} after move. Updating mapping.")
+                                        # Email ID changed after move, updating mapping
                                         try:
                                             # Actualización más segura con manejo de errores
                                             # Verificar si el ID es demasiado largo para la columna
@@ -787,18 +862,21 @@ class MicrosoftGraphService:
                                             ).first()
                                             
                                             if existing_mapping:
-                                                logger.warning(f"[MAIL SYNC] Another mapping already exists with email_id={new_id}. Not updating.")
+                                                logger.warning(f"[MAIL SYNC] Another mapping already exists with email_id={new_id}. Removing duplicate...")
+                                                # Si hay un duplicate, eliminar el anterior y actualizar el actual
+                                                self.db.delete(existing_mapping)
+                                                self.db.flush()  # Asegurar que se elimine antes de actualizar
+                                                email_mapping.email_id = new_id
+                                                self.db.commit()
+                                                # Removed duplicate mapping and updated
                                             else:
                                                 email_mapping.email_id = new_id
                                                 self.db.commit()
-                                                logger.info(f"[MAIL SYNC] Successfully updated mapping with new email ID.")
+                                                # Successfully updated mapping
                                         except Exception as update_err:
                                             logger.warning(f"[MAIL SYNC] Could not update email_id after move: {str(update_err)}. Continuing with original ID.")
                                             self.db.rollback()  # Importante hacer rollback en caso de error
-                                    elif new_id: 
-                                        logger.info(f"[MAIL SYNC] Successfully moved email ID {email_id} to 'Enque Processed' folder.")
-                                    else: 
-                                        logger.warning(f"[MAIL SYNC] Failed to move email ID {email_id} to 'Enque Processed' folder.")
+                                    # Email moved to processed folder
                             except Exception as commit_err:
                                 logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
                                 self.db.rollback()
@@ -823,7 +901,8 @@ class MicrosoftGraphService:
                     
                     continue
             sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
-            log_important(f"[MAIL SYNC] Finished sync for config ID: {sync_config.id}. Created {created_tasks_count} tasks, Added {added_comments_count} comments.")
+            if created_tasks_count > 0 or added_comments_count > 0:
+                logger.info(f"📧 Config {sync_config.id}: {created_tasks_count} tickets, {added_comments_count} comments")
             return []
         except Exception as e: logger.error(f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {str(e)}", exc_info=True); return []
 
@@ -1251,35 +1330,184 @@ class MicrosoftGraphService:
             return task
         except Exception as e: logger.error(f"Error creating task from email ID {email.id}: {str(e)}", exc_info=True); self.db.rollback(); return None
 
-    def get_mailbox_emails(self, app_token: str, user_email: str, folder_name: str = "Inbox", top: int = 10, filter_unread: bool = False) -> List[Dict[str, Any]]:
+    @cached_microsoft_graph(ttl=600, key_prefix="mailbox_folders")  # Cache folders for 10 minutes
+    @rate_limited(resource="mailbox")
+    async def _get_mailbox_folders_cached(self, app_token: str, user_email: str) -> Dict[str, str]:
+        """Get mailbox folders with caching"""
         try:
-            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}; folder_id = None
-            response_folders = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, params={"$filter": f"displayName eq '{folder_name}'"})
-            response_folders.raise_for_status(); folders = response_folders.json().get("value", [])
-            if folders: folder_id = folders[0].get("id")
-            else:
-                common_inbox_names = ["inbox", "bandeja de entrada", "boîte de réception"]
-                response_all_folders = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers)
-                response_all_folders.raise_for_status(); all_folders = response_all_folders.json().get("value", [])
-                for folder in all_folders:
-                    if folder.get("displayName", "").lower() in common_inbox_names: folder_id = folder.get("id"); break
-                if not folder_id:
-                    response_inbox = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/inbox", headers=headers)
-                    if response_inbox.ok: folder_id = response_inbox.json().get("id")
-                    else: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder '{folder_name}' not found.")
-            params = {"$top": top, "$orderby": "receivedDateTime DESC", "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,bodyPreview,importance,hasAttachments,body,isRead"}
-            if filter_unread: params["$filter"] = "isRead eq false"
-            response_messages = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/{folder_id}/messages", headers=headers, params=params)
-            response_messages.raise_for_status(); return response_messages.json().get("value", [])
-        except Exception as e: logger.error(f"Error getting emails for {user_email}: {str(e)}", exc_info=True); return []
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers)
+                response.raise_for_status()
+                
+            folders = response.json().get("value", [])
+            # Create mapping of folder names to IDs
+            folder_map = {}
+            for folder in folders:
+                display_name = folder.get("displayName", "").lower()
+                folder_map[display_name] = folder.get("id")
+                # Add common variants
+                if display_name == "inbox":
+                    folder_map.update({
+                        "bandeja de entrada": folder.get("id"),
+                        "boîte de réception": folder.get("id")
+                    })
+                    
+            return folder_map
+            
+        except Exception as e:
+            logger.error(f"Error getting folders for {user_email}: {str(e)}", exc_info=True)
+            return {}
+    
+    @cached_microsoft_graph(ttl=300, key_prefix="mailbox_emails")  # Cache emails for 5 minutes
+    @rate_limited(resource="mailbox")
+    async def _get_mailbox_emails_cached(self, app_token: str, user_email: str, folder_id: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get mailbox emails with caching and rate limiting"""
+        try:
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.graph_url}/users/{user_email}/mailFolders/{folder_id}/messages", 
+                    headers=headers, 
+                    params=params
+                )
+                response.raise_for_status()
+                
+            return response.json().get("value", [])
+            
+        except Exception as e:
+            logger.error(f"Error getting emails for {user_email}: {str(e)}", exc_info=True)
+            return []
 
-    def get_mailbox_email_content(self, app_token: str, user_email: str, message_id: str) -> Dict[str, Any]:
+    def get_mailbox_emails(self, app_token: str, user_email: str, folder_name: str = "Inbox", top: int = 10, filter_unread: bool = False) -> List[Dict[str, Any]]:
+        """Get mailbox emails with improved caching and performance"""
+        try:
+            folder_id = None
+            
+            if PERFORMANCE_SERVICES_AVAILABLE:
+                try:
+                    # Get cached folder mapping
+                    loop = asyncio.get_event_loop()
+                    folder_map = {}
+                    
+                    if loop.is_running():
+                        task = asyncio.create_task(self._get_mailbox_folders_cached(app_token, user_email))
+                        folder_map = asyncio.run_coroutine_threadsafe(task, loop).result(timeout=10)
+                    else:
+                        folder_map = loop.run_until_complete(self._get_mailbox_folders_cached(app_token, user_email))
+                    
+                    folder_id = folder_map.get(folder_name.lower())
+                    
+                except Exception as cache_error:
+                    pass  # Folder cache not available
+            
+            # Fallback to direct API calls if cache fails
+            if not folder_id:
+                headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+                response_folders = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, params={"$filter": f"displayName eq '{folder_name}'"})
+                response_folders.raise_for_status()
+                folders = response_folders.json().get("value", [])
+                
+                if folders:
+                    folder_id = folders[0].get("id")
+                else:
+                    # Try common inbox names
+                    common_inbox_names = ["inbox", "bandeja de entrada", "boîte de réception"]
+                    response_all_folders = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers)
+                    response_all_folders.raise_for_status()
+                    all_folders = response_all_folders.json().get("value", [])
+                    for folder in all_folders:
+                        if folder.get("displayName", "").lower() in common_inbox_names:
+                            folder_id = folder.get("id")
+                            break
+                    
+                    if not folder_id:
+                        response_inbox = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/inbox", headers=headers)
+                        if response_inbox.ok:
+                            folder_id = response_inbox.json().get("id")
+                        else:
+                            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder '{folder_name}' not found.")
+            
+            # Prepare email query parameters
+            params = {
+                "$top": min(top, 50),  # Limit to prevent large responses
+                "$orderby": "receivedDateTime DESC", 
+                "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,bodyPreview,importance,hasAttachments,body,isRead"
+            }
+            if filter_unread:
+                params["$filter"] = "isRead eq false"
+            
+            # Try cached email retrieval
+            if PERFORMANCE_SERVICES_AVAILABLE:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        task = asyncio.create_task(self._get_mailbox_emails_cached(app_token, user_email, folder_id, params))
+                        return asyncio.run_coroutine_threadsafe(task, loop).result(timeout=15)
+                    else:
+                        return loop.run_until_complete(self._get_mailbox_emails_cached(app_token, user_email, folder_id, params))
+                except Exception as cache_error:
+                    pass  # Email cache not available
+            
+            # Fallback to direct API call
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            response_messages = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/{folder_id}/messages", headers=headers, params=params)
+            response_messages.raise_for_status()
+            return response_messages.json().get("value", [])
+            
+        except Exception as e:
+            logger.error(f"Error getting emails for {user_email}: {str(e)}", exc_info=True)
+            return []
+
+    @cached_microsoft_graph(ttl=1800, key_prefix="email_content")  # Cache for 30 minutes (emails don't change)
+    @rate_limited(resource="mailbox")
+    async def _get_mailbox_email_content_cached(self, app_token: str, user_email: str, message_id: str) -> Dict[str, Any]:
+        """Get email content with caching and rate limiting"""
         try:
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
             params = {"$expand": "attachments"}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.graph_url}/users/{user_email}/messages/{message_id}", 
+                    headers=headers, 
+                    params=params
+                )
+                response.raise_for_status()
+                
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            return {}
+
+    def get_mailbox_email_content(self, app_token: str, user_email: str, message_id: str) -> Dict[str, Any]:
+        """Get email content with improved caching"""
+        try:
+            # Try cached version first
+            if PERFORMANCE_SERVICES_AVAILABLE:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        task = asyncio.create_task(self._get_mailbox_email_content_cached(app_token, user_email, message_id))
+                        return asyncio.run_coroutine_threadsafe(task, loop).result(timeout=15)
+                    else:
+                        return loop.run_until_complete(self._get_mailbox_email_content_cached(app_token, user_email, message_id))
+                except Exception as cache_error:
+                    pass  # Email content cache not available
+            
+            # Fallback to direct API call
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            params = {"$expand": "attachments"}
             response = requests.get(f"{self.graph_url}/users/{user_email}/messages/{message_id}", headers=headers, params=params)
-            response.raise_for_status(); return response.json()
-        except Exception as e: logger.error(f"Error getting full email content for message ID {message_id}: {str(e)}", exc_info=True); return {}
+            response.raise_for_status()
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            return {}
 
     def _mark_email_as_read(self, app_token: str, user_email: str, message_id: str) -> bool:
         try:
@@ -1475,7 +1703,7 @@ class MicrosoftGraphService:
             return html_content
 
     def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None) -> bool:
-        logger.info(f"Attempting to send email reply for task_id: {task_id} by agent: {agent.email}")
+        # Sending email reply
         task = self.db.query(Task).options(joinedload(Task.mailbox_connection), joinedload(Task.user)).filter(Task.id == task_id).first()
         if not task: logger.error(f"Task not found for task_id: {task_id}"); return False
         if not task.mailbox_connection_id or not task.mailbox_connection:
@@ -1488,7 +1716,45 @@ class MicrosoftGraphService:
         if not email_mapping or not email_mapping.email_id:
             logger.error(f"Could not find original email_id in mapping for task_id: {task_id}. Cannot send reply."); return True
         original_message_id = email_mapping.email_id
-        logger.info(f"Found original message ID '{original_message_id}' for reply to task {task_id}")
+        
+        # 🔧 ARREGLO: Verificar si el message ID existe y obtener el más reciente si cambió
+        try:
+            # Intentar acceder al mensaje original para verificar si existe
+            message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}"
+            headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+            
+            response = requests.get(message_endpoint, headers=headers)
+            if response.status_code == 404:
+                logger.warning(f"Message ID not found (404). Searching for updated mapping...")
+                
+                # Buscar TODOS los mappings para este ticket y ordenar por fecha de actualización
+                all_mappings = self.db.query(EmailTicketMapping).filter(
+                    EmailTicketMapping.ticket_id == task_id
+                ).order_by(EmailTicketMapping.updated_at.desc()).all()
+                
+                # Probar cada mapping hasta encontrar uno válido
+                for mapping in all_mappings:
+                    if mapping.email_id != original_message_id:
+                        test_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{mapping.email_id}"
+                        test_response = requests.get(test_endpoint, headers=headers)
+                        
+                        if test_response.status_code == 200:
+                            logger.info(f"📧 Found valid message ID for task {task_id}")
+                            original_message_id = mapping.email_id
+                            break
+                else:
+                    # Si llegamos aquí, ningún mapping funcionó
+                    logger.error(f"❌ No valid message ID found for ticket {task_id}. Cannot send reply.")
+                    return False
+                    
+            elif response.status_code == 200:
+                pass  # Message ID válido, continuar silenciosamente
+            else:
+                logger.warning(f"Unexpected response code {response.status_code} when verifying message ID")
+                
+        except Exception as verify_error:
+            logger.warning(f"Could not verify message ID {original_message_id} for task {task_id}: {str(verify_error)}")
+            # Continuar con el ID original como fallback
         
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         reply_content = self._process_html_for_email(reply_content)
@@ -1648,7 +1914,7 @@ class MicrosoftGraphService:
                     logger.error(f"Failed to send draft message for task_id: {task_id}. Status Code: {send_response.status_code}. Details: {error_details}")
                     send_response.raise_for_status()
                 
-                logger.info(f"Successfully sent email reply with {len(attachments_data)} attachments for task_id: {task_id}")
+                logger.info(f"📧 Reply sent for task {task_id}")
                 return True
             except requests.exceptions.RequestException as e:
                 error_details = "No details available"; status_code = 'N/A'
@@ -1679,7 +1945,7 @@ class MicrosoftGraphService:
                     reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
                     response = requests.post(reply_endpoint, headers=headers, json=reply_payload)
                     response.raise_for_status()
-                    logger.info(f"Successfully sent simple email reply for task_id: {task_id} (without subject modification)")
+                    logger.info(f"📧 Reply sent for task {task_id}")
                     return True
                 else:
                     # Si llegamos aquí, pudimos obtener el mensaje original, así que procedemos con el flujo normal
@@ -1695,7 +1961,7 @@ class MicrosoftGraphService:
                         else:
                             new_subject = f"{ticket_id_tag} {original_subject}"
                         
-                        logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
+                        # Subject modified
                     else:
                         # Subject already has the tag, use as is
                         new_subject = original_subject
@@ -1746,7 +2012,7 @@ class MicrosoftGraphService:
                     reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
                     response = requests.post(reply_endpoint, headers=headers, json=reply_payload)
                     response.raise_for_status()
-                    logger.info(f"Successfully sent fallback simple email reply for task_id: {task_id}")
+                    logger.info(f"📧 Reply sent for task {task_id}")
                     return True
                 except Exception as fallback_error:
                     logger.error(f"Both custom and fallback reply methods failed for task {task_id}. Error: {str(fallback_error)}")
@@ -1860,7 +2126,7 @@ class MicrosoftGraphService:
         self, user_access_token: str, sender_mailbox_email: str, recipient_email: str, 
         subject: str, html_body: str, task_id: Optional[int] = None
     ) -> bool:
-        logger.info(f"Attempting to send new email using user token from: {sender_mailbox_email} to: {recipient_email} with subject: {subject}")
+        # Sending email notification
         
         if not user_access_token:
             logger.error("Token is None or empty. Cannot send email.")
@@ -1869,7 +2135,7 @@ class MicrosoftGraphService:
         # Log de los primeros y últimos caracteres del token para debugging
         token_start = user_access_token[:10] if len(user_access_token) > 10 else user_access_token
         token_end = user_access_token[-5:] if len(user_access_token) > 5 else ""
-        logger.info(f"Token starts with: {token_start}... and ends with: ...{token_end}")
+        # Token validated
         
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
@@ -1898,13 +2164,13 @@ class MicrosoftGraphService:
         try:
             send_mail_endpoint = f"{self.graph_url}/users/{sender_mailbox_email}/sendMail"
             headers = {"Authorization": f"Bearer {user_access_token}", "Content-Type": "application/json"}
-            logger.info(f"Calling Graph API endpoint: {send_mail_endpoint}")
+            # Calling Graph API
             
             async with httpx.AsyncClient() as client:
-                logger.info("Sending request to Microsoft Graph API...")
+                # Sending request
                 response = await client.post(send_mail_endpoint, headers=headers, json=email_payload, timeout=30.0)
                 
-            logger.info(f"Graph API response status code: {response.status_code}")
+                            # Response received
             
             if response.status_code not in [200, 202]:
                 error_details = "No details available"; 
@@ -1918,7 +2184,7 @@ class MicrosoftGraphService:
                 logger.error(f"Failed to send email from {sender_mailbox_email} using user token. Status: {response.status_code}. Details: {error_details}")
                 response.raise_for_status() 
                 
-            logger.info(f"Successfully sent email from {sender_mailbox_email} to {recipient_email} using user token.")
+            logger.info(f"📧 Email sent to {recipient_email}")
             return True
         except httpx.HTTPStatusError as e:
             error_details = "No details available"; 
@@ -1939,15 +2205,12 @@ class MicrosoftGraphService:
             return False
 
     def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:
-        """
-        Detecta automáticamente los dominios del sistema para un workspace específico
-        basándose en los buzones de correo conectados al workspace.
-        """
+        
         try:
-            # Dominios siempre considerados del sistema (core platform)
+
             core_system_domains = ["enque.cc", "microsoftexchange"]
             
-            # Obtener todos los buzones conectados a este workspace
+      
             mailbox_connections = self.db.query(MailboxConnection).filter(
                 MailboxConnection.workspace_id == workspace_id,
                 MailboxConnection.is_active == True
@@ -1960,11 +2223,11 @@ class MicrosoftGraphService:
                     domain = mailbox.email.split('@')[-1].lower()
                     workspace_domains.add(domain)
             
-            # Combinar dominios core con dominios del workspace
+        
             all_system_domains = core_system_domains + list(workspace_domains)
             
             if workspace_domains:
-                logger.info(f"Detected system domains for workspace {workspace_id}: {all_system_domains}")
+                pass  # System domains detected
             
             return all_system_domains
             
