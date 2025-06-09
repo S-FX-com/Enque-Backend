@@ -1,1 +1,0 @@
-from .ticket_attachment import TicketAttachmentSchema 
