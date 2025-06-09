@@ -106,7 +106,8 @@ def _get_root_html() -> str:
 
 # Creación de la aplicación
 app = create_app()
-socket_app = socketio.ASGIApp(sio, app)
+# socket_app = socketio.ASGIApp(sio, app)
+socket_app = app
 
 # Inicialización del logger
 logger.info("Socket.IO enabled")
