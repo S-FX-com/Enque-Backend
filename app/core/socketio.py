@@ -75,7 +75,7 @@ async def emit_new_ticket(workspace_id: int, ticket_data: dict):
     try:
         room = f'workspace_{workspace_id}'
         await sio.emit('new_ticket', ticket_data, room=room)
-        logger.info(f"📤 Emitted new_ticket to workspace {workspace_id}")
+
     except Exception as e:
         logger.error(f"❌ Error emitting new_ticket: {str(e)}")
 
@@ -170,4 +170,27 @@ def emit_new_ticket_sync(workspace_id: int, ticket_data: dict):
                 
         # New ticket queued
     except Exception as e:
-        logger.error(f"❌ Error in sync emit new_ticket: {str(e)}") 
+        logger.error(f"❌ Error in sync emit new_ticket: {str(e)}")
+
+def emit_ticket_update_sync(workspace_id: int, ticket_data: dict):
+    """Emitir evento de actualización de ticket de forma síncrona (para mejor rendimiento)"""
+    try:
+        import asyncio
+        
+        # Intentar obtener el event loop actual
+        try:
+            loop = asyncio.get_running_loop()
+            # Si hay un loop corriendo, usar create_task
+            loop.create_task(emit_ticket_update(workspace_id, ticket_data))
+        except RuntimeError:
+            # No hay loop corriendo, crear uno nuevo
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(emit_ticket_update(workspace_id, ticket_data))
+            finally:
+                loop.close()
+                
+        # Ticket update queued
+    except Exception as e:
+        logger.error(f"❌ Error in sync emit ticket_updated: {str(e)}") 

@@ -13,11 +13,19 @@ class TicketAttachmentSchema(BaseModel):
     @computed_field
     @property
     def download_url(self) -> str:
-        # Esta URL es relativa a la raíz de la API. 
-        # El frontend necesitará componer la URL base completa si es necesario.
-        # Asumiendo que el router de attachments está montado en la raíz de la API (o /api/v1)
-        # y el endpoint es /attachments/{id}
+        # Si tenemos S3 URL, usarla directamente (nuevo sistema)
+        if hasattr(self, '_s3_url') and self._s3_url:
+            return self._s3_url
+        
+        # Fallback a API endpoint (sistema legacy)
         return f"/attachments/{self.id}" 
+    
+    # Método para establecer s3_url cuando se carga desde ORM
+    def __init__(self, **data):
+        # Extraer s3_url si existe en los datos
+        s3_url = data.pop('s3_url', None)
+        super().__init__(**data)
+        self._s3_url = s3_url 
 
     model_config = {
         "from_attributes": True  # Permite la creación desde atributos de modelos ORM

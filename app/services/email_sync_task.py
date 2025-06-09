@@ -36,7 +36,6 @@ def sync_emails_job():
     """
     ⚡ Optimized email sync job with better error handling
     """
-    # Starting email sync
     db = None
     
     try:
@@ -53,28 +52,35 @@ def sync_emails_job():
         batch_size = settings.EMAIL_SYNC_BATCH_SIZE if hasattr(settings, 'EMAIL_SYNC_BATCH_SIZE') else 25
         successful_syncs = 0
         failed_syncs = 0
+        total_tickets = 0
+        total_comments = 0
         
+        # Primero revisar si hay actividad antes de mostrar logs
         for i in range(0, len(configs), batch_size):
             batch = configs[i:i + batch_size]
-            # Processing batch
             
             for config in batch:
                 try:
                     result = sync_single_config(config)
                     if result >= 0:
                         successful_syncs += 1
-                        # Config synced successfully
+                        if result > 0:
+                            total_tickets += result
                     else:
                         failed_syncs += 1
                 except Exception as e:
-                    logger.error(f"Error syncing config #{config.id}: {e}")
+                    logger.error(f"❌ Error syncing config #{config.id}: {e}")
                     failed_syncs += 1
         
+        # Solo mostrar logs si hay actividad real
+        if total_tickets > 0 or total_comments > 0:
+            logger.info(f"📧 Email sync found activity: {total_tickets} tickets, {total_comments} comments")
+        
         if failed_syncs > 0:
-            logger.info(f"📧 Sync: {successful_syncs} OK, {failed_syncs} failed")
+            logger.warning(f"⚠️ Sync issues: {successful_syncs} OK, {failed_syncs} failed")
                     
     except Exception as e:
-        logger.error(f"Error in email sync job: {e}")
+        logger.error(f"❌ Critical error in email sync job: {e}")
     finally:
         if db is not None:
             db.close()
@@ -89,7 +95,7 @@ def sync_single_config(config: EmailSyncConfig) -> int:
         ).first()
         
         if not integration:
-            logger.warning(f"No active integration found for sync config #{config.id}")
+            logger.warning(f"⚠️ No active integration found for sync config #{config.id}")
             return -1
             
         token = config_db.query(MicrosoftToken).filter(
@@ -97,8 +103,10 @@ def sync_single_config(config: EmailSyncConfig) -> int:
         ).first()
         
         if not token:
-            logger.warning(f"No token found for integration #{integration.id}")
+            logger.warning(f"⚠️ No token found for integration #{integration.id}")
             return -1
+            
+
             
         service = MicrosoftGraphService(config_db)
         
@@ -107,10 +115,15 @@ def sync_single_config(config: EmailSyncConfig) -> int:
         
         # Use the existing sync_emails method (it's already optimized with cache)
         created_tasks = service.sync_emails(config)
-        return created_tasks or 0
+        
+        tickets_created = created_tasks or 0
+        if tickets_created > 0:
+            logger.info(f"📧 Config {config.id}: {tickets_created} new tickets created")
+        
+        return tickets_created
         
     except Exception as e:
-        logger.error(f"Error syncing emails for config #{config.id}: {e}")
+        logger.error(f"❌ Error syncing emails for config #{config.id}: {e}")
         return -1
     finally:
         config_db.close()
@@ -193,27 +206,33 @@ def start_scheduler():
     """
     ⚡ Start the optimized background scheduler for email sync
     """
+
+    
     if not scheduler_available:
-        logger.warning("Schedule library is not available. Email synchronization scheduler will not run.")
+        logger.warning("❌ Schedule library is not available. Email synchronization scheduler will not run.")
+        logger.warning("💡 Install with: pip install schedule")
         return
     
     # More intelligent scheduling based on load
     schedule.every(30).seconds.do(sync_emails_job)  # Optimized frequency
     schedule.every(3).hours.do(refresh_tokens_job)  # More frequent token refresh
     
+
+    
     # Run in a separate thread with better error handling
     def run_scheduler():
-        # Starting email sync scheduler
+
         while True:
             try:
                 schedule.run_pending()
                 time.sleep(1)
             except Exception as e:
-                logger.error(f"Scheduler error: {e}")
+                logger.error(f"❌ Scheduler error: {e}")
                 time.sleep(5)  # Wait before retrying
             
     scheduler_thread = threading.Thread(target=run_scheduler, name="EmailSyncScheduler")
     scheduler_thread.daemon = True
     scheduler_thread.start()
     
-    logger.info("Email sync started")
+
+

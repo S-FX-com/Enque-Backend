@@ -35,45 +35,30 @@ router = APIRouter()
 async def read_tasks(
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 50,
     current_user: Agent = Depends(get_current_active_user),
-    # Add filter parameters
-    subject: Optional[str] = Query(None, description="Filter by subject text (contains, case-insensitive)"),
-    status: Optional[str] = Query(None, description="Filter by status (e.g., Open, Closed, Unread)"),
-    team_id: Optional[int] = Query(None, description="Filter by assigned team ID"),
-    assignee_id: Optional[int] = Query(None, description="Filter by assigned agent ID"),
-    priority: Optional[str] = Query(None, description="Filter by priority (e.g., Low, Medium, High)"),
-    category_id: Optional[int] = Query(None, description="Filter by category ID"), # Add category filter
+    subject: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    team_id: Optional[int] = Query(None),
+    assignee_id: Optional[int] = Query(None),
+    priority: Optional[str] = Query(None),
+    category_id: Optional[int] = Query(None),
 ) -> Any:
-    """
-    Retrieve tasks based on user role and optional filters:
-    - All users (Admin/Manager/Agent): Can see ALL tasks in the workspace, optionally filtered.
-    - Team-specific filtering only applies when teamId filter is used explicitly.
-    
-    Note: All users can see ALL tickets in "All Tickets" view regardless of team membership.
-    """
-    base_query = db.query(Task).filter(
+    query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
 
-    # No team membership filtering in the main endpoint - all users see all tickets
-    # This ensures "All Tickets" shows everything for everyone
-    query = base_query
-
-    # Apply optional filters to the query
     if subject:
-        # Use ilike for case-insensitive contains search
         query = query.filter(Task.title.ilike(f"%{subject}%"))
     if status:
         query = query.filter(Task.status == status)
     if team_id:
-        # Include both direct team assignments and mailbox team assignments (avoiding duplicates)
         query = query.filter(
             or_(
-                Task.team_id == team_id,  # Direct team assignment
-                and_(  # Mailbox team assignment (only for tickets without direct team assignment)
-                    Task.team_id.is_(None),  # Only include mailbox tickets that don't have team_id
+                Task.team_id == team_id,
+                and_(
+                    Task.team_id.is_(None),
                     Task.mailbox_connection_id.isnot(None),
                     Task.mailbox_connection_id.in_(
                         db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
@@ -87,10 +72,9 @@ async def read_tasks(
         query = query.filter(Task.assignee_id == assignee_id)
     if priority:
         query = query.filter(Task.priority == priority)
-    if category_id: # Add category filter logic
+    if category_id:
         query = query.filter(Task.category_id == category_id)
 
-    # Apply eager loading options to the final filtered query
     query = query.options(
         joinedload(Task.sent_from),
         joinedload(Task.sent_to),
@@ -98,41 +82,29 @@ async def read_tasks(
         joinedload(Task.user),
         joinedload(Task.team),
         joinedload(Task.company),
-        joinedload(Task.category) # Eager load category
+        joinedload(Task.category)
     )
 
-    # Apply ordering, offset, and limit
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-
     return tasks
 
 
 # Endpoint for ticket search - MOVED BEFORE /{task_id} endpoint
 @router.get("/search", response_model=List[TaskWithDetails])
 async def search_tickets(
-    q: str = Query(..., description="Search term to find in ticket title, description or body"),
+    q: str = Query(...),
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 50,
+    limit: int = 30,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Search for tickets containing the search term in title, description or body.
-    All users can search ALL tickets in the workspace regardless of team membership.
-    """
-    # Base query for tickets in current workspace and not deleted
-    base_query = db.query(Task).filter(
+    query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
     
-    # No team filtering - all users can search all tickets
-    
-    # Apply search on title, description and body
-    search_term = f"%{q}%"  # Search term with wildcards for LIKE
-    
-    # Use join and OR condition to search across related tables
-    query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
+    search_term = f"%{q}%"
+    query = query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
         or_(
             Task.title.ilike(search_term),
             Task.description.ilike(search_term),
@@ -140,7 +112,6 @@ async def search_tickets(
         )
     )
     
-    # Load relationships with eager loading
     query = query.options(
         joinedload(Task.sent_from),
         joinedload(Task.sent_to),
@@ -152,9 +123,7 @@ async def search_tickets(
         joinedload(Task.body)
     )
     
-    # Order by creation date and apply pagination
     tickets = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    
     return tickets
 
 
@@ -410,7 +379,7 @@ async def update_task_endpoint(
 
     # --- Socket.IO Event ---
     try:
-        # Emit ticket update event to all workspace clients
+        # ✅ OPTIMIZACIÓN: Usar función síncrona para respuesta más rápida
         task_data = {
             'id': updated_task_obj.id,
             'title': updated_task_obj.title,
@@ -422,7 +391,11 @@ async def update_task_endpoint(
             'user_id': updated_task_obj.user_id,
             'updated_at': updated_task_obj.updated_at.isoformat() if updated_task_obj.updated_at else None
         }
-        await emit_ticket_update(updated_task_obj.workspace_id, task_data)
+        
+        # Usar función síncrona para no bloquear la respuesta
+        from app.core.socketio import emit_ticket_update_sync
+        emit_ticket_update_sync(updated_task_obj.workspace_id, task_data)
+        
     except Exception as e:
         logger.error(f"Failed to emit ticket_updated event for task {task_id}: {str(e)}")
     # --- End Socket.IO Event ---
@@ -489,31 +462,23 @@ async def read_user_tasks(
     return tasks
 
 
-@router.get("/assignee/{agent_id}", response_model=List[TaskWithDetails]) # Use TaskWithDetails
+@router.get("/assignee/{agent_id}", response_model=List[TaskWithDetails])
 async def read_assigned_tasks(
     agent_id: int,
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 25,
     current_user: Agent = Depends(get_current_active_user),
-    # Add filter parameters (excluding assignee_id as it's the main filter)
-    subject: Optional[str] = Query(None, description="Filter by subject text (contains, case-insensitive)"),
-    status: Optional[str] = Query(None, description="Filter by status (e.g., Open, Closed, Unread)"),
-    priority: Optional[str] = Query(None, description="Filter by priority (e.g., Low, Medium, High)"),
+    subject: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
 ) -> Any:
-    """
-    Retrieve tasks assigned to a specific agent WITHIN the current user's workspace, with optional filters.
-    """
-     # Base query for assigned tasks
-    query = db.query(Task).options(
-        joinedload(Task.user) # Eager load the user relationship
+    query = db.query(Task).filter(
+        Task.assignee_id == agent_id,
+        Task.workspace_id == current_user.workspace_id,
+        Task.is_deleted == False
     )
-    # Apply mandatory filters sequentially
-    query = query.filter(Task.assignee_id == agent_id)
-    query = query.filter(Task.workspace_id == current_user.workspace_id)
-    query = query.filter(Task.is_deleted == False)
 
-    # Apply optional filters
     if subject:
         query = query.filter(Task.title.ilike(f"%{subject}%"))
     if status:
@@ -521,9 +486,17 @@ async def read_assigned_tasks(
     if priority:
         query = query.filter(Task.priority == priority)
 
-    # Apply ordering, offset, and limit
-    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    query = query.options(
+        joinedload(Task.sent_from),
+        joinedload(Task.sent_to),
+        joinedload(Task.assignee),
+        joinedload(Task.user),
+        joinedload(Task.team),
+        joinedload(Task.company),
+        joinedload(Task.category)
+    )
 
+    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
     return tasks
 
 
@@ -884,13 +857,16 @@ def get_ticket_html_content(
             attachments = []
             if comment.attachments:
                 for att in comment.attachments:
+                    # Use S3 URL directly if available, otherwise use API endpoint
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
                     attachments.append({
                         "id": att.id,
                         "file_name": att.file_name,
                         "content_type": att.content_type,
                         "file_size": att.file_size,
                         "s3_url": getattr(att, 's3_url', None),
-                        "download_url": f"/api/v1/attachments/{att.id}"
+                        "download_url": download_url
                     })
 
             html_contents.append({

@@ -219,6 +219,7 @@ async def send_notification(
 ) -> bool:
     """
     Send a notification based on settings and templates.
+    Uses the specific mailbox of the ticket if available.
     
     Args:
         db: Database session
@@ -271,25 +272,70 @@ async def send_notification(
             logger.warning(f"[NOTIFY] No se encontró plantilla para notificación {notification_type} en workspace {workspace_id}")
             return False
         
-        # Find an active mailbox for the workspace to send from
-        try:
-            mailbox_conn = db.query(MailboxConnection).filter(
-                MailboxConnection.workspace_id == workspace_id,
-                MailboxConnection.is_active == True
-            ).first()
-            
-            logger.info(f"[NOTIFY] Mailbox connection encontrada: {mailbox_conn is not None}")
-            
-            if not mailbox_conn:
-                logger.warning(f"[NOTIFY] No se encontró conexión de mailbox activa para workspace {workspace_id}")
-                return False
-        except Exception as mailbox_error:
-            logger.error(f"[NOTIFY] Error al buscar mailbox connection: {str(mailbox_error)}", exc_info=True)
-            return False
+        # Intentar usar el mailbox específico del ticket primero
+        preferred_mailbox = None
+        preferred_token = None
         
-        # Apply template variables
+        if task_id:
+            # Buscar el ticket y su mailbox específico
+            from app.models.task import Task
+            task = db.query(Task).filter(Task.id == task_id).first()
+            
+            if task and task.mailbox_connection_id:
+                logger.info(f"[NOTIFY] Ticket {task_id} tiene mailbox específico ID: {task.mailbox_connection_id}")
+                
+                # Buscar el token válido para este mailbox específico
+                mailbox_token_info = db.query(MailboxConnection, MicrosoftToken)\
+                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                    .filter(
+                        MailboxConnection.id == task.mailbox_connection_id,
+                        MailboxConnection.is_active == True,
+                        MicrosoftToken.access_token.isnot(None)
+                    ).first()
+                
+                if mailbox_token_info:
+                    preferred_mailbox, preferred_token = mailbox_token_info
+                    logger.info(f"[NOTIFY] Usando mailbox específico del ticket: {preferred_mailbox.email}")
+                else:
+                    logger.warning(f"[NOTIFY] No se encontró token válido para el mailbox específico del ticket {task_id}")
+
+        # Si no hay mailbox específico o no tiene token válido, usar fallback
+        if not preferred_mailbox or not preferred_token:
+            logger.info(f"[NOTIFY] Buscando mailbox fallback para workspace {workspace_id}")
+            
+            # Get an admin with access to a mailbox to send the email
+            try:
+                admin_sender_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
+                    .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
+                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                    .filter(
+                        Agent.workspace_id == workspace_id,
+                        Agent.role.in_(['admin', 'manager']),
+                        MailboxConnection.is_active == True,
+                        MicrosoftToken.access_token.isnot(None)
+                    ).order_by(Agent.role.desc()).first()
+                
+                logger.info(f"[NOTIFY] Admin con acceso al mailbox encontrado: {admin_sender_info is not None}")
+                
+                if not admin_sender_info:
+                    logger.warning(f"[NOTIFY] No se encontró admin con acceso al mailbox para workspace {workspace_id}")
+                    return False
+                    
+                admin, preferred_mailbox, preferred_token = admin_sender_info
+                logger.info(f"[NOTIFY] Usando mailbox fallback: {preferred_mailbox.email}")
+                
+            except Exception as admin_error:
+                logger.error(f"[NOTIFY] Error al buscar admin con acceso al mailbox: {str(admin_error)}", exc_info=True)
+                return False
+        
+        # Apply template variables including mailbox-specific ones
         subject = template.subject
         html_body = template.template
+        
+        # Add mailbox display name to template variables if available
+        if preferred_mailbox and preferred_mailbox.display_name:
+            template_vars["mailbox_name"] = preferred_mailbox.display_name
+            template_vars["sender_name"] = preferred_mailbox.display_name
         
         # Replace variables in subject and body
         for var_name, var_value in template_vars.items():
@@ -299,48 +345,26 @@ async def send_notification(
         
         logger.info(f"[NOTIFY] Plantilla renderizada con variables: {list(template_vars.keys())}")
         
-        # Get an admin with access to the mailbox to send the email
-        try:
-            admin_sender_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
-                .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
-                .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
-                .filter(
-                    Agent.workspace_id == workspace_id,
-                    Agent.role.in_(['admin', 'manager']),
-                    MailboxConnection.is_active == True,
-                    MicrosoftToken.access_token.isnot(None)
-                ).order_by(Agent.role.desc()).first()
-            
-            logger.info(f"[NOTIFY] Admin con acceso al mailbox encontrado: {admin_sender_info is not None}")
-            
-            if not admin_sender_info:
-                logger.warning(f"[NOTIFY] No se encontró admin con acceso al mailbox para workspace {workspace_id}")
-                return False
-        except Exception as admin_error:
-            logger.error(f"[NOTIFY] Error al buscar admin con acceso al mailbox: {str(admin_error)}", exc_info=True)
-            return False
-        
         # Get current access token (refresh if needed)
-        admin, mailbox_connection, ms_token = admin_sender_info
-        current_access_token = ms_token.access_token
+        current_access_token = preferred_token.access_token
         
-        if ms_token.expires_at < datetime.utcnow():
+        if preferred_token.expires_at < datetime.utcnow():
             try:
-                logger.info(f"[NOTIFY] Refrescando token para mailbox {mailbox_connection.email}")
+                logger.info(f"[NOTIFY] Refrescando token para mailbox {preferred_mailbox.email}")
                 graph_service = MicrosoftGraphService(db=db)
-                refreshed_ms_token = await graph_service.refresh_token_async(ms_token)
+                refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
                 current_access_token = refreshed_ms_token.access_token
                 logger.info("[NOTIFY] Token refrescado exitosamente")
             except Exception as token_error:
                 logger.error(f"[NOTIFY] Error refrescando token: {str(token_error)}", exc_info=True)
                 return False
         
-        # Send the email
-        logger.info(f"[NOTIFY] Intentando enviar email desde {mailbox_connection.email} a {recipient_email}")
+        # Send the email using the correct mailbox
+        logger.info(f"[NOTIFY] Intentando enviar email desde {preferred_mailbox.email} a {recipient_email}")
         graph_service = MicrosoftGraphService(db=db)
         success = await graph_service.send_email_with_user_token(
             user_access_token=current_access_token,
-            sender_mailbox_email=mailbox_connection.email,
+            sender_mailbox_email=preferred_mailbox.email,
             recipient_email=recipient_email,
             subject=subject,
             html_body=html_body,
@@ -348,7 +372,7 @@ async def send_notification(
         )
         
         if success:
-            logger.info(f"[NOTIFY] Notificación {notification_type} enviada exitosamente a {recipient_email}")
+            logger.info(f"[NOTIFY] Notificación {notification_type} enviada exitosamente a {recipient_email} desde {preferred_mailbox.email}")
             return True
         else:
             logger.error(f"[NOTIFY] Falló el envío de notificación {notification_type} a {recipient_email}")

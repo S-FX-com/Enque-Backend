@@ -521,9 +521,19 @@ async def create_comment(
             'ticket_id': task_id,
             'agent_id': current_user.id,
             'agent_name': current_user.name,
-            'content': comment_in.content[:100] + '...' if len(comment_in.content) > 100 else comment_in.content,
+            'agent_email': current_user.email,
+            'content': comment_in.content,  # ✅ Enviar contenido completo para reemplazo perfecto
             'is_private': comment_in.is_private,
-            'created_at': comment.created_at.isoformat() if comment.created_at else None
+            'created_at': comment.created_at.isoformat() if comment.created_at else None,
+            'attachments': [
+                {
+                    'id': att.id,
+                    'file_name': att.file_name,
+                    'content_type': att.content_type,
+                    'file_size': att.file_size,
+                    'download_url': att.s3_url
+                } for att in comment_with_agent.attachments
+            ] if comment_with_agent.attachments else []
         }
         
         # Emitir evento de forma síncrona

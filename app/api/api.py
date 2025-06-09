@@ -3,7 +3,7 @@ from fastapi import APIRouter, Response
 from app.api.endpoints import (
     agents, auth, comments, microsoft, tasks, users, workspaces, teams, attachments, 
     workflows, canned_replies, automations, companies, profile, activities, uploads, 
-    categories, reports, global_signatures, notifications
+    categories, reports, global_signatures, notifications, dashboard
 )
 
 api_router = APIRouter()
@@ -27,6 +27,7 @@ api_router.include_router(notifications.router, prefix="/notifications", tags=["
 api_router.include_router(workflows.router, prefix="/workspaces", tags=["workflows"])
 api_router.include_router(canned_replies.router, prefix="/canned-replies", tags=["canned-replies"])
 api_router.include_router(automations.router, prefix="/automations", tags=["automations"])
+api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 
 @api_router.get("/health", tags=["health"])
 async def health_check():

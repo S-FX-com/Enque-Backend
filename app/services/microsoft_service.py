@@ -543,7 +543,6 @@ class MicrosoftGraphService:
             return html_content
 
     def sync_emails(self, sync_config: EmailSyncConfig):
-        # Starting sync
         user_email, token = self._get_user_email_for_sync(sync_config) # This calls the sync check_and_refresh_all_tokens
         if not user_email or not token:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
@@ -553,14 +552,20 @@ class MicrosoftGraphService:
             user_access_token = token.access_token
             # Using user access token
             
-            emails = self.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, filter_unread=True)
+            emails = self.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, top=50, filter_unread=True)
+            
             if not emails:
                 # No unread emails
                 sync_config.last_sync_time = datetime.utcnow(); self.db.commit(); return []
             # Found unread emails
             created_tasks_count = 0; added_comments_count = 0
+            
+            # 🔧 REACTIVADO: Movimiento de emails con búsqueda mejorada para manejar cambios de Message ID
             processed_folder_id = self._get_or_create_processed_folder(user_access_token, user_email, "Enque Processed")
-            if not processed_folder_id: logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
+            if not processed_folder_id: 
+                logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
+            else:
+                pass  # Folder ready for email processing
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
             
@@ -580,31 +585,56 @@ class MicrosoftGraphService:
             
             for email_data in emails:
                 email_id = email_data.get("id")
+                email_subject = email_data.get("subject", "")
+                sender_email = email_data.get("from", {}).get("emailAddress", {}).get("address", "")
+                
                 if not email_id: logger.warning("[MAIL SYNC] Skipping email with missing ID."); continue
                 try:
                     # Verificar si el correo ya fue procesado
-                    if self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first():
-                        continue
+                    existing_mapping = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first()
+                    if existing_mapping:
+                        # VALIDACIÓN DE INTEGRIDAD: Verificar que el ticket realmente existe
+                        ticket_exists = self.db.query(Task).filter(Task.id == existing_mapping.ticket_id).first()
+                        if not ticket_exists:
+                            logger.warning(f"🚨 ORPHANED MAPPING: Email {email_id} maps to non-existent ticket #{existing_mapping.ticket_id}. Cleaning up...")
+                            self.db.delete(existing_mapping)
+                            self.db.commit()
+                            logger.info(f"✅ Cleaned orphaned mapping for email {email_id}")
+                            # Continue processing as if it's a new email
+                        else:
+                            # VALIDACIÓN AVANZADA: Verificar coherencia de contenido
+                            mapping_subject = existing_mapping.email_subject or ""
+                            current_subject = email_subject or ""
+                            
+                            # Si los subjects son muy diferentes, probablemente es un mapping incorrecto
+                            if mapping_subject and current_subject and mapping_subject.lower() != current_subject.lower():
+                                logger.warning(f"🚨 INCONSISTENT MAPPING: Email {email_id} mapped to ticket #{existing_mapping.ticket_id}")
+                                logger.warning(f"   Removing inconsistent mapping...")
+                                self.db.delete(existing_mapping)
+                                self.db.commit()
+                                logger.info(f"✅ Cleaned inconsistent mapping for email {email_id}")
+                                # Continue processing as if it's a new email
+                            else:
+                                continue
                     
                     # Obtener el asunto del correo para verificar si es una notificación del sistema
-                    email_subject = email_data.get("subject", "").lower()
+                    email_subject_lower = email_subject.lower()
                     
                     # Verificar si el correo es una notificación generada por el sistema
                     is_system_notification = False
                     
                     # Obtener remitente para permitir respuestas de clientes/externos
-                    sender_email = email_data.get("from", {}).get("emailAddress", {}).get("address", "").lower()
+                    sender_email_lower = sender_email.lower()
                     mailbox_email = user_email.lower()
                     
                     # Verificación más estricta: 
                     # 1. Si viene del mismo buzón o un dominio del sistema
                     # 2. Y el asunto contiene patrones típicos de notificación
-                    if any(domain in sender_email for domain in system_domains) or sender_email == mailbox_email:
+                    if any(domain in sender_email_lower for domain in system_domains) or sender_email_lower == mailbox_email:
                         # Si el remitente es del mismo dominio, verificar si el asunto coincide con patrones de notificación
                         for pattern in notification_subject_patterns:
-                            if pattern.lower() in email_subject:
+                            if pattern.lower() in email_subject_lower:
                                 is_system_notification = True
-                                # System notification detected, skipping
                                 
                                 # Marcar como leído y mover a carpeta procesada sin crear ticket
                                 self._mark_email_as_read(user_access_token, user_email, email_id)
@@ -619,11 +649,12 @@ class MicrosoftGraphService:
                     email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     conversation_id = email_content.get("conversationId")
+                    
                     existing_mapping_by_conv = None
                     if conversation_id:
                         existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
+                        
                     if existing_mapping_by_conv:
-                        logger.info(f"📧 Adding comment to existing ticket {existing_mapping_by_conv.ticket_id}")
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
                         reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=sync_config.workspace_id)
@@ -671,8 +702,6 @@ class MicrosoftGraphService:
                                     # Actualizar variables para la BD
                                     s3_html_url = s3_url
                                     content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
-                                    
-                                    # Content migrated to S3
                         except Exception as e:
                             logger.error(f"❌ [MAIL SYNC] Error pre-migrating content to S3: {str(e)}")
                             # Continue with original content if S3 fails
@@ -695,13 +724,41 @@ class MicrosoftGraphService:
                                 for att in non_inline_attachments:
                                     try:
                                         decoded_bytes = base64.b64decode(att.contentBytes)
+                                        
+                                        # 🔧 FIX: Subir adjunto a S3 en lugar de guardar en BD
+                                        s3_url = None
+                                        try:
+                                            from app.services.s3_service import get_s3_service
+                                            s3_service = get_s3_service()
+                                            
+                                            # Determinar carpeta según tipo de archivo
+                                            folder = "images" if att.content_type.startswith("image/") else "documents"
+                                            
+                                            # Subir a S3
+                                            s3_url = s3_service.upload_file(
+                                                file_content=decoded_bytes,
+                                                filename=att.name,
+                                                content_type=att.content_type,
+                                                folder=folder
+                                            )
+                                            
+                                            logger.info(f"📎 Adjunto '{att.name}' subido a S3: {s3_url}")
+                                            
+                                        except Exception as s3_error:
+                                            logger.error(f"❌ Error subiendo adjunto '{att.name}' a S3: {str(s3_error)}")
+                                            # Fallback: guardar en BD si S3 falla
+                                            pass
+                                        
+                                        # Crear adjunto en BD con S3 URL o bytes según disponibilidad
                                         db_attachment = TicketAttachment(
                                             file_name=att.name,
                                             content_type=att.content_type,
                                             file_size=att.size,
-                                            content_bytes=decoded_bytes
+                                            s3_url=s3_url,  # ✅ FIX: Incluir URL de S3
+                                            content_bytes=decoded_bytes if not s3_url else None  # Solo bytes si S3 falló
                                         )
                                         new_comment.attachments.append(db_attachment) # SQLAlchemy manejará el comment_id
+                                        
                                     except Exception as e:
                                         logger.error(f"Error al procesar/decodificar adjunto '{att.name}' para comentario en ticket {existing_mapping_by_conv.ticket_id}: {e}", exc_info=True)
                         
@@ -726,8 +783,6 @@ class MicrosoftGraphService:
                                 # Actualizar la URL en el comentario
                                 new_comment.s3_html_url = final_s3_url
                                 new_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
-                                
-                                # S3 file renamed
                             except Exception as e:
                                 logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for comment {new_comment.id}: {str(e)}")
                                 # Continue with temp filename - not critical
@@ -798,14 +853,36 @@ class MicrosoftGraphService:
                             # Hacer flush para obtener el ID del comentario
                             self.db.flush()
                             
+                            # 🔧 FIX: Usar contenido completo del comentario para socket en lugar de email truncado
+                            full_content = ""
+                            if new_comment.s3_html_url:
+                                # Si está en S3, usar el contenido procesado completo
+                                full_content = special_metadata + processed_reply_html
+                            else:
+                                # Si está en BD, usar el contenido almacenado
+                                full_content = new_comment.content or ""
+                            
+                            # 🔧 FIX: Incluir adjuntos en datos del socket
+                            attachments_data = []
+                            for attachment in new_comment.attachments:
+                                attachments_data.append({
+                                    'id': attachment.id,
+                                    'file_name': attachment.file_name,
+                                    'content_type': attachment.content_type,
+                                    'file_size': attachment.file_size,
+                                    'download_url': attachment.s3_url  # Usar s3_url como download_url
+                                })
+                            
                             comment_data = {
                                 'id': new_comment.id,
                                 'ticket_id': existing_mapping_by_conv.ticket_id,
                                 'agent_id': None,  # Es un usuario, no un agente
+                                'user_id': reply_user.id,  # ✅ AGREGAR user_id para consistencia
                                 'user_name': reply_user.name,
-                                'content': email.body_content[:100] + '...' if len(email.body_content) > 100 else email.body_content,
+                                'content': full_content,  # ✅ FIX: Usar contenido completo en lugar de truncado
                                 'is_private': False,
-                                'created_at': new_comment.created_at.isoformat() if new_comment.created_at else None
+                                'created_at': new_comment.created_at.isoformat() if new_comment.created_at else None,
+                                'attachments': attachments_data  # ✅ FIX: Incluir adjuntos
                             }
                             
                             # Emitir evento de forma síncrona (compatible con email sync)
@@ -817,12 +894,21 @@ class MicrosoftGraphService:
                             logger.info(f"📤 [MAIL SYNC] Socket.IO comment_updated event queued for workspace {workspace.id}")
                         except Exception as e:
                             logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for comment {new_comment.id}: {str(e)}")
-                        if processed_folder_id: self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
+                        
+                        # 🔧 MEJORADO: Mover email de respuesta y actualizar mappings si cambia el ID
+                        if processed_folder_id: 
+                            new_reply_id = self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
+                            if new_reply_id and new_reply_id != email_id:
+                                # Email ID changed after move, updating ALL related mappings for this reply
+                                logger.info(f"📧 Reply email moved - ID changed from {email_id[:50]}... to {new_reply_id[:50]}...")
+                                self._update_all_email_mappings_for_ticket(existing_mapping_by_conv.ticket_id, email_id, new_reply_id)
                         continue
                     else:
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
-                        if not email: logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation."); continue
+                        if not email: 
+                            logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation.")
+                            continue
                         
                         # Verificación adicional del remitente para evitar bucles
                         sender_email = email.sender.address if email.sender else ""
@@ -847,36 +933,9 @@ class MicrosoftGraphService:
                                 if processed_folder_id:
                                     new_id = self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                     if new_id and new_id != email_id:
-                                        # Email ID changed after move, updating mapping
-                                        try:
-                                            # Actualización más segura con manejo de errores
-                                            # Verificar si el ID es demasiado largo para la columna
-                                            if len(new_id) > 255:  # Suponiendo que el campo tiene un límite de 255 caracteres
-                                                logger.warning(f"[MAIL SYNC] New email ID is too long ({len(new_id)} chars). Truncating to 255 chars.")
-                                                new_id = new_id[:255]
-                                            
-                                            # Verificar si ya existe un mapeo con ese ID
-                                            existing_mapping = self.db.query(EmailTicketMapping).filter(
-                                                EmailTicketMapping.email_id == new_id,
-                                                EmailTicketMapping.id != email_mapping.id
-                                            ).first()
-                                            
-                                            if existing_mapping:
-                                                logger.warning(f"[MAIL SYNC] Another mapping already exists with email_id={new_id}. Removing duplicate...")
-                                                # Si hay un duplicate, eliminar el anterior y actualizar el actual
-                                                self.db.delete(existing_mapping)
-                                                self.db.flush()  # Asegurar que se elimine antes de actualizar
-                                                email_mapping.email_id = new_id
-                                                self.db.commit()
-                                                # Removed duplicate mapping and updated
-                                            else:
-                                                email_mapping.email_id = new_id
-                                                self.db.commit()
-                                                # Successfully updated mapping
-                                        except Exception as update_err:
-                                            logger.warning(f"[MAIL SYNC] Could not update email_id after move: {str(update_err)}. Continuing with original ID.")
-                                            self.db.rollback()  # Importante hacer rollback en caso de error
-                                    # Email moved to processed folder
+                                        # 🔧 MEJORADO: Email ID changed after move, updating ALL related mappings
+                                        logger.info(f"📧 Email moved - ID changed from {email_id[:50]}... to {new_id[:50]}...")
+                                        self._update_all_email_mappings_for_ticket(task.id, email_id, new_id)
                             except Exception as commit_err:
                                 logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
                                 self.db.rollback()
@@ -901,10 +960,63 @@ class MicrosoftGraphService:
                     
                     continue
             sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
+            
+            # LIMPIEZA PERIÓDICA: Cada 10 sincronizaciones, limpiar mappings huérfanos
+            if sync_config.id % 10 == 0:  # Solo config IDs múltiplos de 10
+                self._cleanup_orphaned_mappings()
+            
             if created_tasks_count > 0 or added_comments_count > 0:
                 logger.info(f"📧 Config {sync_config.id}: {created_tasks_count} tickets, {added_comments_count} comments")
             return []
         except Exception as e: logger.error(f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {str(e)}", exc_info=True); return []
+
+    def _cleanup_orphaned_mappings(self):
+        """Limpiar mappings huérfanos e inconsistentes"""
+        try:
+            # 1. Buscar mappings huérfanos (que apuntan a tickets inexistentes)
+            orphaned_mappings = self.db.query(EmailTicketMapping).filter(
+                ~EmailTicketMapping.ticket_id.in_(
+                    self.db.query(Task.id).filter(Task.is_deleted == False)
+                )
+            ).all()
+            
+            # 2. Buscar mappings inconsistentes (subject muy diferente al ticket)
+            inconsistent_mappings = []
+            recent_mappings = self.db.query(EmailTicketMapping).filter(
+                EmailTicketMapping.created_at > datetime.utcnow() - timedelta(hours=24)
+            ).limit(100).all()  # Solo revisar mappings recientes para performance
+            
+            for mapping in recent_mappings:
+                if mapping.email_subject:
+                    ticket = self.db.query(Task).filter(Task.id == mapping.ticket_id).first()
+                    if ticket and ticket.title:
+                        # Comparar subjects - si son muy diferentes, probablemente inconsistente
+                        if (mapping.email_subject.lower() != ticket.title.lower() and 
+                            not any(word in ticket.title.lower() for word in mapping.email_subject.lower().split()[:3])):
+                            inconsistent_mappings.append(mapping)
+            
+            total_cleaned = 0
+            
+            if orphaned_mappings:
+                logger.warning(f"🧹 Found {len(orphaned_mappings)} orphaned email mappings. Cleaning up...")
+                for mapping in orphaned_mappings:
+                    self.db.delete(mapping)
+                total_cleaned += len(orphaned_mappings)
+            
+            if inconsistent_mappings:
+                logger.warning(f"🧹 Found {len(inconsistent_mappings)} inconsistent email mappings. Cleaning up...")
+                for mapping in inconsistent_mappings:
+                    self.db.delete(mapping)
+                total_cleaned += len(inconsistent_mappings)
+            
+            if total_cleaned > 0:
+                self.db.commit()
+                logger.info(f"✅ Cleaned up {total_cleaned} problematic email mappings ({len(orphaned_mappings)} orphaned, {len(inconsistent_mappings)} inconsistent)")
+            # No problematic mappings found
+                
+        except Exception as e:
+            logger.error(f"❌ Error during mappings cleanup: {str(e)}")
+            self.db.rollback()
 
     def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
@@ -1083,11 +1195,9 @@ class MicrosoftGraphService:
                     should_migrate_to_s3 = (
                         content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
                         s3_service.should_store_html_in_s3(content_to_store)
-                    )
+                                        )
                     
                     if should_migrate_to_s3:
-                        logger.info(f"🚀 [MAIL SYNC] Pre-migrating large initial content ({content_length} chars) to S3...")
-                        
                         # Generar un ID temporal para el archivo S3
                         import uuid
                         temp_id = str(uuid.uuid4())
@@ -1102,8 +1212,6 @@ class MicrosoftGraphService:
                         # Actualizar variables para la BD
                         s3_html_url = s3_url
                         content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
-                        
-                        logger.info(f"✅ [MAIL SYNC] Initial content pre-migrated to S3: {s3_url}")
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error pre-migrating initial content to S3: {str(e)}")
                 # Continue with original content if S3 fails
@@ -1148,8 +1256,6 @@ class MicrosoftGraphService:
                     # Actualizar la URL en el comentario
                     initial_comment.s3_html_url = final_s3_url
                     initial_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
-                    
-                    logger.info(f"✅ [MAIL SYNC] S3 file renamed for initial comment {initial_comment.id}: {final_s3_url}")
                 except Exception as e:
                     logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for initial comment {initial_comment.id}: {str(e)}")
                     # Continue with temp filename - not critical
@@ -1181,8 +1287,6 @@ class MicrosoftGraphService:
                 
                 # Emitir evento de forma síncrona para email sync
                 emit_new_ticket_sync(workspace.id, task_data)
-                
-                logger.info(f"📤 [MAIL SYNC] Socket.IO new_ticket event queued for workspace {workspace.id}")
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for new ticket {task.id}: {str(e)}")
             
@@ -1455,7 +1559,11 @@ class MicrosoftGraphService:
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
             response_messages = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/{folder_id}/messages", headers=headers, params=params)
             response_messages.raise_for_status()
-            return response_messages.json().get("value", [])
+            
+            emails = response_messages.json().get("value", [])
+
+            
+            return emails
             
         except Exception as e:
             logger.error(f"Error getting emails for {user_email}: {str(e)}", exc_info=True)
@@ -1623,18 +1731,74 @@ class MicrosoftGraphService:
         except Exception: return {}
 
     def _get_or_create_processed_folder(self, app_token: str, user_email: str, folder_name: str) -> Optional[str]:
+        """
+        Obtiene o crea una carpeta de procesamiento. Incluye lógica robusta para manejar 
+        carpetas duplicadas y problemas de permisos en entornos multitenant.
+        """
         try:
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
-            response = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, params={"$filter": f"displayName eq '{folder_name}'"})
-            response.raise_for_status(); folders = response.json().get("value", [])
-            if folders: return folders[0].get("id")
-            logger.info(f"Folder '{folder_name}' not found for {user_email}. Attempting to create.")
+            
+            # Primero, buscar la carpeta existente
+            search_params = {"$filter": f"displayName eq '{folder_name}'"}
+            response = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, params=search_params)
+            response.raise_for_status()
+            folders = response.json().get("value", [])
+            
+            if folders:
+                folder_id = folders[0].get("id")
+                return folder_id
+            
+            # Si no existe, intentar crearla
             data = {"displayName": folder_name}
             response = requests.post(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, json=data)
-            response.raise_for_status(); folder_id = response.json().get("id")
-            logger.info(f"Folder '{folder_name}' created with ID: {folder_id} for user {user_email}")
-            return folder_id
-        except Exception as e: logger.error(f"Error getting or creating folder '{folder_name}' for {user_email}: {str(e)}", exc_info=True); return None
+            
+            if response.status_code in [200, 201]:
+                folder_id = response.json().get("id")
+                return folder_id
+            elif response.status_code == 409:
+                # Conflicto - la carpeta ya existe (posible race condition)
+                # Buscar nuevamente
+                response = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders", headers=headers, params=search_params)
+                response.raise_for_status()
+                folders = response.json().get("value", [])
+                if folders:
+                    folder_id = folders[0].get("id")
+                    return folder_id
+            else:
+                # Otro error al crear
+                error_details = "No details available"
+                try:
+                    error_details = response.json()
+                except ValueError:
+                    error_details = response.text
+                
+                logger.warning(f"Failed to create folder '{folder_name}' (Status: {response.status_code}). Details: {error_details}")
+                
+                # Como fallback, intentar crear en la carpeta Inbox
+                inbox_response = requests.get(f"{self.graph_url}/users/{user_email}/mailFolders/Inbox", headers=headers)
+                if inbox_response.status_code == 200:
+                    inbox_id = inbox_response.json().get("id")
+                    subfolder_data = {"displayName": folder_name}
+                    subfolder_response = requests.post(
+                        f"{self.graph_url}/users/{user_email}/mailFolders/{inbox_id}/childFolders", 
+                        headers=headers, 
+                        json=subfolder_data
+                    )
+                    
+                    if subfolder_response.status_code in [200, 201]:
+                        folder_id = subfolder_response.json().get("id")
+                        return folder_id
+                    else:
+                        logger.error(f"Failed to create subfolder '{folder_name}' in Inbox")
+                
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error getting/creating folder '{folder_name}' for {user_email}: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error getting/creating folder '{folder_name}' for {user_email}: {str(e)}", exc_info=True)
+            return None
 
     def _move_email_to_folder(self, app_token: str, user_email: str, message_id: str, folder_id: str) -> Optional[str]:
         try:
@@ -1645,6 +1809,135 @@ class MicrosoftGraphService:
             if new_message_id != message_id: logger.info(f"Email ID changed from {message_id} to {new_message_id} after move.")
             return new_message_id
         except Exception as e: logger.error(f"Error moving email {message_id} to folder {folder_id} for user {user_email}: {str(e)}"); return message_id
+
+    def _update_all_email_mappings_for_ticket(self, ticket_id: int, old_email_id: str, new_email_id: str) -> bool:
+        """
+        Actualiza todos los mappings de email relacionados con un ticket cuando el Message ID cambia.
+        Esto es crítico para mantener la consistencia después de mover emails a carpetas.
+        Incluye manejo robusto de duplicados y condiciones de carrera.
+        """
+        try:
+            # Verificar que el nuevo ID no sea demasiado largo
+            if len(new_email_id) > 255:
+                logger.warning(f"New email ID is too long ({len(new_email_id)} chars). Truncating to 255 chars.")
+                new_email_id = new_email_id[:255]
+            
+            # Si el ID no cambió, no hay nada que hacer
+            if old_email_id == new_email_id:
+                return True
+            
+            # Buscar todos los mappings para este ticket con el email ID viejo
+            mappings_to_update = self.db.query(EmailTicketMapping).filter(
+                EmailTicketMapping.ticket_id == ticket_id,
+                EmailTicketMapping.email_id == old_email_id
+            ).all()
+            
+            if not mappings_to_update:
+                logger.debug(f"No mappings found to update for ticket {ticket_id} with old email ID {old_email_id[:50]}...")
+                return False
+            
+            # 🔧 VERIFICACIÓN MEJORADA: Buscar mapping existente con nuevo ID
+            existing_mapping = self.db.query(EmailTicketMapping).filter(
+                EmailTicketMapping.email_id == new_email_id,
+                EmailTicketMapping.ticket_id == ticket_id
+            ).first()
+            
+            if existing_mapping:
+                logger.info(f"📧 Mapping with new email ID already exists for ticket {ticket_id}. Removing old mappings.")
+                # Eliminar los mappings antiguos en lugar de intentar actualizar
+                for old_mapping in mappings_to_update:
+                    self.db.delete(old_mapping)
+                self.db.commit()
+                return True
+            
+            # 🔧 MANEJO ROBUSTO DE DUPLICADOS: Usar try/catch para cada actualización
+            updated_count = 0
+            for mapping in mappings_to_update:
+                try:
+                    mapping.email_id = new_email_id
+                    mapping.updated_at = datetime.utcnow()
+                    # Commit individual para detectar duplicados temprano
+                    self.db.flush()
+                    updated_count += 1
+                except Exception as mapping_error:
+                    if "Duplicate entry" in str(mapping_error):
+                        logger.warning(f"🔧 Duplicate email ID detected for mapping {mapping.id}. Removing duplicate mapping.")
+                        # Rollback este mapping específico y eliminarlo
+                        self.db.rollback()
+                        self.db.delete(mapping)
+                        self.db.commit()
+                    else:
+                        logger.error(f"Error updating mapping {mapping.id}: {str(mapping_error)}")
+                        self.db.rollback()
+                    continue
+            
+            # Commit final de todas las actualizaciones exitosas
+            if updated_count > 0:
+                try:
+                    self.db.commit()
+                    logger.info(f"✅ Updated {updated_count} email mappings for ticket {ticket_id}")
+                    return True
+                except Exception as commit_error:
+                    if "Duplicate entry" in str(commit_error):
+                        logger.warning(f"🔧 Duplicate detected during final commit for ticket {ticket_id}. Handling gracefully.")
+                        self.db.rollback()
+                        # Verificar si ahora existe el mapping correcto
+                        final_check = self.db.query(EmailTicketMapping).filter(
+                            EmailTicketMapping.email_id == new_email_id,
+                            EmailTicketMapping.ticket_id == ticket_id
+                        ).first()
+                        return final_check is not None
+                    else:
+                        logger.error(f"Error during final commit for ticket {ticket_id}: {str(commit_error)}")
+                        self.db.rollback()
+                        return False
+            else:
+                return False
+                                
+        except Exception as e:
+            logger.error(f"Error updating email mappings for ticket {ticket_id}: {str(e)}")
+            try:
+                self.db.rollback()
+            except:
+                pass  # En caso de que rollback también falle
+            return False
+
+    def _validate_ticket_mailbox_association(self, task: Task, mailbox_connection: MailboxConnection, email_mapping: EmailTicketMapping) -> bool:
+        """
+        Valida que el ticket esté correctamente asociado con el mailbox correcto.
+        En entornos multitenant, esto es crítico para asegurar que las respuestas
+        se envíen desde el mailbox correcto.
+        """
+        try:
+            # Verificar que el task tenga un mailbox_connection_id válido
+            if not task.mailbox_connection_id:
+                logger.error(f"Task {task.id} has no mailbox_connection_id")
+                return False
+            
+            # Verificar que el mailbox_connection existe y está activo
+            if not mailbox_connection:
+                logger.error(f"Mailbox connection {task.mailbox_connection_id} not found for task {task.id}")
+                return False
+            
+            if not mailbox_connection.is_active:
+                logger.error(f"Mailbox connection {mailbox_connection.email} is not active for task {task.id}")
+                return False
+            
+            # Verificar que el mailbox pertenece al mismo workspace
+            if mailbox_connection.workspace_id != task.workspace_id:
+                logger.error(f"Mailbox {mailbox_connection.email} (workspace {mailbox_connection.workspace_id}) does not match task {task.id} workspace {task.workspace_id}")
+                return False
+            
+            # Verificar que tenemos un mapping válido
+            if not email_mapping or not email_mapping.email_id:
+                logger.error(f"No valid email mapping found for task {task.id}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating ticket-mailbox association for task {task.id}: {str(e)}")
+            return False
 
     def _process_html_for_email(self, html_content: str) -> str:
         """Procesa el HTML para asegurar un formato limpio y con espaciado controlado en clientes de correo."""
@@ -1703,57 +1996,212 @@ class MicrosoftGraphService:
             return html_content
 
     def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None) -> bool:
-        # Sending email reply
         task = self.db.query(Task).options(joinedload(Task.mailbox_connection), joinedload(Task.user)).filter(Task.id == task_id).first()
         if not task: logger.error(f"Task not found for task_id: {task_id}"); return False
         if not task.mailbox_connection_id or not task.mailbox_connection:
             logger.warning(f"Task {task_id} did not originate from email or has no mailbox connection. No reply sent."); return True
+        
         mailbox_connection = task.mailbox_connection; original_sender = task.user
+        
+
+        
         if not original_sender: logger.error(f"Original sender (User) missing for task_id: {task_id}"); return False
-        try: app_token = self.get_application_token()
-        except Exception as e: logger.error(f"Failed to get application token for sending reply: {e}"); return False
-        email_mapping = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == task_id).order_by(EmailTicketMapping.created_at.asc()).first()
-        if not email_mapping or not email_mapping.email_id:
-            logger.error(f"Could not find original email_id in mapping for task_id: {task_id}. Cannot send reply."); return True
+        # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
+        # El token de aplicación (client credentials) no tiene permisos para acceder a mailboxes específicos
+        # Necesitamos usar el token delegado del usuario que configuró este mailbox
+        try:
+            # Obtener el token específico para este mailbox
+            mailbox_token = self.db.query(MicrosoftToken).filter(
+                MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
+                MicrosoftToken.expires_at > datetime.utcnow()
+            ).order_by(MicrosoftToken.created_at.desc()).first()
+            
+            if not mailbox_token:
+                # Intentar refrescar token expirado
+                logger.warning(f"No active token found for mailbox {mailbox_connection.email}. Looking for refreshable token...")
+                expired_token = self.db.query(MicrosoftToken).filter(
+                    MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
+                    MicrosoftToken.refresh_token.isnot(None),
+                    MicrosoftToken.refresh_token != ""
+                ).order_by(MicrosoftToken.expires_at.desc()).first()
+                
+                if expired_token:
+                    try:
+                        mailbox_token = self.refresh_token(expired_token)
+                    except Exception as refresh_error:
+                        logger.error(f"Failed to refresh token for mailbox {mailbox_connection.email}: {str(refresh_error)}")
+                        return False
+                else:
+                    logger.error(f"No refreshable token found for mailbox {mailbox_connection.email}")
+                    return False
+            
+            if not mailbox_token:
+                logger.error(f"Could not obtain valid token for mailbox {mailbox_connection.email}")
+                return False
+                
+            # Usar el token del usuario específico del mailbox
+            app_token = mailbox_token.access_token
+            
+        except Exception as e: 
+            logger.error(f"Failed to get user token for mailbox {mailbox_connection.email}: {e}"); 
+            return False
+        
+        # Get all email mappings for this ticket to find the original email
+        email_mappings = self.db.query(EmailTicketMapping).filter(
+            EmailTicketMapping.ticket_id == task_id
+        ).all()
+        
+        if not email_mappings:
+            logger.error(f"❌ No email mappings found for ticket {task_id}. Cannot send reply.")
+            return False
+        
+        # Usar el primer mapping como referencia principal
+        email_mapping = email_mappings[0]
         original_message_id = email_mapping.email_id
         
-        # 🔧 ARREGLO: Verificar si el message ID existe y obtener el más reciente si cambió
+        # Validar que el ticket esté asociado correctamente con el mailbox
+        if not self._validate_ticket_mailbox_association(task, mailbox_connection, email_mapping):
+            return False
+        
         try:
+            # Verificar que el mailbox_connection está correctamente asociado
+            if not mailbox_connection:
+                logger.error(f"❌ Mailbox connection not found for ticket {task_id}. Cannot send reply.")
+                return False
+            
             # Intentar acceder al mensaje original para verificar si existe
             message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}"
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
             
             response = requests.get(message_endpoint, headers=headers)
             if response.status_code == 404:
-                logger.warning(f"Message ID not found (404). Searching for updated mapping...")
+                logger.warning(f"Message ID {original_message_id} not found (404) in mailbox {mailbox_connection.email}.")
                 
-                # Buscar TODOS los mappings para este ticket y ordenar por fecha de actualización
+                # Buscar otros Message IDs para este ticket EN EL MISMO MAILBOX
                 all_mappings = self.db.query(EmailTicketMapping).filter(
                     EmailTicketMapping.ticket_id == task_id
                 ).order_by(EmailTicketMapping.updated_at.desc()).all()
                 
-                # Probar cada mapping hasta encontrar uno válido
+                found_valid_mapping = False
                 for mapping in all_mappings:
                     if mapping.email_id != original_message_id:
                         test_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{mapping.email_id}"
                         test_response = requests.get(test_endpoint, headers=headers)
                         
                         if test_response.status_code == 200:
-                            logger.info(f"📧 Found valid message ID for task {task_id}")
                             original_message_id = mapping.email_id
+                            found_valid_mapping = True
                             break
-                else:
-                    # Si llegamos aquí, ningún mapping funcionó
-                    logger.error(f"❌ No valid message ID found for ticket {task_id}. Cannot send reply.")
+                
+                if not found_valid_mapping:
+                    # Intentar buscar por conversation ID si está disponible
+                    conversation_mapping = self.db.query(EmailTicketMapping).filter(
+                        EmailTicketMapping.ticket_id == task_id,
+                        EmailTicketMapping.email_conversation_id.isnot(None)
+                    ).first()
+                    
+                    if conversation_mapping and conversation_mapping.email_conversation_id:
+                        # Buscar emails en esta conversación en todas las carpetas
+                        search_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages"
+                        search_params = {
+                            "$filter": f"conversationId eq '{conversation_mapping.email_conversation_id}'",
+                            "$select": "id,subject,receivedDateTime,parentFolderId",
+                            "$top": 20
+                        }
+                        
+                        search_response = requests.get(search_endpoint, headers=headers, params=search_params)
+                        
+                        if search_response.status_code == 200:
+                            conversation_emails = search_response.json().get("value", [])
+                            
+                            if conversation_emails:
+                                # Usar el email más reciente de la conversación
+                                latest_email = max(conversation_emails, key=lambda x: x.get("receivedDateTime", ""))
+                                new_message_id = latest_email.get("id")
+                                
+                                if new_message_id:
+                                    # Verificar que este email sea accesible antes de usarlo
+                                    verify_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{new_message_id}"
+                                    verify_response = requests.get(verify_endpoint, headers=headers)
+                                    
+                                    if verify_response.status_code == 200:
+                                        original_message_id = new_message_id
+                                        found_valid_mapping = True
+                                        
+                                        # Actualizar el mapping en la base de datos con el nuevo Message ID
+                                        try:
+                                            email_mapping.email_id = new_message_id
+                                            self.db.commit()
+                                        except Exception as update_error:
+                                            logger.error(f"Failed to update email mapping: {str(update_error)}")
+                                            self.db.rollback()
+                    
+                    # Buscar en la carpeta "Enque Processed"
+                    if not found_valid_mapping:
+                        try:
+                            # Obtener ID de la carpeta "Enque Processed"
+                            folders_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/mailFolders"
+                            folders_params = {"$filter": "displayName eq 'Enque Processed'"}
+                            
+                            folders_response = requests.get(folders_endpoint, headers=headers, params=folders_params)
+                            
+                            if folders_response.status_code == 200:
+                                folders = folders_response.json().get("value", [])
+                                
+                                if folders:
+                                    processed_folder_id = folders[0].get("id")
+                                    
+                                    # Verificar si tenemos conversation_mapping válido
+                                    if conversation_mapping and conversation_mapping.email_conversation_id:
+                                        # Buscar emails por conversation ID en la carpeta procesada
+                                        processed_search_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/mailFolders/{processed_folder_id}/messages"
+                                        processed_search_params = {
+                                            "$filter": f"conversationId eq '{conversation_mapping.email_conversation_id}'",
+                                            "$select": "id,subject,receivedDateTime,conversationId",
+                                            "$top": 10
+                                        }
+                                        
+                                        processed_response = requests.get(processed_search_endpoint, headers=headers, params=processed_search_params)
+                                        
+                                        if processed_response.status_code == 200:
+                                            processed_emails = processed_response.json().get("value", [])
+                                            
+                                            if processed_emails:
+                                                # Usar el email más reciente
+                                                latest_processed = max(processed_emails, key=lambda x: x.get("receivedDateTime", ""))
+                                                processed_message_id = latest_processed.get("id")
+                                                
+                                                if processed_message_id:
+                                                    # Verificar acceso al email procesado
+                                                    verify_processed_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{processed_message_id}"
+                                                    verify_processed_response = requests.get(verify_processed_endpoint, headers=headers)
+                                                    
+                                                    if verify_processed_response.status_code == 200:
+                                                        original_message_id = processed_message_id
+                                                        found_valid_mapping = True
+                                                        
+                                                        # Actualizar el mapping con el ID de la carpeta procesada
+                                                        try:
+                                                            email_mapping.email_id = processed_message_id
+                                                            self.db.commit()
+                                                        except Exception as update_error:
+                                                            logger.error(f"Failed to update email mapping with processed ID: {str(update_error)}")
+                                                            self.db.rollback()
+                        except Exception as processed_search_error:
+                            logger.error(f"Error searching in 'Enque Processed' folder: {str(processed_search_error)}")
+                    
+                    if not found_valid_mapping:
+                        logger.error(f"❌ No valid message ID found for ticket {task_id} in mailbox {mailbox_connection.email}. Cannot send reply.")
+                        logger.error(f"💡 This ticket was created from mailbox {mailbox_connection.email} but the original email cannot be found.")
+                        logger.error(f"💡 This may indicate that the email was deleted, archived, or moved to a different folder.")
                     return False
                     
-            elif response.status_code == 200:
-                pass  # Message ID válido, continuar silenciosamente
-            else:
-                logger.warning(f"Unexpected response code {response.status_code} when verifying message ID")
+            elif response.status_code != 200:
+                logger.warning(f"⚠️ Unexpected response code {response.status_code} when verifying message ID in {mailbox_connection.email}")
                 
         except Exception as verify_error:
-            logger.warning(f"Could not verify message ID {original_message_id} for task {task_id}: {str(verify_error)}")
+            logger.error(f"❌ Error verifying message ID {original_message_id} for task {task_id}: {str(verify_error)}")
+            logger.error(f"💡 Will attempt to proceed with original message ID as fallback")
             # Continuar con el ID original como fallback
         
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
@@ -2022,9 +2470,55 @@ class MicrosoftGraphService:
                 return False
 
     def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None) -> bool:
-        logger.info(f"Attempting to send new email using app token from: {mailbox_email} to: {recipient_email} with subject: {subject}")
-        try: app_token = self.get_application_token()
-        except Exception as e: logger.error(f"Failed to get application token for sending new email: {e}"); return False
+        logger.info(f"Attempting to send new email from: {mailbox_email} to: {recipient_email} with subject: {subject}")
+        
+        # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
+        try:
+            # Buscar el mailbox connection por email
+            mailbox_connection = self.db.query(MailboxConnection).filter(
+                MailboxConnection.email == mailbox_email,
+                MailboxConnection.is_active == True
+            ).first()
+            
+            if not mailbox_connection:
+                logger.error(f"Mailbox connection not found for email: {mailbox_email}")
+                return False
+            
+            # Obtener el token específico para este mailbox
+            mailbox_token = self.db.query(MicrosoftToken).filter(
+                MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
+                MicrosoftToken.expires_at > datetime.utcnow()
+            ).order_by(MicrosoftToken.created_at.desc()).first()
+            
+            if not mailbox_token:
+                # Intentar refrescar token expirado
+                logger.warning(f"No active token found for mailbox {mailbox_email}. Looking for refreshable token...")
+                expired_token = self.db.query(MicrosoftToken).filter(
+                    MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
+                    MicrosoftToken.refresh_token.isnot(None),
+                    MicrosoftToken.refresh_token != ""
+                ).order_by(MicrosoftToken.expires_at.desc()).first()
+                
+                if expired_token:
+                    try:
+                        mailbox_token = self.refresh_token(expired_token)
+                    except Exception as refresh_error:
+                        logger.error(f"Failed to refresh token for mailbox {mailbox_email}: {str(refresh_error)}")
+                        return False
+                else:
+                    logger.error(f"No refreshable token found for mailbox {mailbox_email}")
+                    return False
+            
+            if not mailbox_token:
+                logger.error(f"Could not obtain valid token for mailbox {mailbox_email}")
+                return False
+                
+            # Usar el token del usuario específico del mailbox
+            app_token = mailbox_token.access_token
+            
+        except Exception as e: 
+            logger.error(f"Failed to get user token for mailbox {mailbox_email}: {e}"); 
+            return False
         
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
@@ -2126,16 +2620,11 @@ class MicrosoftGraphService:
         self, user_access_token: str, sender_mailbox_email: str, recipient_email: str, 
         subject: str, html_body: str, task_id: Optional[int] = None
     ) -> bool:
-        # Sending email notification
-        
         if not user_access_token:
             logger.error("Token is None or empty. Cannot send email.")
             return False
             
-        # Log de los primeros y últimos caracteres del token para debugging
-        token_start = user_access_token[:10] if len(user_access_token) > 10 else user_access_token
-        token_end = user_access_token[-5:] if len(user_access_token) > 5 else ""
-        # Token validated
+
         
         # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
@@ -2164,13 +2653,9 @@ class MicrosoftGraphService:
         try:
             send_mail_endpoint = f"{self.graph_url}/users/{sender_mailbox_email}/sendMail"
             headers = {"Authorization": f"Bearer {user_access_token}", "Content-Type": "application/json"}
-            # Calling Graph API
             
             async with httpx.AsyncClient() as client:
-                # Sending request
                 response = await client.post(send_mail_endpoint, headers=headers, json=email_payload, timeout=30.0)
-                
-                            # Response received
             
             if response.status_code not in [200, 202]:
                 error_details = "No details available"; 
@@ -2226,8 +2711,7 @@ class MicrosoftGraphService:
         
             all_system_domains = core_system_domains + list(workspace_domains)
             
-            if workspace_domains:
-                pass  # System domains detected
+
             
             return all_system_domains
             
