@@ -207,6 +207,8 @@ def start_scheduler():
     ⚡ Start the optimized background scheduler for email sync
     """
 
+    # Ignore
+    return
     
     if not scheduler_available:
         logger.warning("❌ Schedule library is not available. Email synchronization scheduler will not run.")
