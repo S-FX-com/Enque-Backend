@@ -1,0 +1,1 @@
+web: python migrations/create_mailbox_model.py && uvicorn app.main:socket_app --host 0.0.0.0 --port $PORT 
