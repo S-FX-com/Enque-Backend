@@ -114,6 +114,10 @@ def init_microsoft_integration():
     """
     Inicializar automáticamente la integración de Microsoft usando variables de entorno
     """
+
+    # Ignore
+    return
+
     try:
         db = next(get_db())
         integration = db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
