@@ -280,10 +280,16 @@ async def send_password_reset_email( # Changed to async
         logger.error(f"Exception in send_password_reset_email for {to_email} from {sender_mailbox_email}: {e}", exc_info=True)
         return False
 
-def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_title: str, ticket_link: str) -> str:
+def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_title: str, ticket_link: str, sender_name: Optional[str] = None) -> str:
     """
     Generates an HTML content for the ticket assignment notification email.
     """
+    # Determinar el nombre del remitente para la despedida
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+    
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -308,14 +314,7 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
                 box-shadow: 0 4px 15px rgba(0,0,0,0.1);
                 text-align: left;
             }}
-            .logo-container {{
-                text-align: center;
-                margin-bottom: 25px;
-            }}
-            .logo-container img {{
-                max-width: 150px;
-                height: auto;
-            }}
+
             p {{
                 font-size: 16px;
                 line-height: 1.6;
@@ -348,9 +347,6 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
     </head>
     <body>
         <div class="container">
-            <div class="logo-container">
-                <img src="{settings.FRONTEND_URL}/enque.png" alt="Enque Logo">
-            </div>
             <p>Hello {agent_name},</p>
             <p>You have been assigned a new ticket in Enque:</p>
             
@@ -365,7 +361,7 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
             
             <p class="footer">
                 Best regards,<br>
-                The Enque Team
+                {footer_sender}
             </p>
         </div>
     </body>
@@ -381,10 +377,12 @@ async def send_ticket_assignment_email(
     ticket_title: str,
     sender_mailbox_email: str,
     user_access_token: str,
-    request_origin: Optional[str] = None
+    request_origin: Optional[str] = None,
+    sender_mailbox_display_name: Optional[str] = None
 ) -> bool:
     """
     Sends a notification email to an agent when a ticket is assigned to them.
+    Uses the sender_mailbox_display_name to personalize the email signature.
     """
     subject = f"[ID:{ticket_id}] New ticket assigned: {ticket_title}"
     
@@ -392,7 +390,13 @@ async def send_ticket_assignment_email(
     base_url = request_origin if request_origin else settings.FRONTEND_URL
     ticket_link = f"{base_url}/tickets?openTicket={ticket_id}"
     
-    html_content = create_ticket_assignment_email_html(agent_name, ticket_id, ticket_title, ticket_link)
+    html_content = create_ticket_assignment_email_html(
+        agent_name, 
+        ticket_id, 
+        ticket_title, 
+        ticket_link, 
+        sender_mailbox_display_name
+    )
 
     try:
         graph_service = MicrosoftGraphService(db=db)
@@ -406,7 +410,7 @@ async def send_ticket_assignment_email(
             task_id=ticket_id
         )
         if success:
-            logger.info(f"Ticket assignment email sent successfully to {to_email} from {sender_mailbox_email}")
+            logger.info(f"Ticket assignment email sent successfully to {to_email} from {sender_mailbox_email} ({sender_mailbox_display_name or 'No display name'})")
             return True
         else:
             logger.error(f"Failed to send ticket assignment email to {to_email} using MicrosoftGraphService.send_email_with_user_token from {sender_mailbox_email}")
