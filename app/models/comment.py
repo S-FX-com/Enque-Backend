@@ -8,6 +8,7 @@ class Comment(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    other_destinaries = Column(Text, nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
     content = Column(Text, nullable=True)  # Ahora puede ser NULL si está en S3
     s3_html_url = Column(Text, nullable=True)  # URL del HTML almacenado en S3

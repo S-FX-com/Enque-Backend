@@ -103,6 +103,19 @@ async def create_comment(
     The comment can be private (visible only to agents) or public.
     Now includes automatic workflow processing for content analysis.
     """
+
+    # Validate other_destinaries if provided
+    cc_recipients = []
+    if comment_in.other_destinaries and not comment_in.is_private:
+        try:
+            from app.services.email_service import parse_other_destinaries
+            cc_recipients = parse_other_destinaries(comment_in.other_destinaries)
+            logger.info(f"Parsed {len(cc_recipients)} CC recipients for comment on task {task_id}")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid email addresses in other_destinaries: {str(e)}"
+            )
     
     # Fetch the task ensuring it belongs to the user's workspace
     task = db.query(TaskModel).filter(
@@ -195,6 +208,7 @@ async def create_comment(
         workspace_id=current_user.workspace_id,
         content=content_to_store,  # Usar contenido procesado
         s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
+        other_destinaries=comment_in.other_destinaries,
         is_private=comment_in.is_private
     )
     db.add(comment)
@@ -486,6 +500,7 @@ async def create_comment(
                 agent_email=current_user.email,
                 agent_name=current_user.name,
                 is_private=comment_in.is_private,
+                cc_recipients=cc_recipients,
                 processed_attachment_ids=processed_attachment_ids,
                 db_path=db_path
             )
@@ -523,6 +538,7 @@ async def create_comment(
             'agent_name': current_user.name,
             'agent_email': current_user.email,
             'content': comment_in.content,  # ✅ Enviar contenido completo para reemplazo perfecto
+            'other_destinaries': comment_in.other_destinaries,  # Include CC info
             'is_private': comment_in.is_private,
             'created_at': comment.created_at.isoformat() if comment.created_at else None,
             'attachments': [
@@ -684,6 +700,7 @@ def send_email_in_background(
     agent_name: str,
     is_private: bool,
     processed_attachment_ids: list,
+    cc_recipients: List[str],
     db_path: str
 ):
     """
@@ -729,7 +746,7 @@ def send_email_in_background(
             # Task originated from email, send a reply
             logger.info(f"[BACKGROUND] Task {task_id} originated from email. Attempting to send comment ID {comment_id} as reply with {len(processed_attachment_ids)} attachments.")
             microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids)
+            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients)
         else:
             # Task was created manually, send a new email notification
             logger.info(f"[BACKGROUND] Task {task_id} was manual. Attempting to send comment ID {comment_id} as new email notification.")

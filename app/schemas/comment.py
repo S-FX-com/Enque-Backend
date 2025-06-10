@@ -16,6 +16,7 @@ class CommentCreate(CommentBase):
     # Campos adicionales para gestión de asignación y archivos adjuntos
     preserve_assignee: bool = False  # Flag para no cambiar el asignado actual
     assignee_id: Optional[int] = None  # ID de agente a asignar (si se quiere cambiar)
+    other_destinaries: Optional[str] = None
     is_attachment_upload: bool = False  # Flag para indicar si es una carga de adjunto
 
 class CommentUpdate(BaseModel):
