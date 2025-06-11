@@ -1,9 +1,11 @@
 from typing import Any, List, Optional
 import asyncio  # Importar asyncio
+import time
+import logging
 from concurrent.futures import ThreadPoolExecutor  # Importar ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, noload
 from sqlalchemy import or_, and_ # Import 'or_' for OR condition and 'and_' for AND condition
 
 # Import dependencies
@@ -19,6 +21,9 @@ from app.models.activity import Activity # Import Activity model
 from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema
 # Import logger if needed for activity logging errors
 from app.utils.logger import logger
+
+# Logger específico para este módulo
+task_logger = logging.getLogger(__name__)
 # Import update_task service function and Microsoft service
 from app.services.task_service import update_task, send_assignment_notification # Importar función de notificación
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
@@ -30,8 +35,8 @@ from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_d
 router = APIRouter()
 
 
-# Use TaskWithDetails as the response model to include sender details
-@router.get("/", response_model=List[TaskWithDetails])
+# OPTIMIZADO: Use TaskSchema en lugar de TaskWithDetails para evitar relaciones pesadas
+@router.get("/", response_model=List[TaskSchema])
 async def read_tasks(
     db: Session = Depends(get_db),
     skip: int = 0,
@@ -44,9 +49,25 @@ async def read_tasks(
     priority: Optional[str] = Query(None),
     category_id: Optional[int] = Query(None),
 ) -> Any:
+
+    start_time = time.time()
+    
     query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
+    ).options(
+        noload(Task.workspace),
+        noload(Task.sent_from),
+        noload(Task.sent_to),
+        noload(Task.assignee),
+        noload(Task.user),
+        noload(Task.team),
+        noload(Task.company),
+        noload(Task.category),
+        noload(Task.comments),
+        noload(Task.email_mappings),
+        noload(Task.body),
+        noload(Task.mailbox_connection)
     )
 
     if subject:
@@ -75,17 +96,11 @@ async def read_tasks(
     if category_id:
         query = query.filter(Task.category_id == category_id)
 
-    query = query.options(
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category)
-    )
-
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    
+    query_time = time.time() - start_time
+            # Optimized tasks list query completed
+    
     return tasks
 
 
@@ -462,21 +477,40 @@ async def read_user_tasks(
     return tasks
 
 
-@router.get("/assignee/{agent_id}", response_model=List[TaskWithDetails])
+@router.get("/assignee/{agent_id}", response_model=List[TaskSchema])
 async def read_assigned_tasks(
     agent_id: int,
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 25,
+    limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
     subject: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     priority: Optional[str] = Query(None),
 ) -> Any:
+    """
+    OPTIMIZADO: Tasks asignados sin relaciones pesadas para máximo rendimiento
+    """
+    start_time = time.time()
+    
     query = db.query(Task).filter(
         Task.assignee_id == agent_id,
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
+    ).options(
+        # EVITAR cargar relaciones para máximo rendimiento
+        noload(Task.workspace),
+        noload(Task.sent_from),
+        noload(Task.sent_to),
+        noload(Task.assignee),
+        noload(Task.user),
+        noload(Task.team),
+        noload(Task.company),
+        noload(Task.category),
+        noload(Task.comments),
+        noload(Task.email_mappings),
+        noload(Task.body),
+        noload(Task.mailbox_connection)
     )
 
     if subject:
@@ -486,17 +520,11 @@ async def read_assigned_tasks(
     if priority:
         query = query.filter(Task.priority == priority)
 
-    query = query.options(
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category)
-    )
-
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    
+    query_time = time.time() - start_time
+            # Optimized assignee tasks query completed
+    
     return tasks
 
 
@@ -775,7 +803,7 @@ def get_ticket_html_content(
         # Fetch all S3 content in parallel if we have any S3 URLs
         s3_content_cache = {}
         if s3_urls_needed:
-            logger.info(f"Fetching {len(s3_urls_needed)} S3 contents in parallel for ticket {task_id}")
+            # Fetching S3 contents in parallel
             
             # Simple concurrent fetching using ThreadPoolExecutor
             from concurrent.futures import as_completed
@@ -815,8 +843,7 @@ def get_ticket_html_content(
                         from app.utils.image_processor import extract_base64_images
                         processed_content, extracted_images = extract_base64_images(content, task.id)
                         content = processed_content
-                        if extracted_images:
-                            logger.info(f"Processed {len(extracted_images)} base64 images in comment {comment.id}")
+                        # Base64 images processed silently
                     except Exception as e:
                         logger.warning(f"Error processing images in comment {comment.id}: {e}")
             
@@ -878,7 +905,7 @@ def get_ticket_html_content(
                 "created_at": comment.created_at
             })
 
-        logger.info(f"Successfully retrieved HTML content for ticket {task_id}: {len(html_contents)} items")
+        # Successfully retrieved HTML content
         
         return {
             "status": "success",

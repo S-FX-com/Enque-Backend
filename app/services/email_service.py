@@ -1,8 +1,9 @@
+import re
 from app.core.config import settings
 from app.services.microsoft_service import MicrosoftGraphService # Assuming this service can send mail
 from app.utils.logger import logger
 from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB session
-from typing import Optional
+from typing import Optional, Tuple, List
 
 # Placeholder for a more sophisticated HTML email template system
 def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url: str, workspace_name: str) -> str:
@@ -418,3 +419,51 @@ async def send_ticket_assignment_email(
     except Exception as e:
         logger.error(f"Exception in send_ticket_assignment_email for {to_email}: {e}", exc_info=True)
         return False
+
+def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
+    """
+    Validate a comma-separated string of email addresses.
+    
+    Args:
+        email_string: String containing comma-separated email addresses
+        
+    Returns:
+        Tuple of (is_valid, list_of_emails)
+    """
+    if not email_string or not email_string.strip():
+        return True, []
+    
+    # Split by comma and clean up
+    emails = [email.strip() for email in email_string.split(',') if email.strip()]
+    
+    # Email regex pattern
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+    valid_emails = []
+    for email in emails:
+        if re.match(email_pattern, email):
+            valid_emails.append(email)
+        else:
+            logger.warning(f"Invalid email address found: {email}")
+            return False, []
+    
+    return True, valid_emails
+
+def parse_other_destinaries(other_destinaries: Optional[str]) -> List[str]:
+    """
+    Parse and validate the other_destinaries field.
+    
+    Args:
+        other_destinaries: Comma-separated string of email addresses
+        
+    Returns:
+        List of valid email addresses
+    """
+    if not other_destinaries:
+        return []
+    
+    is_valid, emails = validate_email_addresses(other_destinaries)
+    if not is_valid:
+        raise ValueError("Invalid email addresses in other_destinaries field")
+    
+    return emails

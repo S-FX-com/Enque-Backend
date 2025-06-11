@@ -1,16 +1,18 @@
 from typing import Generator, Optional
+import time
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, noload
 
 from app.core.config import settings
 from app.database.session import get_db
 from app.models.agent import Agent
 from app.models.workspace import Workspace
 from app.schemas.token import TokenPayload
+from app.core.cache import user_cache, create_user_from_cache
 
 # OAuth2 bearer token for authentication
 oauth2_scheme = OAuth2PasswordBearer(
@@ -23,6 +25,7 @@ def get_current_user(
 ) -> Agent:
     """
     Get the current authenticated user from the token
+    Implementa caché para evitar consultas repetitivas durante 5 minutos
     """
     try:
         payload = jwt.decode(
@@ -41,12 +44,34 @@ def get_current_user(
             detail="Invalid token payload",
         )
     
-    user = db.query(Agent).filter(Agent.id == token_data.sub).first()
+    user_id = token_data.sub
+    
+    # INTENTAR OBTENER DESDE CACHÉ PRIMERO
+    cached_user_data = user_cache.get(user_id)
+    if cached_user_data:
+        return create_user_from_cache(cached_user_data)
+    
+    # SI NO ESTÁ EN CACHÉ, CONSULTAR BASE DE DATOS
+    # OPTIMIZACIÓN: Consulta sin relaciones pesadas para mejorar velocidad
+    user = db.query(Agent).filter(Agent.id == user_id).options(
+        noload(Agent.assigned_tasks),
+        noload(Agent.sent_tasks),
+        noload(Agent.teams),
+        noload(Agent.comments),
+        noload(Agent.activities),
+        noload(Agent.created_mailboxes),
+        noload(Agent.microsoft_tokens),
+        noload(Agent.created_canned_replies)
+    ).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
             detail="User not found",
         )
+    
+    # GUARDAR EN CACHÉ PARA PRÓXIMAS SOLICITUDES
+    user_cache.set(user)
+    
     return user
 
 
@@ -102,6 +127,7 @@ def get_current_workspace(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found"
         )
+    
     return workspace
 
 def check_workspace_access(user: Agent, workspace_id: int) -> None:

@@ -327,9 +327,7 @@ async def delete_task(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Delete a task. All roles can delete tasks.
-    """
+   
     task = db.query(Task).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id
@@ -355,9 +353,7 @@ async def read_user_tasks(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Retrieve tasks created by a specific user WITHIN the current user's workspace
-    """
+  
     tasks = db.query(Task).filter(
         Task.user_id == user_id,
         Task.workspace_id == current_user.workspace_id,
@@ -375,9 +371,7 @@ async def read_assigned_tasks(
     status: Optional[str] = Query(None, description="Filter by status (e.g., Open, Closed, Unread)"),
     priority: Optional[str] = Query(None, description="Filter by priority (e.g., Low, Medium, High)"),
 ) -> Any:
-    """
-    Retrieve tasks assigned to a specific agent WITHIN the current user's workspace, with optional filters.
-    """
+    
     query = db.query(Task).options(
         selectinload(Task.user)
     )
@@ -400,10 +394,7 @@ async def read_team_tasks(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Retrieve tasks assigned to a specific team WITHIN the current user's workspace.
-    Includes both direct team assignments and mailbox team assignments.
-    """
+   
     tasks = db.query(Task).filter(
         or_(
             Task.team_id == team_id,
@@ -427,10 +418,7 @@ def get_task_initial_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get initial ticket content from S3 when it's migrated there.
-    Falls back to description or email_body if not in S3.
-    """
+    
     try:
         task = db.query(Task).filter(
             Task.id == task_id,
@@ -520,10 +508,7 @@ def get_ticket_html_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get complete ticket HTML content directly from S3 URLs stored in comments.
-    This is MUCH simpler - just reads the s3_html_url field and fetches from S3.
-    """
+
     try:
         task = db.query(Task).filter(
             Task.id == task_id,
@@ -599,7 +584,7 @@ def get_ticket_html_content(
                 comment_mapping[comment.s3_html_url] = comment
         s3_content_cache = {}
         if s3_urls_needed:
-            logger.info(f"Fetching {len(s3_urls_needed)} S3 contents in parallel for ticket {task_id}")
+            # Fetching S3 contents in parallel
             from concurrent.futures import as_completed
             def fetch_s3_content(s3_url):
                 try:
@@ -625,8 +610,7 @@ def get_ticket_html_content(
                         from app.utils.image_processor import extract_base64_images
                         processed_content, extracted_images = extract_base64_images(content, task.id)
                         content = processed_content
-                        if extracted_images:
-                            logger.info(f"Processed {len(extracted_images)} base64 images in comment {comment.id}")
+                        # Base64 images processed silently
                     except Exception as e:
                         logger.warning(f"Error processing images in comment {comment.id}: {e}")
             if not content:
@@ -674,7 +658,7 @@ def get_ticket_html_content(
                 "attachments": attachments,
                 "created_at": comment.created_at
             })
-        logger.info(f"Successfully retrieved HTML content for ticket {task_id}: {len(html_contents)} items")
+        # Successfully retrieved HTML content
         return {
             "status": "success",
             "ticket_id": task_id,

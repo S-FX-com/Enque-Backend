@@ -49,6 +49,7 @@ import time
 from sqlalchemy import or_, and_, desc
 import re
 from app.utils.image_processor import extract_base64_images  # Importamos nuestra nueva utilidad
+from app.services.token_service import TokenService  # NEW: dedicated auth service
 import boto3  # For S3 file downloads
 
 
@@ -63,6 +64,11 @@ class MicrosoftGraphService:
         self.auth_url = settings.MICROSOFT_AUTH_URL
         self.token_url = settings.MICROSOFT_TOKEN_URL
         self.graph_url = settings.MICROSOFT_GRAPH_URL
+
+        # Instantiate dedicated TokenService
+        self.token_service = TokenService(db, self.integration)
+
+        # Legacy app-token attrs retained for backward-compat (not used anymore)
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
         
@@ -1995,7 +2001,7 @@ class MicrosoftGraphService:
             logger.error(f"Error al procesar HTML para correo electrónico: {str(e)}", exc_info=True)
             return html_content
 
-    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None) -> bool:
+    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None, cc_recipients: List[str] = None) -> bool:
         task = self.db.query(Task).options(joinedload(Task.mailbox_connection), joinedload(Task.user)).filter(Task.id == task_id).first()
         if not task: logger.error(f"Task not found for task_id: {task_id}"); return False
         if not task.mailbox_connection_id or not task.mailbox_connection:
@@ -2335,6 +2341,9 @@ class MicrosoftGraphService:
                         "content": html_body
                     }
                 }
+
+                if cc_recipients:
+                    update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
                 
                 update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
                 response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
@@ -2435,6 +2444,9 @@ class MicrosoftGraphService:
                             "content": html_body
                         }
                     }
+
+                    if cc_recipients:
+                        update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
                     
                     update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
                     response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
