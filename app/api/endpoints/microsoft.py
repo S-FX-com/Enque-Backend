@@ -2,7 +2,7 @@ from typing import Any, List, Optional
 from datetime import datetime, timedelta # Import datetime and timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request # Added Request
 from fastapi.responses import RedirectResponse # Added RedirectResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.api.dependencies import get_db, get_current_active_user
 from app.models.agent import Agent
 from app.core.config import settings # Import settings
@@ -24,6 +24,7 @@ from app.utils.logger import ms_logger as logger
 import urllib.parse
 import base64 # Ensure base64 is imported
 import json # Ensure json is imported
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -53,14 +54,34 @@ def get_connections( # Renamed function
     if not current_agent or not current_agent.workspace_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
-    # Fetch all active connections for the workspace
-    connections = db.query(MailboxConnection).filter(
+    # Fetch all active connections for the workspace with team relationships
+    connections = db.query(MailboxConnection).options(
+        joinedload(MailboxConnection.teams)
+    ).filter(
         MailboxConnection.workspace_id == current_agent.workspace_id,
         MailboxConnection.is_active == True
     ).all()
 
+    # Convert to response format with team_ids
+    result = []
+    for conn in connections:
+        conn_dict = {
+            "id": conn.id,
+            "email": conn.email,
+            "display_name": conn.display_name,
+            "workspace_id": conn.workspace_id,
+            "created_by_agent_id": conn.created_by_agent_id,
+            "is_global": conn.is_global,
+            "is_active": conn.is_active,
+            "created_at": conn.created_at,
+            "updated_at": conn.updated_at,
+            "team_ids": [team.id for team in conn.teams],
+            "teams": [{"id": team.id, "name": team.name, "icon_name": team.icon_name} for team in conn.teams]
+        }
+        result.append(conn_dict)
+
     logger.info(f"Found {len(connections)} active connections for workspace {current_agent.workspace_id}")
-    return connections
+    return result
 
 
 # Updated DELETE endpoint to accept connection_id
@@ -121,6 +142,96 @@ def disconnect_mailbox(
         db.rollback()
         logger.error(f"Error disconnecting mailbox for workspace {workspace_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to disconnect mailbox.")
+
+
+# Add the new schema class before the endpoint
+class ReconnectMailboxRequest(BaseModel):
+    state: Optional[str] = Field(None, description="Base64 encoded state from frontend containing workspace_id, agent_id, and original_hostname")
+
+# New endpoint for reconnecting a mailbox connection
+@router.post("/connection/{connection_id}/reconnect", response_model=dict)
+def reconnect_mailbox(
+    connection_id: int,
+    request_data: ReconnectMailboxRequest,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Reconnect a specific mailbox by initiating a new OAuth flow.
+    This is useful when connection authentication has expired or been revoked.
+    """
+    if not current_agent or not current_agent.workspace_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    
+    workspace_id = current_agent.workspace_id
+    logger.info(f"Attempting to reconnect mailbox connection ID {connection_id} for workspace {workspace_id}")
+    
+    # Find the specific connection by ID and ensure it belongs to the agent's workspace
+    connection = db.query(MailboxConnection).filter(
+        MailboxConnection.id == connection_id,
+        MailboxConnection.workspace_id == workspace_id
+    ).first()
+    
+    if not connection:
+        logger.warning(f"Mailbox connection ID {connection_id} not found or does not belong to workspace {workspace_id}.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox connection not found.")
+    
+    try:
+        # If state was provided in the request, decode it to get original_hostname
+        original_hostname = None
+        if request_data.state:
+            try:
+                # Decode base64 state
+                missing_padding = len(request_data.state) % 4
+                if missing_padding:
+                    padded_state = request_data.state + ('=' * (4 - missing_padding))
+                else:
+                    padded_state = request_data.state
+                
+                decoded_state = base64.urlsafe_b64decode(padded_state).decode('utf-8')
+                state_data = json.loads(decoded_state)
+                original_hostname = state_data.get("original_hostname")
+                logger.info(f"Extracted original_hostname from state: {original_hostname}")
+            except Exception as e:
+                logger.warning(f"Could not decode state parameter: {e}")
+        
+        # Generate state parameter with connection_id included
+        state_data = {
+            "workspace_id": str(workspace_id),
+            "agent_id": str(current_agent.id),
+            "connection_id": str(connection_id),
+            "is_reconnect": "true",
+            "original_hostname": original_hostname
+        }
+        
+        # Encode state data
+        state_json_string = json.dumps(state_data)
+        base64_state = base64.urlsafe_b64encode(state_json_string.encode()).decode('utf-8')
+        # Remove padding characters
+        base64_state = base64_state.replace('+', '-').replace('/', '_').rstrip('=')
+        
+        logger.info(f"Generated reconnect state for Microsoft auth: {base64_state}")
+        
+        microsoft_service = MicrosoftGraphService(db)
+        # Use explicit redirect URI and scopes for email sync
+        email_sync_redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
+        email_sync_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
+        
+        # Get the authorization URL with the state
+        auth_url = microsoft_service.get_auth_url(
+            redirect_uri=email_sync_redirect_uri,
+            scopes=email_sync_scopes,
+            state=base64_state,
+            prompt="consent"  # Force consent prompt to get fresh tokens
+        )
+        
+        return {"auth_url": auth_url}
+    except Exception as e:
+        logger.error(f"Error generating reconnection URL for mailbox {connection_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate reconnection URL: {str(e)}"
+        )
 
 
 # Removed the old get_connection_status endpoint
@@ -476,4 +587,89 @@ def get_admin_consent_url(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
+        )
+
+
+@router.put("/connection/{connection_id}", response_model=MailboxConnectionSchema)
+def update_mailbox_connection(
+    connection_id: int,
+    connection_update: MailboxConnectionUpdate,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Update a mailbox connection, including team assignments and global visibility.
+    """
+    if not current_agent or not current_agent.workspace_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+    # Find the connection
+    connection = db.query(MailboxConnection).options(
+        joinedload(MailboxConnection.teams)
+    ).filter(
+        MailboxConnection.id == connection_id,
+        MailboxConnection.workspace_id == current_agent.workspace_id
+    ).first()
+
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Mailbox connection not found"
+        )
+
+    try:
+        # Update basic fields
+        update_data = connection_update.dict(exclude_unset=True, exclude={'team_ids'})
+        
+        for field, value in update_data.items():
+            setattr(connection, field, value)
+
+        # Handle team assignments if provided
+        if connection_update.team_ids is not None:
+            # Clear existing team assignments
+            connection.teams.clear()
+            
+            # Add new team assignments (only if not global)
+            if not connection_update.is_global and connection_update.team_ids:
+                from app.models.team import Team
+                teams = db.query(Team).filter(
+                    Team.id.in_(connection_update.team_ids),
+                    Team.workspace_id == current_agent.workspace_id
+                ).all()
+                
+                if len(teams) != len(connection_update.team_ids):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="One or more team IDs are invalid"
+                    )
+                
+                connection.teams.extend(teams)
+
+        db.commit()
+        db.refresh(connection)
+        
+        # Prepare response
+        result = {
+            "id": connection.id,
+            "email": connection.email,
+            "display_name": connection.display_name,
+            "workspace_id": connection.workspace_id,
+            "created_by_agent_id": connection.created_by_agent_id,
+            "is_global": connection.is_global,
+            "is_active": connection.is_active,
+            "created_at": connection.created_at,
+            "updated_at": connection.updated_at,
+            "team_ids": [team.id for team in connection.teams],
+            "teams": [{"id": team.id, "name": team.name, "icon_name": team.icon_name} for team in connection.teams]
+        }
+        
+        logger.info(f"Updated mailbox connection {connection_id}: global={connection.is_global}, teams={[t.id for t in connection.teams]}")
+        return result
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating mailbox connection {connection_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update mailbox connection"
         )

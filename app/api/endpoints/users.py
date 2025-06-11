@@ -3,6 +3,7 @@ from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.api.dependencies import get_current_active_user, get_current_workspace
 from app.database.session import get_db
@@ -53,46 +54,73 @@ async def create_user(
         )
 
     # Treat company_id=0 as None/null
-    company_id = user_in.company_id if user_in.company_id != 0 else None
+    company_id_from_input = user_in.company_id if user_in.company_id != 0 else None
 
-    # Validate company_id if provided
-    if company_id is not None:
+    # Validate company_id if provided directly
+    if company_id_from_input is not None:
         company = db.query(Company).filter(
-            Company.id == company_id,
+            Company.id == company_id_from_input,
             Company.workspace_id == current_workspace.id
         ).first()
         if not company:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Company with ID {company_id} does not exist in this workspace",
+                detail=f"Company with ID {company_id_from_input} does not exist in this workspace",
             )
 
     # Create new user with the current workspace
-    user_data = user_in.dict(exclude={'company_id'}) # Exclude potentially modified company_id
+    user_data = user_in.dict(exclude={'company_id'}) 
     user_data["workspace_id"] = current_workspace.id
-    user_data["company_id"] = company_id # Use the processed company_id
+    user_data["company_id"] = company_id_from_input # Use the processed company_id from input
+    
     user = User(**user_data)
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    # If user has no company, add to unassigned_users for this workspace
+    # Attempt automatic company assignment if company_id is still None
+    if user.company_id is None and user.email:
+        user_email_domain = user.email.split('@')[-1].lower() if '@' in user.email else None
+        if user_email_domain:
+            print(f"Attempting to auto-assign user {user.email} with domain {user_email_domain}")
+            # Search for company with matching email_domain (case-insensitive)
+            # Ensure email_domain in DB is also compared in lowercase if it's not guaranteed
+            company_to_assign = db.query(Company).filter(
+                Company.workspace_id == current_workspace.id,
+                func.lower(Company.email_domain) == user_email_domain 
+            ).first() # Consider what to do if multiple companies have the same domain
+
+            if company_to_assign:
+                print(f"Found matching company: {company_to_assign.name} (ID: {company_to_assign.id}) for domain {user_email_domain}")
+                user.company_id = company_to_assign.id
+                db.add(user) # Re-add to session if needed, or let commit handle it
+                db.commit()
+                db.refresh(user)
+                print(f"User {user.email} automatically assigned to company {company_to_assign.name}")
+            else:
+                print(f"No matching company found for domain {user_email_domain}")
+
+    # If user has no company (either initially or after auto-assign attempt failed), 
+    # add to unassigned_users for this workspace
     if user.company_id is None:
         # Check if already exists in unassigned_users for this workspace
-        unassigned_user = db.query(UnassignedUser).filter(
+        unassigned_user_entry_exists = db.query(UnassignedUser).filter(
             UnassignedUser.email == user.email,
-            UnassignedUser.workspace_id == current_workspace.id # Check workspace
+            UnassignedUser.workspace_id == current_workspace.id
         ).first()
-        if not unassigned_user:
-            unassigned_user_entry = UnassignedUser(
+        if not unassigned_user_entry_exists:
+            unassigned_user_data = UnassignedUser(
                 name=user.name,
                 email=user.email,
                 phone=user.phone,
-                workspace_id=current_workspace.id # Assign workspace_id
+                workspace_id=current_workspace.id
             )
-            db.add(unassigned_user_entry)
-            db.commit()
-
+            db.add(unassigned_user_data)
+            db.commit() # Commit the unassigned_user_data entry
+            print(f"User {user.email} added to unassigned users list.")
+        else:
+            print(f"User {user.email} already in unassigned users list or has a company.")
+    
     return user
 
 

@@ -2,17 +2,27 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func 
+from sqlalchemy.exc import IntegrityError  # Añadimos la importación para el manejo del error
 
 from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
 from app.database.session import get_db
+import secrets 
+from datetime import datetime, timedelta 
+from typing import Dict 
+from typing import Dict 
 from app.models.agent import Agent
 from app.models.team import Team, TeamMember
-from app.models.task import Task 
+from app.models.task import Task
 from app.models.workspace import Workspace
-from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate
+from app.models.microsoft import MailboxConnection, MicrosoftToken # Import MailboxConnection and MicrosoftToken
+from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate, AgentInviteCreate, AgentAcceptInvitation 
 from app.schemas.team import Team as TeamSchema
-from app.core.security import get_password_hash
-from app.utils.logger import logger 
+from app.schemas.token import Token 
+from app.core.security import get_password_hash, create_access_token 
+from app.utils.logger import logger
+from app.core.config import settings 
+from app.services.email_service import send_agent_invitation_email
+from app.services.microsoft_service import MicrosoftGraphService 
 
 router = APIRouter()
 
@@ -100,11 +110,11 @@ async def update_agent(
     agent_id: int,
     agent_in: AgentUpdate,
     db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_admin),
+    current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
-    Update an agent (admin only)
+    Update an agent. Users can update their own profiles, admins can update any profile.
     """
     agent = db.query(Agent).filter(
         Agent.id == agent_id,
@@ -116,14 +126,35 @@ async def update_agent(
             detail="Agent not found",
         )
 
+    # Check permissions: users can only update their own profile, admins can update any
+    if current_user.role != "admin" and current_user.id != agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions to update this agent profile",
+        )
+
     update_data = agent_in.dict(exclude_unset=True)
 
+    # If user is not admin and trying to update someone else's profile (already caught above)
+    # or trying to change sensitive fields, restrict it
+    if current_user.role != "admin" and current_user.id == agent_id:
+        # Non-admin users can only update certain fields on their own profile
+        restricted_fields = ["role", "is_active", "workspace_id"]
+        for field in restricted_fields:
+            if field in update_data:
+                # For role specifically, allow if it's the same as current role (no change)
+                if field == "role" and update_data[field] == agent.role:
+                    continue
+                # Otherwise, remove the restricted field
+                del update_data[field]
+
+    # Hash password if it's being updated
     if "password" in update_data and update_data["password"]:
         update_data["password"] = get_password_hash(update_data["password"])
     elif "password" in update_data:
          del update_data["password"]
 
-
+    # Apply updates
     for field, value in update_data.items():
         setattr(agent, field, value)
 
@@ -162,6 +193,212 @@ async def delete_agent(
     db.commit()
 
     return agent
+
+
+@router.post("/invite", response_model=AgentSchema) # Or a different response model like a status message
+async def invite_agent(
+    agent_invite_in: AgentInviteCreate,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_admin), # Ensure only admins can invite
+    current_workspace: Workspace = Depends(get_current_workspace), # Get current workspace from dependency
+):
+    """
+    Invite a new agent to the current workspace.
+    Creates an inactive agent record and sends an invitation email using any active mailbox in the workspace.
+    """
+    if agent_invite_in.workspace_id != current_workspace.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workspace ID in request does not match current admin's workspace."
+        )
+    
+    # Primero verificamos si el agente ya existe en este workspace
+    existing_agent_in_workspace = db.query(Agent).filter(
+        Agent.email == agent_invite_in.email,
+        Agent.workspace_id == agent_invite_in.workspace_id
+    ).first()
+    
+    if existing_agent_in_workspace:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agent with email {agent_invite_in.email} already exists in this workspace.",
+        )
+
+    # Luego verificamos si el agente existe en cualquier otro workspace
+    existing_agent = db.query(Agent).filter(
+        Agent.email == agent_invite_in.email
+    ).first()
+
+    invitation_token = secrets.token_urlsafe(32)
+    token_expires_at = datetime.utcnow() + timedelta(hours=settings.AGENT_INVITATION_TOKEN_EXPIRE_HOURS)
+    
+    # Si el agente ya existe en otro workspace, creamos uno nuevo solo para este workspace
+    # pero mantenemos la referencia al mismo email
+    if existing_agent:
+        logger.info(f"Agent with email {agent_invite_in.email} already exists in another workspace. Creating a new record for current workspace.")
+        
+    # Creamos el nuevo agente para este workspace
+    new_agent_data = AgentCreate(
+        name=agent_invite_in.name,
+        email=agent_invite_in.email,
+        role=agent_invite_in.role,
+        workspace_id=agent_invite_in.workspace_id,
+        is_active=False, 
+        password=None, 
+        invitation_token=invitation_token,
+        invitation_token_expires_at=token_expires_at,
+    )
+    
+    db_agent = Agent(**new_agent_data.dict()) 
+
+    try:
+        db.add(db_agent)
+        db.commit()
+        db.refresh(db_agent)
+    except IntegrityError as e:
+        db.rollback()
+        logger.error(f"IntegrityError while inviting agent {agent_invite_in.email}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Database error: {str(e)}. The agent may already exist in this workspace."
+        )
+    
+    invitation_link = f"https://{current_workspace.subdomain}.enque.cc/accept-invitation?token={invitation_token}"
+
+    admin_mailbox_connection = db.query(MailboxConnection).filter(
+        MailboxConnection.created_by_agent_id == current_user.id,
+        MailboxConnection.workspace_id == current_workspace.id,
+        MailboxConnection.is_active == True
+    ).first()
+
+    if not admin_mailbox_connection:
+        logger.info(f"Admin {current_user.email} has no active mailbox. Looking for any active mailbox in workspace {current_workspace.id}.")
+        admin_agents = db.query(Agent.id).filter(
+            Agent.workspace_id == current_workspace.id,
+            Agent.role == "admin",
+            Agent.is_active == True
+        ).all()
+        admin_ids = [admin.id for admin in admin_agents]
+        
+        admin_mailbox_connection = db.query(MailboxConnection).filter(
+            MailboxConnection.created_by_agent_id.in_(admin_ids),
+            MailboxConnection.workspace_id == current_workspace.id,
+            MailboxConnection.is_active == True
+        ).first()
+        
+        # If still no mailbox found, try any active mailbox in the workspace
+        if not admin_mailbox_connection:
+            admin_mailbox_connection = db.query(MailboxConnection).filter(
+        MailboxConnection.workspace_id == current_workspace.id,
+        MailboxConnection.is_active == True
+    ).first()
+
+    if not admin_mailbox_connection:
+        logger.error(f"No active mailbox connection found in workspace {current_workspace.id} to send invitation from.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active mailbox found in this workspace. Please connect a mailbox to send invitations."
+        )
+    ms_token = db.query(MicrosoftToken).filter(
+        MicrosoftToken.mailbox_connection_id == admin_mailbox_connection.id
+    ).order_by(MicrosoftToken.created_at.desc()).first()
+
+    if not ms_token:
+        logger.error(f"No Microsoft token found for mailbox {admin_mailbox_connection.email} (ID: {admin_mailbox_connection.id}).")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No token found for the connected mailbox {admin_mailbox_connection.email}. Please re-authenticate."
+        )
+    graph_service = MicrosoftGraphService(db=db)
+    if ms_token.expires_at < datetime.utcnow():
+        try:
+            logger.info(f"Token for {admin_mailbox_connection.email} expired, attempting refresh.")
+            ms_token = graph_service.refresh_token(ms_token)
+        except HTTPException as e:
+            logger.error(f"Failed to refresh token for {admin_mailbox_connection.email}: {e.detail}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not refresh token for mailbox {admin_mailbox_connection.email}. Please re-authenticate. Error: {e.detail}"
+            )
+
+    email_sent = await send_agent_invitation_email(
+        db=db,
+        to_email=db_agent.email,
+        agent_name=db_agent.name,
+        invitation_link=invitation_link,
+        sender_mailbox_email=admin_mailbox_connection.email,
+        user_access_token=ms_token.access_token,
+        workspace_name=current_workspace.subdomain
+    )
+
+    if not email_sent:
+        logger.error(f"Failed to send invitation email to {db_agent.email} from {admin_mailbox_connection.email} for agent ID {db_agent.id}. Agent created but invitation not sent.")
+    
+    logger.info(f"Agent {db_agent.name} ({db_agent.email}) invited to workspace {current_workspace.subdomain} by {current_user.email}. Invitation sent from {admin_mailbox_connection.email}. Token: {invitation_token}")
+    
+    # The AgentSchema by default might try to hide invitation_token.
+    # If you need to return it (e.g., for testing), ensure the schema allows it or use a different one.
+    return db_agent
+
+
+@router.post("/accept-invitation", response_model=Token) # Responds with a JWT token upon successful activation
+async def accept_agent_invitation(
+    invitation_data: AgentAcceptInvitation,
+    db: Session = Depends(get_db),
+):
+    """
+    Allows an agent to accept an invitation, set their password, and activate their account.
+    """
+    agent = db.query(Agent).filter(Agent.invitation_token == invitation_data.token).first()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired invitation token.",
+        )
+    
+    if agent.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account is already active.",
+        )
+
+    if agent.invitation_token_expires_at and agent.invitation_token_expires_at < datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invitation token has expired.",
+        )
+    agent.password = get_password_hash(invitation_data.password)
+    agent.is_active = True
+    agent.invitation_token = None 
+    agent.invitation_token_expires_at = None 
+    
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    logger.info(f"Agent {agent.email} (ID: {agent.id}) accepted invitation and activated account.")
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_payload = {
+        "role": agent.role,
+        "workspace_id": str(agent.workspace_id),
+        "name": agent.name, 
+        "email": agent.email 
+    }
+    access_token = create_access_token(
+        subject=str(agent.id),  
+        extra_data=token_payload, 
+        expires_delta=access_token_expires
+    )
+    
+    # Get workspace information to include subdomain in response
+    workspace = db.query(Workspace).filter(Workspace.id == agent.workspace_id).first()
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "workspace_subdomain": workspace.subdomain if workspace else None
+    }
 
 
 @router.get("/{agent_id}/teams", response_model=List[TeamSchema])

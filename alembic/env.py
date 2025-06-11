@@ -10,9 +10,18 @@ from sqlalchemy import create_engine
 from alembic import context
 
 # Import all models to ensure they're registered with SQLAlchemy metadata
-from app.models import Agent, Team, TeamMember, Company, User, UnassignedUser, Task, Comment, Activity
+from app.models import (
+    Agent, Team, TeamMember, Company, User, UnassignedUser, Task,
+    Comment, Activity, CannedReply, Workspace, MicrosoftIntegration,
+    MicrosoftToken, EmailTicketMapping, EmailSyncConfig, TicketAttachment,
+    GlobalSignature, NotificationTemplate, NotificationSetting,
+    Workflow, Automation, AutomationCondition, AutomationAction
+)
 from app.database.session import engine
 from app.core.config import settings
+
+# Import the single shared Base
+from app.database.base_class import Base
 
 # Configure logger
 logger = logging.getLogger("alembic")
@@ -26,26 +35,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-from app.models.agent import Base as AgentBase
-from app.models.team import Base as TeamBase
-from app.models.task import Base as TaskBase
-from app.models.company import Base as CompanyBase
-from app.models.user import Base as UserBase
-from app.models.comment import Base as CommentBase
-from app.models.activity import Base as ActivityBase
-
-# target_metadata = None
-target_metadata = [
-    AgentBase.metadata,
-    TeamBase.metadata,
-    TaskBase.metadata,
-    CompanyBase.metadata,
-    UserBase.metadata,
-    CommentBase.metadata,
-    ActivityBase.metadata
-]
+# Use a single metadata object
+target_metadata = Base.metadata
 
 
 def get_working_engine():
@@ -59,7 +50,7 @@ def get_working_engine():
             return connectable
     except Exception as e:
         logger.error(f"Error connecting with DATABASE_URI: {str(e)}")
-    
+
     # Try with Railway's MYSQL_URL directly
     try:
         mysql_url = os.getenv("MYSQL_URL")
@@ -71,7 +62,7 @@ def get_working_engine():
                 return direct_engine
     except Exception as e:
         logger.error(f"Error connecting with MYSQL_URL: {str(e)}")
-    
+
     # Try with external host
     try:
         host = os.getenv("MYSQLHOST", "hopper.proxy.rlwy.net")
@@ -79,7 +70,7 @@ def get_working_engine():
         user = os.getenv("MYSQLUSER", "root")
         password = os.getenv("MYSQLPASSWORD", "")
         database = os.getenv("MYSQL_DATABASE", "railway")
-        
+
         ext_url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
         logger.info(f"Trying connection with external host: {host}")
         ext_engine = create_engine(ext_url)
@@ -88,7 +79,7 @@ def get_working_engine():
             return ext_engine
     except Exception as e:
         logger.error(f"Error connecting with external host: {str(e)}")
-    
+
     # Wait a moment and try again with the first option
     logger.info("Waiting 5 seconds before trying again...")
     time.sleep(5)
@@ -140,4 +131,4 @@ def run_migrations_online() -> None:
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online() 
+    run_migrations_online()

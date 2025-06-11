@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, func, Boolean
+from sqlalchemy import Column, Integer, String
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.sql.sqltypes import TIMESTAMP
@@ -9,11 +9,7 @@ class Workspace(Base):
     __tablename__ = "workspaces"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    subdomain = Column(String, nullable=False, unique=True, index=True)
-    description = Column(Text, nullable=True)
-    email_domain = Column(String(255), nullable=False)
-    logo_url = Column(String(1024), nullable=True)
+    subdomain = Column(String(255), nullable=False, unique=True, index=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(
         TIMESTAMP(timezone=True),
@@ -31,6 +27,11 @@ class Workspace(Base):
     comments = relationship("Comment", back_populates="workspace")
     activities = relationship("Activity", back_populates="workspace")
     mailbox_connections = relationship("MailboxConnection", back_populates="workspace")
+    global_signature = relationship("GlobalSignature", back_populates="workspace", uselist=False, cascade="all, delete-orphan")
+    notification_templates = relationship("NotificationTemplate", back_populates="workspace", cascade="all, delete-orphan")
+    notification_settings = relationship("NotificationSetting", back_populates="workspace", cascade="all, delete-orphan")
+    workflows = relationship("Workflow", back_populates="workspace", cascade="all, delete-orphan")
+    canned_replies = relationship("CannedReply", back_populates="workspace", cascade="all, delete-orphan")
 
     def __repr__(self):
-        return f"<Workspace {self.name}>" 
+        return f"<Workspace {self.subdomain}>" 

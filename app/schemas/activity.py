@@ -7,7 +7,7 @@ WorkspaceRef = ForwardRef("Workspace")
 AgentRef = ForwardRef("Agent")
 
 # Activity source types
-ActivitySourceType = Literal["Workspace", "Ticket", "Team", "Company", "User"]
+ActivitySourceType = Literal["Workspace", "Ticket", "Team", "Company", "User", "Comment"]
 
 class ActivityBase(BaseModel):
     action: str

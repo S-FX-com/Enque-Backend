@@ -1,8 +1,10 @@
-# backend/app/services/utils.py
 from sqlalchemy.orm import Session
-from typing import Optional # Import Optional
+from typing import Optional 
 from app.models.user import User, UnassignedUser
-from app.models.workspace import Workspace # Import Workspace if needed for type hint
+from app.models.workspace import Workspace 
+from app.models.company import Company 
+from sqlalchemy import func 
+from sqlalchemy.exc import IntegrityError 
 
 
 def get_or_create_user(db: Session, email: str, name: Optional[str] = None, workspace_id: Optional[int] = None) -> Optional[User]:
@@ -19,74 +21,105 @@ def get_or_create_user(db: Session, email: str, name: Optional[str] = None, work
     Returns:
         User object or None if creation failed due to missing workspace_id.
     """
-    # Try to find user by email within the specific workspace
-    # Note: This assumes email is unique *within* a workspace for Users.
-    # If email should be globally unique, adjust the filter.
     user_query = db.query(User).filter(User.email == email)
     if workspace_id:
         user_query = user_query.filter(User.workspace_id == workspace_id)
     user = user_query.first()
 
     if user:
-        # Ensure the found user belongs to the correct workspace if workspace_id was provided
         if workspace_id and user.workspace_id != workspace_id:
-             # This case should ideally not happen if email is unique per workspace,
-             # but handle defensively. Could indicate data inconsistency.
-             print(f"Warning: Found user {email} but belongs to workspace {user.workspace_id}, expected {workspace_id}")
-             return None # Or raise an error?
+            print(f"Warning: Found user {email} but belongs to workspace {user.workspace_id}, expected {workspace_id}")
+            return None 
         return user
-
-    # --- Create new user if not found ---
-    # Workspace ID is required for creation
+    
     if not workspace_id:
         print(f"Error: workspace_id is required to create a new user for email {email}")
-        return None # Cannot create user without workspace context
+        return None 
 
-    if not name:
-        # Use part of email as name if not provided
-        name = email.split('@')[0]
-
-    # Create user with workspace_id (company_id will be None initially)
-    user = User(
-        name=name,
-        email=email,
-        workspace_id=workspace_id, # Assign workspace_id
-        company_id=None # Explicitly set company_id to None
-    )
-
-    db.add(user)
-    # It's better to commit after potentially adding to unassigned_users as well
-    # db.commit()
-    # db.refresh(user)
-
-    # If the user has no company (which is always true for newly created users here),
-    # add to unassigned_users for this workspace
-    if user.company_id is None:
-        # Check if already exists in unassigned_users for this workspace
-        unassigned_user = db.query(UnassignedUser).filter(
-            UnassignedUser.email == email,
-            UnassignedUser.workspace_id == workspace_id # Filter by workspace
-        ).first()
-        if not unassigned_user:
-            unassigned_user_entry = UnassignedUser(
-                name=name,
-                email=email,
-                workspace_id=workspace_id # Assign workspace_id
-                # phone is not available here unless passed in
-            )
-            db.add(unassigned_user_entry)
-
-    # Commit both User and potentially UnassignedUser
     try:
+        if not name:
+            name = email.split('@')[0]
+        new_user_obj = User(
+            name=name,
+            email=email,
+            workspace_id=workspace_id, 
+            company_id=None 
+        )
+
+        user_email_domain = email.split('@')[-1].lower() if '@' in email else None
+        if user_email_domain and workspace_id:
+            company_to_assign = db.query(Company).filter(
+                Company.workspace_id == workspace_id,
+                func.lower(Company.email_domain) == user_email_domain
+            ).first()
+
+            if company_to_assign:
+                new_user_obj.company_id = company_to_assign.id
+
+        db.add(new_user_obj)
+
+        # Handle unassigned_users with proper duplicate checking
+        if new_user_obj.company_id is None:
+            unassigned_user_exists = db.query(UnassignedUser).filter(
+                UnassignedUser.email == email,
+                UnassignedUser.workspace_id == workspace_id 
+            ).first()
+            if not unassigned_user_exists:
+                unassigned_user_entry = UnassignedUser(
+                    name=name,
+                    email=email,
+                    workspace_id=workspace_id 
+                )
+                db.add(unassigned_user_entry)
+
+        # Single commit for both user and unassigned_user
         db.commit()
-        db.refresh(user) # Refresh after commit to get ID etc.
-        # Refresh unassigned_user_entry if needed
-        # if 'unassigned_user_entry' in locals(): db.refresh(unassigned_user_entry)
+        db.refresh(new_user_obj) 
+        return new_user_obj
+
+    except IntegrityError as e:
+        db.rollback()
+        if e.orig and hasattr(e.orig, 'args') and isinstance(e.orig.args, tuple) and len(e.orig.args) > 0:
+            error_code = e.orig.args[0]
+            error_message = str(e.orig.args[1]) if len(e.orig.args) > 1 else ""
+
+            if error_code == 1062:
+                # Handle both users and unassigned_users duplicates
+                if ('users.ix_users_email' in error_message or 'ix_users_email' in error_message):
+                    print(f"Race condition handled: User {email} likely created by another process. Re-fetching.")
+                    existing_user = user_query.first()
+                    if existing_user:
+                        return existing_user
+                    else:
+                        print(f"Error: User {email} insert failed (duplicate), but not found on re-fetch.")
+                        return None
+                elif 'unassigned_users.ix_unassigned_users_email' in error_message:
+                    print(f"UnassignedUser {email} already exists, retrying user creation without unassigned_user")
+                    # Retry creating just the user without the unassigned_user entry
+                    try:
+                        db.add(new_user_obj)
+                        db.commit()
+                        db.refresh(new_user_obj)
+                        print(f"Successfully created user {email} (unassigned_user already existed)")
+                        return new_user_obj
+                    except Exception as retry_error:
+                        db.rollback()
+                        print(f"Retry failed for user {email}: {retry_error}")
+                        # Try to get existing user as fallback
+                        existing_user = user_query.first()
+                        return existing_user
+                else:
+                    print(f"Unhandled IntegrityError during user creation for {email}: {e}")
+                    raise 
+            else:
+                print(f"Non-duplicate IntegrityError for {email}: {e}")
+                raise 
+        else:
+            print(f"Unexpected IntegrityError structure for {email}: {e}")
+            raise
+
     except Exception as e:
         db.rollback()
-        print(f"Error committing new user/unassigned user for {email}: {e}")
-        return None # Return None on commit error
+        print(f"Generic error committing new user/unassigned user for {email}: {e}")
+        return None
 
-    return user
-
-# Removed the duplicated original function definition

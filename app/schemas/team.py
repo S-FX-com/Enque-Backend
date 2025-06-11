@@ -9,6 +9,8 @@ class TeamBase(BaseModel):
     name: str
     description: Optional[str] = None
     logo_url: Optional[str] = None
+    icon_name: Optional[str] = None
+    manager_id: Optional[int] = None
 
 class TeamCreate(TeamBase):
     workspace_id: int
@@ -17,6 +19,8 @@ class TeamUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     logo_url: Optional[str] = None
+    icon_name: Optional[str] = None
+    manager_id: Optional[int] = None
 
 class TeamInDBBase(TeamBase):
     id: int
