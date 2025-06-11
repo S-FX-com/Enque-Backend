@@ -2,69 +2,130 @@ import logging
 import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from typing import Dict
 
-# Create logs directory if it doesn't exist
-logs_dir = Path("logs")
-logs_dir.mkdir(exist_ok=True)
 
-# Configure logger
-logger = logging.getLogger("enque")
-logger.setLevel(logging.DEBUG) # Changed level to DEBUG to allow debug messages through
+class LogManager:
+    """
+    Centralised, reusable logging factory.
 
-# Format for logs - Simplified format for logs
-log_format = logging.Formatter(
-    "%(levelname)s - %(message)s"
-)
+    It guarantees that:
+    • All loggers share consistent console/file formatting.
+    • Handlers are created only once (avoids duplicated log entries).
+    • Consumers can simply call LogManager.get_logger(name).
 
-# Console handler - Temporarily set to DEBUG to see detailed logs
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(log_format)
-console_handler.setLevel(logging.DEBUG)  # Temporarily changed to DEBUG
-logger.addHandler(console_handler)
+    Back-compatibility: the module still exposes `logger`, `ms_logger`,
+    `important_logger`, and `log_important` so existing imports continue to work.
+    """
 
-# File handler - We keep the complete format for log files
-file_format = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+    _initialized: bool = False
+    _loggers: Dict[str, logging.Logger] = {}
 
-file_handler = RotatingFileHandler(
-    logs_dir / "enque.log",
-    maxBytes=10485760,  # 10MB
-    backupCount=10
-)
-file_handler.setFormatter(file_format)
-logger.addHandler(file_handler)
+    # ------------------------------------------------------------------ #
+    # Paths & formats
+    # ------------------------------------------------------------------ #
+    LOG_DIR = Path("logs")
+    LOG_DIR.mkdir(exist_ok=True)
 
-# Create specific logger for Microsoft integration
-ms_logger = logging.getLogger("enque.microsoft")
-ms_logger.setLevel(logging.INFO)
+    CONSOLE_FMT = "%(levelname)s - %(message)s"
+    FILE_FMT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-# File handler for Microsoft integration
-ms_file_handler = RotatingFileHandler(
-    logs_dir / "microsoft.log",
-    maxBytes=10485760,  # 10MB
-    backupCount=5
-)
-ms_file_handler.setFormatter(file_format)
-ms_logger.addHandler(ms_file_handler)
+    # Cached default handlers (created on first initialisation)
+    _default_handlers: list[logging.Handler] = []
 
-# Also log to console - Temporarily set to DEBUG
-ms_console_handler = logging.StreamHandler(sys.stdout)
-ms_console_handler.setFormatter(log_format)
-ms_console_handler.setLevel(logging.DEBUG)  # Temporarily changed to DEBUG
-ms_logger.addHandler(ms_console_handler)
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _create_handler(
+        cls,
+        *,
+        to_console: bool,
+        level: int,
+        filename: str | None = None,
+    ) -> logging.Handler:
+        """Factory for console/file handlers with unified formatting."""
+        fmt = logging.Formatter(cls.CONSOLE_FMT if to_console else cls.FILE_FMT)
 
-# Special handler for important INFO events that should still be shown in console
-important_console_handler = logging.StreamHandler(sys.stdout)
-important_console_handler.setFormatter(logging.Formatter("IMPORTANT - %(message)s"))
-important_console_handler.setLevel(logging.INFO)
+        if to_console:
+            handler: logging.Handler = logging.StreamHandler(sys.stdout)
+        else:
+            path = cls.LOG_DIR / filename  # type: ignore[arg-type]
+            handler = RotatingFileHandler(
+                path,
+                maxBytes=10_485_760,  # 10 MB
+                backupCount=10,
+            )
 
-# Create a special logger for important events
-important_logger = logging.getLogger("enque.important")
-important_logger.setLevel(logging.INFO)
-important_logger.addHandler(important_console_handler)
-important_logger.addHandler(file_handler)  # Also log to main log file
+        handler.setFormatter(fmt)
+        handler.setLevel(level)
+        return handler
+
+    @classmethod
+    def _initialise_defaults(cls) -> None:
+        """Create base handlers once for the whole application."""
+        if cls._initialized:
+            return
+
+        # Console handler (DEBUG to aid development)
+        console_debug = cls._create_handler(to_console=True, level=logging.DEBUG)
+
+        # File handler for whole application
+        file_handler = cls._create_handler(
+            to_console=False, level=logging.DEBUG, filename="enque.log"
+        )
+
+        cls._default_handlers = [console_debug, file_handler]
+        cls._initialized = True
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def get_logger(cls, name: str, level: int = logging.INFO) -> logging.Logger:
+        """Return a configured logger (creates it if not existing)."""
+        cls._initialise_defaults()
+
+        if name not in cls._loggers:
+            logger = logging.getLogger(name)
+            logger.setLevel(level)
+
+            # Attach default handlers only once
+            if not logger.handlers:
+                for handler in cls._default_handlers:
+                    logger.addHandler(handler)
+
+            cls._loggers[name] = logger
+
+        return cls._loggers[name]
+
+    @classmethod
+    def set_level(cls, level: int, *logger_names: str) -> None:
+        """Convenience method to adjust level at runtime for multiple loggers."""
+        for name in logger_names:
+            cls.get_logger(name).setLevel(level)
+
+
+# ---------------------------------------------------------------------- #
+# Pre-configured loggers (backwards-compatible exports)
+# ---------------------------------------------------------------------- #
+logger = LogManager.get_logger("enque", level=logging.DEBUG)
+ms_logger = LogManager.get_logger("enque.microsoft", level=logging.INFO)
+important_logger = LogManager.get_logger("enque.important", level=logging.INFO)
+
+# Additional handler for "important" messages with distinct prefix
+_important_console = LogManager._create_handler(to_console=True, level=logging.INFO)
+_important_console.setFormatter(logging.Formatter("IMPORTANT - %(message)s"))
+
+if not any(
+    isinstance(h, logging.StreamHandler)
+    and getattr(h, "formatter", None)
+    and h.formatter._fmt.startswith("IMPORTANT")
+    for h in important_logger.handlers
+):
+    important_logger.addHandler(_important_console)
+
 
 def log_important(message: str) -> None:
-    """Log important events that should be visible in console even at INFO level"""
+    """Log important events that should be visible in console even at INFO level."""
     important_logger.info(message)

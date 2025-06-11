@@ -49,6 +49,7 @@ import time
 from sqlalchemy import or_, and_, desc
 import re
 from app.utils.image_processor import extract_base64_images  # Importamos nuestra nueva utilidad
+from app.services.token_service import TokenService  # NEW: dedicated auth service
 import boto3  # For S3 file downloads
 
 
@@ -63,6 +64,11 @@ class MicrosoftGraphService:
         self.auth_url = settings.MICROSOFT_AUTH_URL
         self.token_url = settings.MICROSOFT_TOKEN_URL
         self.graph_url = settings.MICROSOFT_GRAPH_URL
+
+        # Instantiate dedicated TokenService
+        self.token_service = TokenService(db, self.integration)
+
+        # Legacy app-token attrs retained for backward-compat (not used anymore)
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
         
