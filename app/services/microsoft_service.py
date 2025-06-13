@@ -1822,6 +1822,10 @@ class MicrosoftGraphService:
         Esto es crítico para mantener la consistencia después de mover emails a carpetas.
         Incluye manejo robusto de duplicados y condiciones de carrera.
         """
+        if not old_email_id or not new_email_id:
+            logger.warning(f"Invalid email IDs provided: old='{old_email_id}', new='{new_email_id}'")
+            return False
+            
         try:
             # Verificar que el nuevo ID no sea demasiado largo
             if len(new_email_id) > 255:
@@ -1830,82 +1834,112 @@ class MicrosoftGraphService:
             
             # Si el ID no cambió, no hay nada que hacer
             if old_email_id == new_email_id:
+                logger.debug(f"Email ID unchanged for ticket {ticket_id}. No update needed.")
                 return True
             
-            # Buscar todos los mappings para este ticket con el email ID viejo
-            mappings_to_update = self.db.query(EmailTicketMapping).filter(
-                EmailTicketMapping.ticket_id == ticket_id,
-                EmailTicketMapping.email_id == old_email_id
-            ).all()
+            logger.info(f"🔄 Updating email mappings for ticket {ticket_id}: {old_email_id[:50]}... → {new_email_id[:50]}...")
             
-            if not mappings_to_update:
-                logger.debug(f"No mappings found to update for ticket {ticket_id} with old email ID {old_email_id[:50]}...")
-                return False
+            # 🔧 ESTRATEGIA COMPLETAMENTE NUEVA: Crear nuevo mapping y eliminar el viejo
+            # Esto evita conflictos de transacciones y duplicados
             
-            # 🔧 VERIFICACIÓN MEJORADA: Buscar mapping existente con nuevo ID
-            existing_mapping = self.db.query(EmailTicketMapping).filter(
+            # 1. Verificar si ya existe un mapping con el nuevo ID
+            existing_new_mapping = self.db.query(EmailTicketMapping).filter(
                 EmailTicketMapping.email_id == new_email_id,
                 EmailTicketMapping.ticket_id == ticket_id
             ).first()
             
-            if existing_mapping:
-                logger.info(f"📧 Mapping with new email ID already exists for ticket {ticket_id}. Removing old mappings.")
-                # Eliminar los mappings antiguos en lugar de intentar actualizar
-                for old_mapping in mappings_to_update:
+            if existing_new_mapping:
+                logger.info(f"✅ Mapping with new email ID already exists for ticket {ticket_id}. Removing old mappings only.")
+                # Solo eliminar los mappings antiguos
+                old_mappings = self.db.query(EmailTicketMapping).filter(
+                    EmailTicketMapping.ticket_id == ticket_id,
+                    EmailTicketMapping.email_id == old_email_id
+                ).all()
+                
+                for old_mapping in old_mappings:
                     self.db.delete(old_mapping)
+                
                 self.db.commit()
+                logger.info(f"✅ Removed {len(old_mappings)} old email mappings for ticket {ticket_id}")
                 return True
             
-            # 🔧 MANEJO ROBUSTO DE DUPLICADOS: Usar try/catch para cada actualización
-            updated_count = 0
-            for mapping in mappings_to_update:
-                try:
-                    mapping.email_id = new_email_id
-                    mapping.updated_at = datetime.utcnow()
-                    # Commit individual para detectar duplicados temprano
-                    self.db.flush()
-                    updated_count += 1
-                except Exception as mapping_error:
-                    if "Duplicate entry" in str(mapping_error):
-                        logger.warning(f"🔧 Duplicate email ID detected for mapping {mapping.id}. Removing duplicate mapping.")
-                        # Rollback este mapping específico y eliminarlo
-                        self.db.rollback()
-                        self.db.delete(mapping)
-                        self.db.commit()
-                    else:
-                        logger.error(f"Error updating mapping {mapping.id}: {str(mapping_error)}")
-                        self.db.rollback()
-                    continue
+            # 2. Buscar todos los mappings antiguos para este ticket
+            old_mappings = self.db.query(EmailTicketMapping).filter(
+                EmailTicketMapping.ticket_id == ticket_id,
+                EmailTicketMapping.email_id == old_email_id
+            ).all()
             
-            # Commit final de todas las actualizaciones exitosas
-            if updated_count > 0:
+            if not old_mappings:
+                logger.debug(f"No old mappings found for ticket {ticket_id} with email ID {old_email_id[:50]}...")
+                return False
+            
+            # 3. Crear nuevos mappings basados en los antiguos
+            new_mappings_created = 0
+            
+            for old_mapping in old_mappings:
                 try:
-                    self.db.commit()
-                    logger.info(f"✅ Updated {updated_count} email mappings for ticket {ticket_id}")
-                    return True
-                except Exception as commit_error:
-                    if "Duplicate entry" in str(commit_error):
-                        logger.warning(f"🔧 Duplicate detected during final commit for ticket {ticket_id}. Handling gracefully.")
+                    # Crear nuevo mapping con el nuevo email ID
+                    new_mapping = EmailTicketMapping(
+                        email_id=new_email_id,
+                        email_conversation_id=old_mapping.email_conversation_id,
+                        ticket_id=old_mapping.ticket_id,
+                        email_subject=old_mapping.email_subject,
+                        email_sender=old_mapping.email_sender,
+                        email_received_at=old_mapping.email_received_at,
+                        is_processed=old_mapping.is_processed,
+                        created_at=old_mapping.created_at,
+                        updated_at=datetime.utcnow()
+                    )
+                    
+                    # Intentar agregar el nuevo mapping
+                    self.db.add(new_mapping)
+                    self.db.flush()  # Flush para detectar duplicados temprano
+                    new_mappings_created += 1
+                    
+                except Exception as create_error:
+                    if "Duplicate entry" in str(create_error):
+                        logger.warning(f"🔧 Duplicate detected while creating new mapping for ticket {ticket_id}. Skipping creation.")
                         self.db.rollback()
-                        # Verificar si ahora existe el mapping correcto
-                        final_check = self.db.query(EmailTicketMapping).filter(
+                        # Verificar si el mapping ya existe
+                        existing_check = self.db.query(EmailTicketMapping).filter(
                             EmailTicketMapping.email_id == new_email_id,
                             EmailTicketMapping.ticket_id == ticket_id
                         ).first()
-                        return final_check is not None
+                        if existing_check:
+                            new_mappings_created += 1  # Contar como exitoso
                     else:
-                        logger.error(f"Error during final commit for ticket {ticket_id}: {str(commit_error)}")
+                        logger.error(f"Error creating new mapping for ticket {ticket_id}: {str(create_error)}")
                         self.db.rollback()
-                        return False
+                        continue
+            
+            # 4. Si se crearon nuevos mappings exitosamente, eliminar los antiguos
+            if new_mappings_created > 0:
+                try:
+                    # Commit los nuevos mappings primero
+                    self.db.commit()
+                    
+                    # Ahora eliminar los mappings antiguos
+                    for old_mapping in old_mappings:
+                        self.db.delete(old_mapping)
+                    
+                    self.db.commit()
+                    logger.info(f"✅ Successfully updated {new_mappings_created} email mappings for ticket {ticket_id}")
+                    return True
+                    
+                except Exception as cleanup_error:
+                    logger.error(f"Error during cleanup for ticket {ticket_id}: {str(cleanup_error)}")
+                    self.db.rollback()
+                    return False
             else:
+                logger.warning(f"No new mappings were created for ticket {ticket_id}")
                 return False
-                                
+                
         except Exception as e:
             logger.error(f"Error updating email mappings for ticket {ticket_id}: {str(e)}")
             try:
                 self.db.rollback()
-            except:
-                pass  # En caso de que rollback también falle
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback for ticket {ticket_id}: {str(rollback_error)}")
             return False
 
     def _validate_ticket_mailbox_association(self, task: Task, mailbox_connection: MailboxConnection, email_mapping: EmailTicketMapping) -> bool:
