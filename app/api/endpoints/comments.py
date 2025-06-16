@@ -129,38 +129,49 @@ async def create_comment(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
-    
-    # Verificar si hay un cambio de assignee
+
     previous_assignee_id = task.assignee_id
     assignee_changed = False
-    
-    # Para respuestas externas, auto-establecer status="With User" si no es "Closed"
+
     if not comment_in.is_private and task.status != "Closed":
         task.status = "With User"
         db.add(task)
-    
-    # Lógica para asignar ticket al agente que comenta (si no está asignado)
+  
     if task.assignee_id is None and not comment_in.preserve_assignee:
-        # Solo asignar al usuario actual si no tiene un assignee_id explícito en request
-        # y si no es una carga de adjunto (is_attachment_upload)
+        
         if comment_in.assignee_id is None and not comment_in.is_attachment_upload:
             task.assignee_id = current_user.id
             assignee_changed = True
-        # Si se proporciona explícitamente un assignee_id, usar ese
+       
         elif comment_in.assignee_id is not None:
             task.assignee_id = comment_in.assignee_id
             assignee_changed = previous_assignee_id != comment_in.assignee_id
     
-    # Si hay un assignee_id explícito (y no estamos preservando el actual)
+ 
     elif comment_in.assignee_id is not None and not comment_in.preserve_assignee:
         task.assignee_id = comment_in.assignee_id
         assignee_changed = previous_assignee_id != comment_in.assignee_id
     
-    # Update last_update field on the task
+
     task.last_update = datetime.utcnow()  # Use import
     db.add(task)
 
-    # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
+    if cc_recipients and not comment_in.is_private:
+        existing_cc = []
+        if task.cc_recipients:
+            existing_cc = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
+        
+        all_cc = existing_cc.copy()
+        for new_cc in cc_recipients:
+            if new_cc not in all_cc:
+                all_cc.append(new_cc)
+    
+        if all_cc:
+            task.cc_recipients = ", ".join(all_cc)
+            logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
+        
+        db.add(task)
+
     content_to_store = comment_in.content
     s3_html_url = None
     
@@ -169,10 +180,10 @@ async def create_comment(
             from app.services.s3_service import get_s3_service
             s3_service = get_s3_service()
             
-            # Verificar si el contenido es muy grande o debe ir a S3
+            
             content_length = len(comment_in.content)
             should_migrate_to_s3 = (
-                content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                content_length > 65000 or  
                 s3_service.should_store_html_in_s3(comment_in.content)
             )
             

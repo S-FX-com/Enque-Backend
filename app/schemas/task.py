@@ -126,6 +126,7 @@ class TicketInDBBase(BaseModel):
     updated_at: datetime
     last_update: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
+    cc_recipients: Optional[str] = None
     
     class Config:
         from_attributes = True
