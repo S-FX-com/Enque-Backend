@@ -37,7 +37,13 @@ class Task(Base):
     deleted_at = Column(DateTime, nullable=True)
     is_read = Column(Boolean, default=False)
     mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) 
-    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) 
+    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True)
+    
+    # Email-related columns
+    email_message_id = Column(String(255), nullable=True, index=True)
+    email_conversation_id = Column(String(255), nullable=True)
+    email_sender = Column(String(255), nullable=True)
+    cc_recipients = Column(Text, nullable=True)
 
     # Relationships
     workspace = relationship("Workspace", back_populates="tasks")

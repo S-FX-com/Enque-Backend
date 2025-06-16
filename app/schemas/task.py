@@ -66,18 +66,19 @@ class TicketCreate(BaseModel):
     user_id: int
     company_id: Optional[int] = None
     workspace_id: int
-    category_id: Optional[int] = None 
+    category_id: Optional[int] = None
+    cc_recipients: Optional[str] = None
 
 class TicketUpdate(BaseModel):
     title: Optional[str] = None
-    description: Optional[str] = None 
+    description: Optional[str] = None
     status: Optional[TaskStatus] = None
     priority: Optional[TaskPriority] = None
-    assignee_id: Optional[int] = None 
-    company_id: Optional[int] = None
-    due_date: Optional[datetime] = None
+    assignee_id: Optional[int] = None
     team_id: Optional[int] = None
-    category_id: Optional[int] = None 
+    due_date: Optional[datetime] = None
+    category_id: Optional[int] = None
+    cc_recipients: Optional[str] = None
     
     @validator("status")
     def validate_status(cls, v):

@@ -1055,6 +1055,13 @@ class MicrosoftGraphService:
             
             recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("toRecipients", []) if r.get("emailAddress")]
             if not recipients: recipients = [EmailAddress(name="", address=user_email)]
+            
+            # NUEVO: Procesar CC recipients
+            cc_recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("ccRecipients", []) if r.get("emailAddress")]
+            
+            # NUEVO: Procesar BCC recipients (si están disponibles)
+            bcc_recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("bccRecipients", []) if r.get("emailAddress")]
+            
             body_data = email_content.get("body", {}); body_content = body_data.get("content", ""); body_type = body_data.get("contentType", "html")
             received_time = datetime.utcnow(); received_dt_str = email_content.get("receivedDateTime")
             if received_dt_str:
@@ -1071,7 +1078,8 @@ class MicrosoftGraphService:
                 except Exception as att_err: logger.error(f"Error parsing attachment {i+1} for email {email_content.get('id')}: {att_err}"); continue
             return EmailData(
                 id=email_content["id"], conversation_id=email_content.get("conversationId", ""), subject=email_content.get("subject", "No Subject"),
-                sender=sender, to_recipients=recipients, body_content=body_content, body_type=body_type, received_at=received_time,
+                sender=sender, to_recipients=recipients, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients,
+                body_content=body_content, body_type=body_type, received_at=received_time,
                 attachments=attachments, importance=email_content.get("importance", "normal"))
         except Exception as e: logger.error(f"Error parsing email data for email ID {email_content.get('id', 'N/A')}: {str(e)}", exc_info=True); return None
 
@@ -1145,12 +1153,22 @@ class MicrosoftGraphService:
                     team_id = team_assignment.team_id
                     logger.info(f"Auto-assigning ticket to team {team_id} based on mailbox assignment")
             
+            # NUEVO: Procesar CC recipients para guardar en el ticket
+            cc_recipients_str = None
+            if email.cc_recipients:
+                cc_emails = [cc.address for cc in email.cc_recipients if cc.address]
+                if cc_emails:
+                    cc_recipients_str = ", ".join(cc_emails)
+                    logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
+            
             # Crear el ticket sin descripción inicial
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
-                mailbox_connection_id=config.mailbox_connection_id, team_id=team_id)
+                mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
+                email_message_id=email.id, email_conversation_id=email.conversation_id,
+                email_sender=f"{email.sender.name} <{email.sender.address}>", cc_recipients=cc_recipients_str)
             self.db.add(task); self.db.flush()
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
@@ -2036,18 +2054,37 @@ class MicrosoftGraphService:
             return html_content
 
     def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None, cc_recipients: List[str] = None) -> bool:
-        task = self.db.query(Task).options(joinedload(Task.mailbox_connection), joinedload(Task.user)).filter(Task.id == task_id).first()
-        if not task: logger.error(f"Task not found for task_id: {task_id}"); return False
-        if not task.mailbox_connection_id or not task.mailbox_connection:
-            logger.warning(f"Task {task_id} did not originate from email or has no mailbox connection. No reply sent."); return True
+        """
+        Send a reply email for a ticket that originated from an email.
+        If the ticket has original CC recipients, they will be included in the reply.
+        """
+        logger.info(f"[REPLY EMAIL] Starting reply process for task {task_id} by agent {agent.name}")
         
-        mailbox_connection = task.mailbox_connection; original_sender = task.user
+        # Get the task with its mailbox connection
+        task = self.db.query(Task).options(
+            joinedload(Task.mailbox_connection)
+        ).filter(Task.id == task_id).first()
         
-
+        if not task:
+            logger.error(f"❌ Task {task_id} not found for reply email")
+            return False
         
-        if not original_sender: logger.error(f"Original sender (User) missing for task_id: {task_id}"); return False
-        # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
-        # El token de aplicación (client credentials) no tiene permisos para acceder a mailboxes específicos
+        if not task.mailbox_connection:
+            logger.error(f"❌ Task {task_id} has no associated mailbox connection. Cannot send reply.")
+            return False
+        
+        mailbox_connection = task.mailbox_connection
+        
+        # NUEVO: Si no se proporcionan CC recipients específicos, usar los CC del ticket original
+        if not cc_recipients and task.cc_recipients:
+            cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
+            logger.info(f"Using original ticket CC recipients: {cc_recipients}")
+        elif cc_recipients:
+            logger.info(f"Using provided CC recipients: {cc_recipients}")
+        else:
+            logger.info("No CC recipients for this reply")
+        
+        # Verificar que el token de aplicación (client credentials) no tiene permisos para acceder a mailboxes específicos
         # Necesitamos usar el token delegado del usuario que configuró este mailbox
         try:
             # Obtener el token específico para este mailbox
