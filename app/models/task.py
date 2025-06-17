@@ -37,13 +37,19 @@ class Task(Base):
     deleted_at = Column(DateTime, nullable=True)
     is_read = Column(Boolean, default=False)
     mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) 
-    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True)
-    
+    category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) 
+
     # Email-related columns
     email_message_id = Column(String(255), nullable=True, index=True)
     email_conversation_id = Column(String(255), nullable=True)
     email_sender = Column(String(255), nullable=True)
     cc_recipients = Column(Text, nullable=True)
+
+    # Merge-related columns
+    merged_to_ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True, index=True)
+    is_merged = Column(Boolean, default=False, index=True)
+    merged_at = Column(DateTime, nullable=True)
+    merged_by_agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
     workspace = relationship("Workspace", back_populates="tasks")
@@ -58,6 +64,12 @@ class Task(Base):
     body = relationship("TicketBody", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
     mailbox_connection = relationship("MailboxConnection", back_populates="tasks") 
     category = relationship("Category", back_populates="tasks") 
+    
+    # Merge relationships
+    merged_to_ticket = relationship("Task", remote_side=[id], foreign_keys=[merged_to_ticket_id])
+    merged_tickets = relationship("Task", foreign_keys=[merged_to_ticket_id], overlaps="merged_to_ticket")
+    merged_by_agent = relationship("Agent", foreign_keys=[merged_by_agent_id])
+    
     @property
     def is_from_email(self):
         """Check if this task was created from an email"""

@@ -18,7 +18,7 @@ from app.models.team import TeamMember # Import TeamMember for filtering
 from app.models.microsoft import EmailTicketMapping, MailboxConnection, mailbox_team_assignments # Import MailboxConnection
 from app.models.activity import Activity # Import Activity model
 # Use TaskWithDetails and the renamed TicketCreate/TicketUpdate schemas
-from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema
+from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema, TicketMergeRequest, TicketMergeResponse
 # Import logger if needed for activity logging errors
 from app.utils.logger import logger
 
@@ -28,6 +28,7 @@ task_logger = logging.getLogger(__name__)
 from app.services.task_service import update_task, send_assignment_notification # Importar función de notificación
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
 from app.services.automation_service import execute_automations_for_ticket # Import automation service
+from app.services.ticket_merge_service import TicketMergeService # Import merge service
 from datetime import datetime # Import datetime
 from app.core.config import settings # Import settings
 from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_deleted, emit_comment_update # Import Socket.IO functions
@@ -306,33 +307,29 @@ async def read_task(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Get task by ID, including its body content and related details.
-    Ensures the task belongs to the current user's workspace.
+    Get a specific task by ID with all related details
     """
-    # Eager load relationships including the new 'body'
-    task = db.query(Task).options(
+    query = db.query(Task).options(
         joinedload(Task.workspace),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.user),
-        joinedload(Task.sent_from),
+        joinedload(Task.sent_from), 
         joinedload(Task.sent_to),
         joinedload(Task.assignee),
-        joinedload(Task.category), # Eager load category
-        joinedload(Task.body) # Eager load the body
+        joinedload(Task.user),
+        joinedload(Task.team),
+        joinedload(Task.company),
+        joinedload(Task.category),
+        joinedload(Task.body),
+        joinedload(Task.merged_by_agent)
     ).filter(
         Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id, # Ensure task is in user's workspace
+        Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
-    ).first()
-
+    )
+    
+    task = query.first()
     if not task:
-        # Use 404 even if it exists in another workspace for security
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Ticket not found",
-        )
-
+        raise HTTPException(status_code=404, detail="Task not found")
+    
     return task
 
 
@@ -489,7 +486,7 @@ async def read_assigned_tasks(
     priority: Optional[str] = Query(None),
 ) -> Any:
     """
-    OPTIMIZADO: Tasks asignados sin relaciones pesadas para máximo rendimiento
+    OPTIMIZADO: Tasks assigned without heavy relationships for maximum performance
     """
     start_time = time.time()
     
@@ -498,7 +495,7 @@ async def read_assigned_tasks(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # EVITAR cargar relaciones para máximo rendimiento
+        # EVITAR loading relationships for maximum performance
         noload(Task.workspace),
         noload(Task.sent_from),
         noload(Task.sent_to),
@@ -740,7 +737,7 @@ def get_ticket_html_content(
                 if s3_content:
                     initial_content = s3_content
                     
-                    # ✅ EXTRAER INFORMACIÓN DEL ORIGINAL-SENDER (como hacía el frontend)
+                    # ✅ EXTRACT ORIGINAL-SENDER INFORMATION (like frontend used to do)
                     import re
                     original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', s3_content)
                     
@@ -851,7 +848,7 @@ def get_ticket_html_content(
             if not content:
                 content = comment.content or "Content not available"
 
-            # ✅ DETERMINAR SENDER INFO - extraer de original-sender si existe
+            # ✅ DETERMINE SENDER INFO - extract from original-sender if exists
             import re
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             
@@ -919,3 +916,151 @@ def get_ticket_html_content(
     except Exception as e:
         logger.error(f"❌ Error getting HTML content for ticket {task_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get ticket HTML content: {str(e)}")
+
+
+# === MERGE ENDPOINTS ===
+
+@router.post("/merge", response_model=TicketMergeResponse)
+async def merge_tickets(
+    merge_request: TicketMergeRequest,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Merge multiple tickets into a main ticket.
+    Transfers all comments, attachments and content from secondary tickets to the main one.
+    """
+    try:
+        # Execute merge using the service
+        result = TicketMergeService.merge_tickets(
+            db=db,
+            target_ticket_id=merge_request.target_ticket_id,
+            ticket_ids_to_merge=merge_request.ticket_ids_to_merge,
+            current_user=current_user
+        )
+        
+        if result["success"]:
+            logger.info(f"Successful merge: ticket {merge_request.target_ticket_id} with {result['merged_ticket_ids']}")
+            return TicketMergeResponse(
+                success=True,
+                target_ticket_id=result["target_ticket_id"],
+                merged_ticket_ids=result["merged_ticket_ids"],
+                comments_transferred=result["comments_transferred"],
+                message=result["message"]
+            )
+        else:
+            logger.error(f"Merge error: {result.get('errors', [])}")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Error merging tickets",
+                    "errors": result.get("errors", [])
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in merge_tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/mergeable", response_model=List[TaskSchema])
+async def get_mergeable_tickets(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    exclude_ticket_id: Optional[int] = Query(None, description="Ticket ID to exclude from search"),
+    search: Optional[str] = Query(None, description="Search term to filter tickets"),
+    limit: int = Query(50, le=100, description="Results limit")
+) -> Any:
+    """
+    Get list of tickets that can be merged.
+    Excludes already merged tickets, deleted tickets, and optionally a specific ticket.
+    """
+    try:
+        tickets = TicketMergeService.get_mergeable_tickets(
+            db=db,
+            workspace_id=current_user.workspace_id,
+            exclude_ticket_id=exclude_ticket_id,
+            search_term=search,
+            limit=limit
+        )
+        
+        return tickets
+        
+    except Exception as e:
+        logger.error(f"Error getting mergeable tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting tickets: {str(e)}")
+
+
+@router.get("/{ticket_id}/merge-info")
+async def get_ticket_merge_info(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get merge information for a specific ticket.
+    Includes if it's merged, with which ticket, and which tickets were merged into it.
+    """
+    try:
+        # Verify ticket exists and belongs to user's workspace
+        ticket = db.query(Task).filter(
+            Task.id == ticket_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+        
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        
+        merge_info = {
+            "ticket_id": ticket_id,
+            "is_merged": ticket.is_merged,
+            "merged_to_ticket_id": ticket.merged_to_ticket_id,
+            "merged_at": ticket.merged_at,
+            "merged_by_agent_id": ticket.merged_by_agent_id,
+            "merged_by_agent_name": None,
+            "merged_tickets": [],
+            "merged_to_ticket_title": None
+        }
+        
+        # If merged, get main ticket information
+        if ticket.is_merged and ticket.merged_to_ticket_id:
+            target_ticket = db.query(Task).filter(Task.id == ticket.merged_to_ticket_id).first()
+            if target_ticket:
+                merge_info["merged_to_ticket_title"] = target_ticket.title
+        
+        # Get information about the agent who performed the merge
+        if ticket.merged_by_agent_id:
+            agent = db.query(Agent).filter(Agent.id == ticket.merged_by_agent_id).first()
+            if agent:
+                merge_info["merged_by_agent_name"] = agent.name
+        
+        # Get tickets that were merged into this ticket
+        merged_tickets = TicketMergeService.get_merged_tickets_for_ticket(
+            db=db,
+            ticket_id=ticket_id,
+            workspace_id=current_user.workspace_id
+        )
+        
+        merge_info["merged_tickets"] = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "merged_at": t.merged_at,
+                "status": t.status
+            }
+            for t in merged_tickets
+        ]
+        
+        return merge_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting merge info for {ticket_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting merge information: {str(e)}")
+
+
+
