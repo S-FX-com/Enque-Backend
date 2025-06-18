@@ -79,6 +79,7 @@ class TicketUpdate(BaseModel):
     due_date: Optional[datetime] = None
     category_id: Optional[int] = None 
     cc_recipients: Optional[str] = None
+    user_id: Optional[int] = None
     
     @validator("status")
     def validate_status(cls, v):
