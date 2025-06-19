@@ -777,12 +777,28 @@ def get_ticket_html_content(
 
         # Add initial content if we have it
         if initial_content:
+            # ✅ FIX: Obtener adjuntos del primer comentario si existe
+            initial_attachments = []
+            if comments and comments[0].attachments:
+                for att in comments[0].attachments:
+                    # Use S3 URL directly if available, otherwise use API endpoint
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
+                    initial_attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": download_url
+                    })
+            
             html_contents.append({
                 "id": "initial",
                 "content": initial_content,
                 "sender": initial_sender,
                 "is_private": False,
-                "attachments": [],
+                "attachments": initial_attachments,
                 "created_at": comments[0].created_at if comments else task.created_at
             })
 

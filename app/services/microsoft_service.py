@@ -1181,11 +1181,38 @@ class MicrosoftGraphService:
                 for att in non_inline_attachments:
                     try:
                         decoded_bytes = base64.b64decode(att.contentBytes)
+                        
+                        # ✅ FIX: Subir adjunto inicial a S3 (igual que para comentarios posteriores)
+                        s3_url = None
+                        try:
+                            from app.services.s3_service import get_s3_service
+                            s3_service = get_s3_service()
+                            
+                            # Determinar carpeta según tipo de archivo
+                            folder = "images" if att.content_type.startswith("image/") else "documents"
+                            
+                            # Subir a S3
+                            s3_url = s3_service.upload_file(
+                                file_content=decoded_bytes,
+                                filename=att.name,
+                                content_type=att.content_type,
+                                folder=folder
+                            )
+                            
+                            logger.info(f"📎 Adjunto inicial '{att.name}' subido a S3: {s3_url}")
+                            
+                        except Exception as s3_error:
+                            logger.error(f"❌ Error subiendo adjunto inicial '{att.name}' a S3: {str(s3_error)}")
+                            # Fallback: guardar en BD si S3 falla
+                            pass
+                        
+                        # Crear adjunto en BD con S3 URL o bytes según disponibilidad
                         db_attachment = TicketAttachment(
                             file_name=att.name,
                             content_type=att.content_type,
                             file_size=att.size,
-                            content_bytes=decoded_bytes
+                            s3_url=s3_url,  # ✅ FIX: Incluir URL de S3
+                            content_bytes=decoded_bytes if not s3_url else None  # Solo bytes si S3 falló
                         )
                         attachments_for_comment.append(db_attachment)
                     except Exception as e:
