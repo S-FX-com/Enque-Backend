@@ -775,13 +775,10 @@ def get_ticket_html_content(
                     "created_at": task.created_at
                 }
 
-        # Add initial content if we have it
         if initial_content:
-            # ✅ FIX: Obtener adjuntos del primer comentario si existe
             initial_attachments = []
             if comments and comments[0].attachments:
                 for att in comments[0].attachments:
-                    # Use S3 URL directly if available, otherwise use API endpoint
                     download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
                     
                     initial_attachments.append({
@@ -801,10 +798,6 @@ def get_ticket_html_content(
                 "attachments": initial_attachments,
                 "created_at": comments[0].created_at if comments else task.created_at
             })
-
-        # 2. Process ALL comments - much simpler approach
-        
-        # First, collect all S3 URLs that need to be fetched
         s3_urls_needed = []
         comment_mapping = {}
         
@@ -864,12 +857,10 @@ def get_ticket_html_content(
             if not content:
                 content = comment.content or "Content not available"
 
-            # ✅ DETERMINE SENDER INFO - extract from original-sender if exists
             import re
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             
             if original_sender_match:
-                # Es un mensaje de usuario con información extraída del HTML
                 sender = {
                     "type": "user",
                     "name": original_sender_match.group(1).strip(),
@@ -877,7 +868,6 @@ def get_ticket_html_content(
                     "created_at": comment.created_at
                 }
             elif comment.agent:
-                # Es un mensaje de agente real
                 sender = {
                     "type": "agent",
                     "name": comment.agent.name,
@@ -885,7 +875,6 @@ def get_ticket_html_content(
                     "created_at": comment.created_at
                 }
             else:
-                # Fallback
                 sender = {
                     "type": "unknown",
                     "name": "Unknown",
@@ -893,11 +882,9 @@ def get_ticket_html_content(
                     "created_at": comment.created_at
                 }
 
-            # Process attachments
             attachments = []
             if comment.attachments:
                 for att in comment.attachments:
-                    # Use S3 URL directly if available, otherwise use API endpoint
                     download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
                     
                     attachments.append({
@@ -916,10 +903,7 @@ def get_ticket_html_content(
                 "is_private": comment.is_private,
                 "attachments": attachments,
                 "created_at": comment.created_at
-            })
-
-        # Successfully retrieved HTML content
-        
+            })        
         return {
             "status": "success",
             "ticket_id": task_id,
@@ -947,7 +931,6 @@ async def merge_tickets(
     Transfers all comments, attachments and content from secondary tickets to the main one.
     """
     try:
-        # Execute merge using the service
         result = TicketMergeService.merge_tickets(
             db=db,
             target_ticket_id=merge_request.target_ticket_id,
@@ -1020,7 +1003,6 @@ async def get_ticket_merge_info(
     Includes if it's merged, with which ticket, and which tickets were merged into it.
     """
     try:
-        # Verify ticket exists and belongs to user's workspace
         ticket = db.query(Task).filter(
             Task.id == ticket_id,
             Task.workspace_id == current_user.workspace_id,
@@ -1041,19 +1023,16 @@ async def get_ticket_merge_info(
             "merged_to_ticket_title": None
         }
         
-        # If merged, get main ticket information
         if ticket.is_merged and ticket.merged_to_ticket_id:
             target_ticket = db.query(Task).filter(Task.id == ticket.merged_to_ticket_id).first()
             if target_ticket:
                 merge_info["merged_to_ticket_title"] = target_ticket.title
         
-        # Get information about the agent who performed the merge
         if ticket.merged_by_agent_id:
             agent = db.query(Agent).filter(Agent.id == ticket.merged_by_agent_id).first()
             if agent:
                 merge_info["merged_by_agent_name"] = agent.name
         
-        # Get tickets that were merged into this ticket
         merged_tickets = TicketMergeService.get_merged_tickets_for_ticket(
             db=db,
             ticket_id=ticket_id,
@@ -1077,6 +1056,3 @@ async def get_ticket_merge_info(
     except Exception as e:
         logger.error(f"Error getting merge info for {ticket_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting merge information: {str(e)}")
-
-
-
