@@ -1341,6 +1341,29 @@ class MicrosoftGraphService:
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for new ticket {task.id}: {str(e)}")
             
+            # NUEVO: Ejecutar automations basadas en las condiciones del ticket
+            try:
+                from app.services.automation_service import execute_automations_for_ticket
+                
+                # Cargar el ticket con todas las relaciones necesarias para las condiciones de automation
+                from sqlalchemy.orm import joinedload
+                task_with_relations = self.db.query(Task).options(
+                    joinedload(Task.user),
+                    joinedload(Task.assignee),
+                    joinedload(Task.company),
+                    joinedload(Task.category),
+                    joinedload(Task.team)
+                ).filter(Task.id == task.id).first()
+                
+                if task_with_relations:
+                    executed_actions = execute_automations_for_ticket(self.db, task_with_relations)
+                    if executed_actions:
+                        # Refresh the task to get updated values from automations
+                        self.db.refresh(task)
+                        
+            except Exception as automation_error:
+                logger.error(f"Error executing automations for new ticket {task.id}: {str(automation_error)}")
+            
             # NUEVO: Procesar workflows basados en el contenido del email inicial
             try:
                 from app.services.workflow_service import WorkflowService

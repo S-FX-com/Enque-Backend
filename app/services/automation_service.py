@@ -191,21 +191,13 @@ def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
         Automation.is_active == True
     ).all()
     
-    logger.info(f"Checking {len(automations)} active automations for ticket {ticket.id}")
-    
     for automation in automations:
         try:
             # Check if all conditions match
             if _check_automation_conditions(automation, ticket):
-                logger.info(f"Automation {automation.id} '{automation.name}' matches ticket {ticket.id}")
-                
                 # Execute all actions
                 actions_executed = _execute_automation_actions(db, automation, ticket)
                 executed_actions.extend(actions_executed)
-                
-                logger.info(f"Executed {len(actions_executed)} actions for automation {automation.id}")
-            else:
-                logger.debug(f"Automation {automation.id} conditions do not match ticket {ticket.id}")
                 
         except Exception as e:
             logger.error(f"Error executing automation {automation.id} for ticket {ticket.id}: {str(e)}")
@@ -213,7 +205,7 @@ def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
     
     if executed_actions:
         db.commit()
-        logger.info(f"Successfully executed {len(executed_actions)} automation actions for ticket {ticket.id}")
+        logger.info(f"Executed {len(executed_actions)} automation actions for ticket #{ticket.id}")
     
     return executed_actions
 
@@ -266,7 +258,8 @@ def _get_ticket_value(condition_type: ConditionType, ticket: Task) -> Optional[s
     """Get the value from the ticket based on the condition type"""
     try:
         if condition_type == ConditionType.DESCRIPTION:
-            return ticket.description or ""
+            # DESCRIPTION en el frontend se mapea a "Subject", que corresponde al campo title del ticket
+            return ticket.title or ""
         elif condition_type == ConditionType.NOTE:
             # For notes, we might need to check related comments/notes
             return ""  # TODO: Implement note checking if needed
@@ -319,7 +312,7 @@ def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) 
                 ticket.assignee_id = agent.id
                 return f"Set agent from '{old_assignee}' to '{agent.email}'"
             else:
-                logger.warning(f"Agent not found: {action.action_value}")
+                logger.warning(f"Agent not found: '{action.action_value}' in workspace {ticket.workspace_id}")
                 return None
                 
         elif action.action_type == ActionType.SET_TEAM:
@@ -334,7 +327,7 @@ def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) 
                 ticket.team_id = team.id
                 return f"Set team from '{old_team}' to '{team.name}'"
             else:
-                logger.warning(f"Team not found: {action.action_value}")
+                logger.warning(f"Team not found: '{action.action_value}' in workspace {ticket.workspace_id}")
                 return None
                 
         elif action.action_type == ActionType.SET_PRIORITY:
