@@ -82,20 +82,44 @@ async def read_tasks(
     return tasks
 @router.get("/search", response_model=List[TaskWithDetails])
 async def search_tickets(
-    q: str = Query(..., description="Search term to find in ticket title, description or body"),
+    q: str = Query(..., description="Search term to find in ticket title, description, body, or ticket ID"),
     db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 50,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Search for tickets containing the search term in title, description or body.
+    Search for tickets containing the search term in title, description, body, or by ticket ID.
+    If the search query is numeric, it will search by ticket ID first, then by text.
     All users can search ALL tickets in the workspace regardless of team membership.
     """
     base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
+    
+    # Check if query is numeric (ticket ID search)
+    if q.strip().isdigit():
+        ticket_id = int(q.strip())
+        # Search by exact ticket ID first
+        id_query = base_query.filter(Task.id == ticket_id)
+        id_query = id_query.options(
+            selectinload(Task.sent_from),
+            selectinload(Task.sent_to),
+            selectinload(Task.assignee),
+            selectinload(Task.user),
+            selectinload(Task.team),
+            selectinload(Task.company),
+            selectinload(Task.category),
+            selectinload(Task.body),
+        )
+        tickets = id_query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+        
+        # If found by ID, return immediately
+        if tickets:
+            return tickets
+    
+    # Text search (original logic)
     search_term = f"%{q}%"
     query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
         or_(

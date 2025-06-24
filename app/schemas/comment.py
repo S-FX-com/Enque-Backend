@@ -16,7 +16,8 @@ class CommentCreate(CommentBase):
     # Campos adicionales para gestión de asignación y archivos adjuntos
     preserve_assignee: bool = False  # Flag para no cambiar el asignado actual
     assignee_id: Optional[int] = None  # ID de agente a asignar (si se quiere cambiar)
-    other_destinaries: Optional[str] = None
+    other_destinaries: Optional[str] = None  # CC recipients
+    bcc_recipients: Optional[str] = None       # BCC recipients
     is_attachment_upload: bool = False  # Flag para indicar si es una carga de adjunto
 
 class CommentUpdate(BaseModel):
@@ -28,6 +29,8 @@ class CommentInDBBase(CommentBase):
     ticket_id: int
     agent_id: Optional[int] = None
     workspace_id: int
+    other_destinaries: Optional[str] = None  # CC recipients
+    bcc_recipients: Optional[str] = None     # BCC recipients
     s3_html_url: Optional[str] = None  # URL del contenido en S3
     created_at: datetime
     updated_at: datetime

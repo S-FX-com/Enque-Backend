@@ -104,7 +104,7 @@ async def create_comment(
     Now includes automatic workflow processing for content analysis.
     """
 
-    # Validate other_destinaries if provided
+    # Validate other_destinaries (CC) if provided
     cc_recipients = []
     if comment_in.other_destinaries and not comment_in.is_private:
         try:
@@ -115,6 +115,19 @@ async def create_comment(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid email addresses in other_destinaries: {str(e)}"
+            )
+    
+    # Validate bcc_recipients if provided
+    bcc_recipients = []
+    if comment_in.bcc_recipients and not comment_in.is_private:
+        try:
+            from app.services.email_service import parse_other_destinaries
+            bcc_recipients = parse_other_destinaries(comment_in.bcc_recipients)
+            logger.info(f"Parsed {len(bcc_recipients)} BCC recipients for comment on task {task_id}")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid email addresses in bcc_recipients: {str(e)}"
             )
     
     # Fetch the task ensuring it belongs to the user's workspace
@@ -156,6 +169,7 @@ async def create_comment(
     task.last_update = datetime.utcnow()  # Use import
     db.add(task)
 
+    # Update CC recipients on ticket
     if cc_recipients and not comment_in.is_private:
         existing_cc = []
         if task.cc_recipients:
@@ -169,6 +183,23 @@ async def create_comment(
         if all_cc:
             task.cc_recipients = ", ".join(all_cc)
             logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
+        
+        db.add(task)
+    
+    # Update BCC recipients on ticket
+    if bcc_recipients and not comment_in.is_private:
+        existing_bcc = []
+        if task.bcc_recipients:
+            existing_bcc = [email.strip() for email in task.bcc_recipients.split(",") if email.strip()]
+        
+        all_bcc = existing_bcc.copy()
+        for new_bcc in bcc_recipients:
+            if new_bcc not in all_bcc:
+                all_bcc.append(new_bcc)
+    
+        if all_bcc:
+            task.bcc_recipients = ", ".join(all_bcc)
+            logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
         
         db.add(task)
 
@@ -219,7 +250,8 @@ async def create_comment(
         workspace_id=current_user.workspace_id,
         content=content_to_store,  # Usar contenido procesado
         s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
-        other_destinaries=comment_in.other_destinaries,
+        other_destinaries=comment_in.other_destinaries,  # CC recipients
+        bcc_recipients=comment_in.bcc_recipients,        # BCC recipients
         is_private=comment_in.is_private
     )
     db.add(comment)
@@ -512,6 +544,7 @@ async def create_comment(
                 agent_name=current_user.name,
                 is_private=comment_in.is_private,
                 cc_recipients=cc_recipients,
+                bcc_recipients=bcc_recipients,
                 processed_attachment_ids=processed_attachment_ids,
                 db_path=db_path
             )
@@ -550,6 +583,7 @@ async def create_comment(
             'agent_email': current_user.email,
             'content': comment_in.content,  # ✅ Enviar contenido completo para reemplazo perfecto
             'other_destinaries': comment_in.other_destinaries,  # Include CC info
+            'bcc_recipients': comment_in.bcc_recipients,        # Include BCC info
             'is_private': comment_in.is_private,
             'created_at': comment.created_at.isoformat() if comment.created_at else None,
             'attachments': [
@@ -712,6 +746,7 @@ def send_email_in_background(
     is_private: bool,
     processed_attachment_ids: list,
     cc_recipients: List[str],
+    bcc_recipients: List[str],
     db_path: str
 ):
     """

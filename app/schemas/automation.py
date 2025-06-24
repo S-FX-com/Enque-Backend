@@ -6,8 +6,10 @@ from enum import Enum
 
 class ConditionType(str, Enum):
     DESCRIPTION = "DESCRIPTION"
-    NOTE = "NOTE"
+    TICKET_BODY = "TICKET_BODY"
     USER = "USER"
+    USER_DOMAIN = "USER_DOMAIN"
+    INBOX = "INBOX"
     AGENT = "AGENT"
     COMPANY = "COMPANY"
     PRIORITY = "PRIORITY"
@@ -21,11 +23,18 @@ class ConditionOperator(str, Enum):
     NCON = "ncon"
 
 
+class LogicalOperator(str, Enum):
+    AND = "AND"
+    OR = "OR"
+
+
 class ActionType(str, Enum):
     SET_AGENT = "SET_AGENT"
     SET_PRIORITY = "SET_PRIORITY"
     SET_STATUS = "SET_STATUS"
     SET_TEAM = "SET_TEAM"
+    SET_CATEGORY = "SET_CATEGORY"
+    ALSO_NOTIFY = "ALSO_NOTIFY"
 
 
 # Condition schemas
@@ -33,6 +42,7 @@ class AutomationConditionBase(BaseModel):
     condition_type: ConditionType
     condition_operator: Optional[ConditionOperator] = ConditionOperator.EQL
     condition_value: Optional[str] = None
+    logical_operator: Optional[LogicalOperator] = None
 
 
 class AutomationConditionCreate(AutomationConditionBase):
@@ -43,6 +53,7 @@ class AutomationConditionUpdate(BaseModel):
     condition_type: Optional[ConditionType] = None
     condition_operator: Optional[ConditionOperator] = None
     condition_value: Optional[str] = None
+    logical_operator: Optional[LogicalOperator] = None
 
 
 class AutomationCondition(AutomationConditionBase):
@@ -83,6 +94,8 @@ class AutomationBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     workspace_id: int
     is_active: Optional[bool] = True
+    conditions_operator: Optional[LogicalOperator] = LogicalOperator.AND
+    actions_operator: Optional[LogicalOperator] = LogicalOperator.AND
 
 
 class AutomationCreate(AutomationBase):
@@ -105,6 +118,8 @@ class AutomationCreate(AutomationBase):
 class AutomationUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     is_active: Optional[bool] = None
+    conditions_operator: Optional[LogicalOperator] = None
+    actions_operator: Optional[LogicalOperator] = None
     conditions: Optional[List[AutomationConditionCreate]] = None
     actions: Optional[List[AutomationActionCreate]] = None
 
@@ -112,6 +127,8 @@ class AutomationUpdate(BaseModel):
 class AutomationInDBBase(AutomationBase):
     id: int
     workspace_id: int
+    conditions_operator: LogicalOperator
+    actions_operator: LogicalOperator
     created_at: datetime
     updated_at: datetime
     created_by: Optional[int] = None

@@ -85,11 +85,11 @@ def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url
             </div>
             <p>Hello {agent_name},</p>
             <p>You have been invited to join <strong>{workspace_name}</strong> on Enque. Please click the button below to set up your account and create your password:</p>
-            
+
             <div class="workspace-info">
                 <p style="margin: 0;"><strong>Workspace:</strong> {workspace_name}</p>
             </div>
-            
+
             <p style="text-align: center;">
                 <a href="{invitation_link}" class="button">Accept Invitation & Set Password</a>
             </p>
@@ -109,7 +109,7 @@ def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url
     return html_content
 
 async def send_agent_invitation_email(
-    db: Session, 
+    db: Session,
     to_email: str,
     agent_name: str,
     invitation_link: str,
@@ -126,7 +126,7 @@ async def send_agent_invitation_email(
     # Or better, a CDN or dedicated image hosting.
     # Replace "YOUR_PUBLIC_LOGO_URL_HERE" with the actual URL.
     # If your frontend is at app.enque.cc and enque.png is in its public root, then:
-    # logo_url = f"{settings.FRONTEND_URL}/enque.png" 
+    # logo_url = f"{settings.FRONTEND_URL}/enque.png"
     # However, ensure this is truly public and doesn't require auth.
     # For now, using a placeholder. You MUST update this.
     logo_url = "https://app.enque.cc/enque.png" # Example: Replace with your actual public logo URL
@@ -258,11 +258,11 @@ async def send_password_reset_email( # Changed to async
     # If we wanted to pass logo_url as a parameter to create_password_reset_email_html,
     # its signature would need to change, and then we'd pass logo_url here.
     # For now, it's consistent as create_password_reset_email_html directly uses settings.FRONTEND_URL + /enque.png
-    html_content = create_password_reset_email_html(agent_name, reset_link) 
+    html_content = create_password_reset_email_html(agent_name, reset_link)
 
     try:
         graph_service = MicrosoftGraphService(db=db)
-        
+
         success = await graph_service.send_email_with_user_token(
             user_access_token=user_access_token,
             sender_mailbox_email=sender_mailbox_email,
@@ -270,7 +270,7 @@ async def send_password_reset_email( # Changed to async
             subject=subject,
             html_body=html_content
         )
-        
+
         if success:
             logger.info(f"Password reset email sent successfully to {to_email} from {sender_mailbox_email}")
             return True
@@ -290,7 +290,7 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
         footer_sender = f"The {sender_name} Team"
     else:
         footer_sender = "The Enque Team"
-    
+
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -350,16 +350,16 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
         <div class="container">
             <p>Hello {agent_name},</p>
             <p>You have been assigned a new ticket in Enque:</p>
-            
+
             <div class="ticket-info">
                 <p><strong>Ticket ID:</strong> {ticket_id}</p>
                 <p><strong>Subject:</strong> {ticket_title}</p>
             </div>
-            
+
             <p style="text-align: center;">
                 <a href="{ticket_link}" class="button">View Ticket</a>
             </p>
-            
+
             <p class="footer">
                 Best regards,<br>
                 {footer_sender}
@@ -386,16 +386,17 @@ async def send_ticket_assignment_email(
     Uses the sender_mailbox_display_name to personalize the email signature.
     """
     subject = f"[ID:{ticket_id}] New ticket assigned: {ticket_title}"
-    
+
     # Use the origin URL if provided, otherwise fallback to settings.FRONTEND_URL
     base_url = request_origin if request_origin else settings.FRONTEND_URL
-    ticket_link = f"{base_url}/tickets?openTicket={ticket_id}"
-    
+    #ticket_link = f"{base_url}/tickets?openTicket={ticket_id}"
+    ticket_link = f"{base_url}/tickets/{ticket_id}"
+
     html_content = create_ticket_assignment_email_html(
-        agent_name, 
-        ticket_id, 
-        ticket_title, 
-        ticket_link, 
+        agent_name,
+        ticket_id,
+        ticket_title,
+        ticket_link,
         sender_mailbox_display_name
     )
 
@@ -423,22 +424,22 @@ async def send_ticket_assignment_email(
 def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
     """
     Validate a comma-separated string of email addresses.
-    
+
     Args:
         email_string: String containing comma-separated email addresses
-        
+
     Returns:
         Tuple of (is_valid, list_of_emails)
     """
     if not email_string or not email_string.strip():
         return True, []
-    
+
     # Split by comma and clean up
     emails = [email.strip() for email in email_string.split(',') if email.strip()]
-    
+
     # Email regex pattern
     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    
+
     valid_emails = []
     for email in emails:
         if re.match(email_pattern, email):
@@ -446,24 +447,24 @@ def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
         else:
             logger.warning(f"Invalid email address found: {email}")
             return False, []
-    
+
     return True, valid_emails
 
 def parse_other_destinaries(other_destinaries: Optional[str]) -> List[str]:
     """
     Parse and validate the other_destinaries field.
-    
+
     Args:
         other_destinaries: Comma-separated string of email addresses
-        
+
     Returns:
         List of valid email addresses
     """
     if not other_destinaries:
         return []
-    
+
     is_valid, emails = validate_email_addresses(other_destinaries)
     if not is_valid:
         raise ValueError("Invalid email addresses in other_destinaries field")
-    
+
     return emails

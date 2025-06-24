@@ -7,8 +7,10 @@ import enum
 
 class ConditionType(enum.Enum):
     DESCRIPTION = "DESCRIPTION"
-    NOTE = "NOTE"
+    TICKET_BODY = "TICKET_BODY"
     USER = "USER"
+    USER_DOMAIN = "USER_DOMAIN"
+    INBOX = "INBOX"
     AGENT = "AGENT"
     COMPANY = "COMPANY"
     PRIORITY = "PRIORITY"
@@ -22,11 +24,18 @@ class ConditionOperator(enum.Enum):
     NCON = "ncon"
 
 
+class LogicalOperator(enum.Enum):
+    AND = "AND"
+    OR = "OR"
+
+
 class ActionType(enum.Enum):
     SET_AGENT = "SET_AGENT"
     SET_PRIORITY = "SET_PRIORITY"
     SET_STATUS = "SET_STATUS"
     SET_TEAM = "SET_TEAM"
+    SET_CATEGORY = "SET_CATEGORY"
+    ALSO_NOTIFY = "ALSO_NOTIFY"
 
 
 class Automation(Base):
@@ -36,6 +45,8 @@ class Automation(Base):
     name = Column(String(255), nullable=False)
     workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     is_active = Column(Boolean, default=True)
+    conditions_operator = Column(Enum(LogicalOperator), default=LogicalOperator.AND)
+    actions_operator = Column(Enum(LogicalOperator), default=LogicalOperator.AND)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     created_by = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
@@ -57,6 +68,7 @@ class AutomationCondition(Base):
     condition_type = Column(Enum(ConditionType), nullable=False)
     condition_operator = Column(Enum(ConditionOperator), default=ConditionOperator.EQL)
     condition_value = Column(String(500))
+    logical_operator = Column(Enum(LogicalOperator), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships

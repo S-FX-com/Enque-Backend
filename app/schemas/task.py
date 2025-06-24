@@ -68,6 +68,7 @@ class TicketCreate(BaseModel):
     workspace_id: int
     category_id: Optional[int] = None 
     cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
 
 class TicketUpdate(BaseModel):
     title: Optional[str] = None
@@ -79,6 +80,7 @@ class TicketUpdate(BaseModel):
     due_date: Optional[datetime] = None
     category_id: Optional[int] = None 
     cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
     user_id: Optional[int] = None
     
     @validator("status")
@@ -151,6 +153,7 @@ class TicketInDBBase(BaseModel):
     last_update: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
     
     # Merge fields
     merged_to_ticket_id: Optional[int] = None

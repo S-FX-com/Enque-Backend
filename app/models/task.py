@@ -44,6 +44,7 @@ class Task(Base):
     email_conversation_id = Column(String(255), nullable=True)
     email_sender = Column(String(255), nullable=True)
     cc_recipients = Column(Text, nullable=True)
+    bcc_recipients = Column(Text, nullable=True)
 
     # Merge-related columns
     merged_to_ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True, index=True)
