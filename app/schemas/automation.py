@@ -42,7 +42,6 @@ class AutomationConditionBase(BaseModel):
     condition_type: ConditionType
     condition_operator: Optional[ConditionOperator] = ConditionOperator.EQL
     condition_value: Optional[str] = None
-    logical_operator: Optional[LogicalOperator] = None
 
 
 class AutomationConditionCreate(AutomationConditionBase):
@@ -53,7 +52,6 @@ class AutomationConditionUpdate(BaseModel):
     condition_type: Optional[ConditionType] = None
     condition_operator: Optional[ConditionOperator] = None
     condition_value: Optional[str] = None
-    logical_operator: Optional[LogicalOperator] = None
 
 
 class AutomationCondition(AutomationConditionBase):

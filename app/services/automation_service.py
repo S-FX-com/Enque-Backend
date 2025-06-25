@@ -213,39 +213,23 @@ def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
 
 
 def _check_automation_conditions(automation: Automation, ticket: Task) -> bool:
-    """Check if conditions of an automation match the ticket using individual logical operators"""
+    """Check if conditions of an automation match the ticket using logical operators"""
     if not automation.conditions:
         return False
     
-    # Sort conditions to ensure consistent order
-    sorted_conditions = sorted(automation.conditions, key=lambda c: c.id)
+    # Evaluate each condition
+    condition_results = []
+    for condition in automation.conditions:
+        result = _check_single_condition(condition, ticket)
+        condition_results.append(result)
     
-    # If only one condition, just evaluate it
-    if len(sorted_conditions) == 1:
-        return _check_single_condition(sorted_conditions[0], ticket)
-    
-    # Start with the first condition result
-    result = _check_single_condition(sorted_conditions[0], ticket)
-    
-    # Process remaining conditions with their logical operators
-    for i in range(1, len(sorted_conditions)):
-        current_condition = sorted_conditions[i]
-        previous_condition = sorted_conditions[i - 1]
-        
-        # Get the logical operator from the previous condition
-        # If no logical operator is set, default to AND
-        logical_op = previous_condition.logical_operator or LogicalOperator.AND
-        
-        # Evaluate current condition
-        current_result = _check_single_condition(current_condition, ticket)
-        
-        # Apply logical operator
-        if logical_op == LogicalOperator.OR:
-            result = result or current_result
-        else:  # Default to AND
-            result = result and current_result
-    
-    return result
+    # Apply logical operator
+    if automation.conditions_operator == LogicalOperator.OR:
+        # At least one condition must be true
+        return any(condition_results)
+    else:  # Default to AND
+        # All conditions must be true
+        return all(condition_results)
 
 
 def _check_single_condition(condition: AutomationCondition, ticket: Task) -> bool:
