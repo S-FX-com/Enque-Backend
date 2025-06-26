@@ -10,7 +10,8 @@ class CommentBase(BaseModel):
 
 class CommentCreate(CommentBase):
     ticket_id: int
-    agent_id: int
+    agent_id: Optional[int] = None  # Hacerlo opcional
+    user_id: Optional[int] = None   # Campo agregado para user_id
     workspace_id: int
     attachment_ids: Optional[List[int]] = None  # IDs de adjuntos existentes para asociar
     # Campos adicionales para gestión de asignación y archivos adjuntos
@@ -28,6 +29,7 @@ class CommentInDBBase(CommentBase):
     id: int
     ticket_id: int
     agent_id: Optional[int] = None
+    user_id: Optional[int] = None   # Campo agregado para user_id
     workspace_id: int
     other_destinaries: Optional[str] = None  # CC recipients
     bcc_recipients: Optional[str] = None     # BCC recipients

@@ -2110,20 +2110,79 @@ class MicrosoftGraphService:
         """
         logger.info(f"[REPLY EMAIL] Starting reply process for task {task_id} by agent {agent.name}")
         
-        # Get the task with its mailbox connection
+        # IMPORTANTE: Forzar refresh para obtener datos actualizados del ticket
+        self.db.expire_all()  # Expira cache de SQLAlchemy
+        
+        # Get the task with its mailbox connection and user information
         task = self.db.query(Task).options(
-            joinedload(Task.mailbox_connection)
+            joinedload(Task.mailbox_connection),
+            joinedload(Task.user)  # Agregar user para debugging
         ).filter(Task.id == task_id).first()
         
         if not task:
             logger.error(f"❌ Task {task_id} not found for reply email")
             return False
         
+        # Log información del usuario actual para debugging
+        if task.user:
+            logger.info(f"[REPLY EMAIL] Task {task_id} assigned to user: {task.user.name} ({task.user.email})")
+        else:
+            logger.info(f"[REPLY EMAIL] Task {task_id} has no assigned user")
+        
         if not task.mailbox_connection:
             logger.error(f"❌ Task {task_id} has no associated mailbox connection. Cannot send reply.")
             return False
         
         mailbox_connection = task.mailbox_connection
+        
+        # Get email mappings to check original sender
+        email_mappings = self.db.query(EmailTicketMapping).filter(
+            EmailTicketMapping.ticket_id == task_id
+        ).order_by(EmailTicketMapping.created_at.asc()).all()
+        
+        if not email_mappings:
+            logger.error(f"❌ No email mappings found for ticket {task_id}. Cannot send reply.")
+            return False
+        
+        # Get the original email sender from the first mapping
+        original_mapping = email_mappings[0]
+        original_sender = original_mapping.email_sender  # Format: "Name <email@domain.com>"
+        
+        # Extract email from original sender
+        import re
+        email_match = re.search(r'<([^>]+)>', original_sender) if original_sender else None
+        original_sender_email = email_match.group(1) if email_match else (original_sender or "")
+        
+        # Check if the current ticket user is different from the original sender
+        current_user_email = task.user.email if task.user else ""
+        contact_changed = current_user_email and original_sender_email and current_user_email.lower() != original_sender_email.lower()
+        
+        if contact_changed:
+            logger.info(f"[REPLY EMAIL] 🔄 Primary contact changed from {original_sender_email} to {current_user_email}")
+            logger.info(f"[REPLY EMAIL] 📧 Sending NEW email to updated contact instead of reply")
+            
+            # Send a new email to the updated contact instead of using createReply
+            subject = f"Re: [ID:{task_id}] {task.title}"
+            
+            # Format the HTML content if needed
+            if not reply_content.strip().lower().startswith('<html'):
+                html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{reply_content}</body></html>"
+            else:
+                html_body = reply_content
+            
+            # Use send_new_email method for the updated contact
+            return self.send_new_email(
+                mailbox_email=mailbox_connection.email,
+                recipient_email=current_user_email,
+                subject=subject,
+                html_body=html_body,
+                attachment_ids=attachment_ids,
+                task_id=task_id,
+                cc_recipients=cc_recipients
+            )
+        
+        # If contact hasn't changed, proceed with normal reply logic
+        logger.info(f"[REPLY EMAIL] 📧 Contact unchanged, sending normal reply to {original_sender_email}")
         
         # NUEVO: Si no se proporcionan CC recipients específicos, usar los CC del ticket original
         if not cc_recipients and task.cc_recipients:
@@ -2173,15 +2232,7 @@ class MicrosoftGraphService:
             logger.error(f"Failed to get user token for mailbox {mailbox_connection.email}: {e}"); 
             return False
         
-        # Get all email mappings for this ticket to find the original email
-        email_mappings = self.db.query(EmailTicketMapping).filter(
-            EmailTicketMapping.ticket_id == task_id
-        ).all()
-        
-        if not email_mappings:
-            logger.error(f"❌ No email mappings found for ticket {task_id}. Cannot send reply.")
-            return False
-        
+        # Use the email mappings already obtained above
         # Usar el primer mapping como referencia principal
         email_mapping = email_mappings[0]
         original_message_id = email_mapping.email_id
@@ -2602,7 +2653,7 @@ class MicrosoftGraphService:
                 logger.error(f"An unexpected error occurred while sending email reply for task_id: {task_id}. Error: {str(e)}", exc_info=True)
                 return False
 
-    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None) -> bool:
+    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None, cc_recipients: List[str] = None) -> bool:
         logger.info(f"Attempting to send new email from: {mailbox_email} to: {recipient_email} with subject: {subject}")
         
         # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
@@ -2719,11 +2770,16 @@ class MicrosoftGraphService:
             "saveToSentItems": "true"
         }
         
+        # Add CC recipients if provided
+        if cc_recipients:
+            email_payload["message"]["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
+            logger.info(f"Including {len(cc_recipients)} CC recipients in new email: {cc_recipients}")
+        
         # Add attachments to payload if any were found
         if attachments_data:
             email_payload["message"]["attachments"] = attachments_data
             logger.info(f"Including {len(attachments_data)} attachments in new email")
-            
+        
         try:
             send_mail_endpoint = f"{self.graph_url}/users/{mailbox_email}/sendMail"
             headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}

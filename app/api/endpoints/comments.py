@@ -781,6 +781,8 @@ def send_email_in_background(
             return
             
         # Re-fetch task with user relationship loaded to get recipient email if needed
+        # IMPORTANTE: Forzar refresh desde la base de datos para obtener datos actualizados
+        db.expire_all()  # Expira todos los objetos en cache
         task_with_user = db.query(TaskModel).options(
             joinedload(TaskModel.user)
         ).filter(TaskModel.id == task_id).first()
@@ -788,7 +790,14 @@ def send_email_in_background(
         if not task_with_user:
             logger.error(f"[BACKGROUND] Task {task_id} not found when attempting to send email for comment {comment_id}.")
             return
-        elif task_with_user.mailbox_connection_id:
+        
+        # Log para debugging - mostrar información del usuario actual del ticket
+        if task_with_user.user:
+            logger.info(f"[BACKGROUND] Task {task_id} current user: {task_with_user.user.name} ({task_with_user.user.email})")
+        else:
+            logger.info(f"[BACKGROUND] Task {task_id} has no assigned user")
+            
+        if task_with_user.mailbox_connection_id:
             # Task originated from email, send a reply
             logger.info(f"[BACKGROUND] Task {task_id} originated from email. Attempting to send comment ID {comment_id} as reply with {len(processed_attachment_ids)} attachments.")
             microsoft_service = get_microsoft_service(db)
@@ -814,6 +823,14 @@ def send_email_in_background(
             sender_mailbox = sender_mailbox_conn.email
             subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
             html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
+
+            # Log detallado del envío de email
+            logger.info(f"[BACKGROUND] 📧 Sending email notification:")
+            logger.info(f"[BACKGROUND]   → From: {sender_mailbox}")
+            logger.info(f"[BACKGROUND]   → To: {recipient_email}")
+            logger.info(f"[BACKGROUND]   → Subject: {subject}")
+            logger.info(f"[BACKGROUND]   → Comment ID: {comment_id}")
+            logger.info(f"[BACKGROUND]   → Task ID: {task_id}")
 
             microsoft_service = get_microsoft_service(db)
             logger.info(f"[BACKGROUND] Sending new email notification for comment {comment_id} from {sender_mailbox} to {recipient_email} with {len(processed_attachment_ids)} attachments")

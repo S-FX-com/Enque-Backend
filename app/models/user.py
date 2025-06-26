@@ -16,6 +16,7 @@ class User(Base):
     company = relationship("Company", foreign_keys=[company_id], back_populates="users")
     workspace = relationship("Workspace", back_populates="users")
     tasks = relationship("Task", back_populates="user")
+    comments = relationship("Comment", back_populates="user")
 
 
 class UnassignedUser(Base):

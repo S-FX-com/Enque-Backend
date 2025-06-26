@@ -123,13 +123,6 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     
     # ✅ OPTIMIZACIÓN: Ejecutar procesos pesados en background usando threading
     try:
-        # Ejecutar automatizaciones en background thread
-        threading.Thread(
-            target=_execute_automations_thread,
-            args=(task_id, task.workspace_id),
-            daemon=True
-        ).start()
-        
         # Ejecutar workflows en background thread
         threading.Thread(
             target=_execute_workflows_thread,
@@ -177,35 +170,6 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         task_dict['email_info'] = None
     
     return task_dict
-
-
-def _execute_automations_thread(task_id: int, workspace_id: int):
-    """Ejecutar automatizaciones en background thread"""
-    try:
-        from app.services.automation_service import execute_automations_for_ticket
-        # Crear nueva sesión para background task
-        background_db = SessionLocal()
-        
-        try:
-            # Load the task with all relationships needed for automation conditions
-            task_with_relations = background_db.query(Task).options(
-                joinedload(Task.user),
-                joinedload(Task.assignee),
-                joinedload(Task.company),
-                joinedload(Task.category),
-                joinedload(Task.team)
-            ).filter(Task.id == task_id).first()
-            
-            if task_with_relations:
-                executed_actions = execute_automations_for_ticket(background_db, task_with_relations)
-                if executed_actions:
-                    logger.info(f"✅ Background automations executed for ticket {task_id}: {executed_actions}")
-                    background_db.commit()
-        finally:
-            background_db.close()
-        
-    except Exception as automation_error:
-        logger.error(f"❌ Error in background automations for ticket {task_id}: {str(automation_error)}", exc_info=True)
 
 
 def _execute_workflows_thread(task_id: int, workspace_id: int, old_assignee_id, old_status, old_priority, update_data):
