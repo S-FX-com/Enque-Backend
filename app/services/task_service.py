@@ -15,7 +15,7 @@ from app.database.session import SessionLocal
 from app.models.agent import Agent
 from app.models.microsoft import MailboxConnection, MicrosoftToken
 from app.core.config import settings
-from app.services.email_service import send_ticket_assignment_email
+from app.services.email_service import send_ticket_assignment_email, send_team_ticket_notification_email
 from app.services.microsoft_service import MicrosoftGraphService
 
 
@@ -134,6 +134,14 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         if 'assignee_id' in update_data and old_assignee_id != task.assignee_id and task.assignee_id is not None:
             threading.Thread(
                 target=_send_assignment_notification_thread,
+                args=(task_id, request_origin),
+                daemon=True
+            ).start()
+        
+        # Enviar notificación de equipo si se asigna a un equipo sin agente específico
+        if ('team_id' in update_data or 'assignee_id' in update_data) and task.team_id and not task.assignee_id:
+            threading.Thread(
+                target=_send_team_notification_thread,
                 args=(task_id, request_origin),
                 daemon=True
             ).start()
@@ -315,6 +323,35 @@ def _send_assignment_notification_thread(task_id: int, request_origin: Optional[
         logger.error(f"❌ Error sending background assignment notification for ticket {task_id}: {str(e)}", exc_info=True)
 
 
+def _send_team_notification_thread(task_id: int, request_origin: Optional[str] = None):
+    """Enviar notificación de equipo en background thread"""
+    try:
+        import asyncio
+        # Crear nueva sesión para background task
+        background_db = SessionLocal()
+        
+        try:
+            # Reload task
+            task = background_db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                return
+                
+            # Crear event loop para la función async
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                # Ejecutar la función async de notificación
+                loop.run_until_complete(send_team_notification(background_db, task, request_origin))
+                logger.info(f"✅ Background team notification sent for ticket {task_id}")
+            finally:
+                loop.close()
+        finally:
+            background_db.close()
+            
+    except Exception as e:
+        logger.error(f"❌ Error sending background team notification for ticket {task_id}: {str(e)}", exc_info=True)
+
+
 def delete_task(db: Session, task_id: int) -> Optional[Task]:
     """Soft delete a task"""
     task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
@@ -452,3 +489,95 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             
     except Exception as e:
         logger.error(f"Error inesperado al enviar notificación para el ticket {task.id}: {e}", exc_info=True)
+
+
+async def send_team_notification(db: Session, task: Task, request_origin: Optional[str] = None):
+    """
+    Envía notificación a todos los miembros de un equipo cuando se crea un ticket 
+    asignado al equipo pero sin agente específico asignado.
+    """
+    try:
+        # Solo enviar si el ticket tiene team_id pero NO tiene assignee_id
+        if not task.team_id or task.assignee_id:
+            return
+            
+        # Obtener todos los miembros del equipo
+        from app.models.team import TeamMember
+        team_members = db.query(TeamMember).join(Agent).filter(
+            TeamMember.team_id == task.team_id,
+            Agent.is_active == True,
+            Agent.email.isnot(None),
+            Agent.email != ""
+        ).all()
+        
+        if not team_members:
+            logger.info(f"No active team members found for team {task.team_id}")
+            return
+            
+        # Obtener información del equipo
+        from app.models.team import Team
+        team = db.query(Team).filter(Team.id == task.team_id).first()
+        team_name = team.name if team else f"Team {task.team_id}"
+        
+        logger.info(f"Sending team notification for ticket {task.id} to {len(team_members)} members of team '{team_name}'")
+        
+        # Obtener el primer mailbox disponible para enviar notificaciones
+        from app.models.microsoft import MailboxConnection
+        preferred_mailbox = db.query(MailboxConnection).filter(
+            MailboxConnection.workspace_id == task.workspace_id,
+            MailboxConnection.is_active == True
+        ).first()
+        
+        if not preferred_mailbox:
+            logger.error(f"No active mailbox found for workspace {task.workspace_id}")
+            return
+            
+        # Obtener el token más reciente para el mailbox
+        from app.models.microsoft import MicrosoftToken
+        preferred_token = db.query(MicrosoftToken).filter(
+            MicrosoftToken.mailbox_connection_id == preferred_mailbox.id
+        ).order_by(MicrosoftToken.created_at.desc()).first()
+        
+        if not preferred_token:
+            logger.error(f"No token found for mailbox {preferred_mailbox.email}")
+            return
+            
+        current_access_token = preferred_token.access_token
+        
+        # Refrescar token si está expirado
+        if preferred_token.expires_at < datetime.utcnow():
+            try:
+                logger.info(f"Refrescando token para el buzón {preferred_mailbox.email}")
+                graph_service = MicrosoftGraphService(db=db)
+                refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
+                current_access_token = refreshed_ms_token.access_token
+            except Exception as e:
+                logger.error(f"Error al refrescar token para enviar notificación de equipo: {e}")
+                return
+        
+        # Enviar notificación a cada miembro del equipo
+        for team_member in team_members:
+            try:
+                sent = await send_team_ticket_notification_email(
+                    db=db,
+                    to_email=team_member.agent.email,
+                    agent_name=team_member.agent.name,
+                    team_name=team_name,
+                    ticket_id=task.id,
+                    ticket_title=task.title,
+                    sender_mailbox_email=preferred_mailbox.email,
+                    sender_mailbox_display_name=preferred_mailbox.display_name,
+                    user_access_token=current_access_token,
+                    request_origin=request_origin
+                )
+                
+                if sent:
+                    logger.info(f"Team notification sent to {team_member.agent.name} ({team_member.agent.email}) for ticket {task.id}")
+                else:
+                    logger.error(f"Failed to send team notification to {team_member.agent.email} for ticket {task.id}")
+                    
+            except Exception as e:
+                logger.error(f"Error sending team notification to {team_member.agent.email}: {str(e)}")
+                
+    except Exception as e:
+        logger.error(f"Error inesperado al enviar notificaciones de equipo para el ticket {task.id}: {e}", exc_info=True)

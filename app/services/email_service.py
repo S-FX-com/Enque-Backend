@@ -421,6 +421,163 @@ async def send_ticket_assignment_email(
         logger.error(f"Exception in send_ticket_assignment_email for {to_email}: {e}", exc_info=True)
         return False
 
+def create_team_ticket_notification_email_html(agent_name: str, team_name: str, ticket_id: int, ticket_title: str, ticket_link: str, sender_name: Optional[str] = None) -> str:
+    """
+    Generates an HTML content for the team ticket notification email.
+    """
+    # Determinar el nombre del remitente para la despedida
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>New Team Ticket</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+                margin: 0;
+                padding: 20px;
+                background-color: #f4f4f7;
+                color: #333;
+            }}
+            .container {{
+                background-color: #ffffff;
+                max-width: 600px;
+                margin: 20px auto;
+                padding: 30px;
+                border-radius: 8px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                text-align: left;
+            }}
+
+            p {{
+                font-size: 16px;
+                line-height: 1.6;
+                margin-bottom: 1em;
+            }}
+            a.button {{
+                display: inline-block;
+                background-color: #007bff;
+                color: #ffffff;
+                padding: 12px 25px;
+                text-decoration: none;
+                border-radius: 5px;
+                font-weight: bold;
+                margin-top: 10px;
+                margin-bottom: 20px;
+            }}
+            .footer {{
+                font-size: 14px;
+                color: #777;
+                margin-top: 25px;
+            }}
+            .ticket-info {{
+                background-color: #f8f9fa;
+                padding: 15px;
+                border-radius: 5px;
+                margin: 20px 0;
+                border-left: 4px solid #007bff;
+            }}
+            .team-badge {{
+                background-color: #e3f2fd;
+                color: #1976d2;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                font-weight: bold;
+                display: inline-block;
+                margin-bottom: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2 style="color: #333; margin-bottom: 20px;">New Ticket for Your Team</h2>
+            
+            <p>Hi {agent_name},</p>
+            
+            <p>A new ticket has been created and assigned to your team <strong>{team_name}</strong>. This ticket doesn't have a specific agent assigned yet, so any team member can take it.</p>
+            
+            <div class="ticket-info">
+                <div class="team-badge">Team: {team_name}</div>
+                <p style="margin: 0 0 10px 0;"><strong>Ticket ID:</strong> #{ticket_id}</p>
+                <p style="margin: 0;"><strong>Title:</strong> {ticket_title}</p>
+            </div>
+            
+            <p>You can view and claim this ticket by clicking the button below:</p>
+            
+            <a href="{ticket_link}" class="button">View Ticket</a>
+            
+            <p>If you decide to work on this ticket, you can assign it to yourself from the ticket page.</p>
+            
+            <div class="footer">
+                <p>Best regards,<br>{footer_sender}</p>
+                <p style="font-size: 12px; color: #999;">This is an automated notification. Please do not reply to this email.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
+
+
+async def send_team_ticket_notification_email(
+    db: Session,
+    to_email: str,
+    agent_name: str,
+    team_name: str,
+    ticket_id: int,
+    ticket_title: str,
+    sender_mailbox_email: str,
+    user_access_token: str,
+    request_origin: Optional[str] = None,
+    sender_mailbox_display_name: Optional[str] = None
+) -> bool:
+    """
+    Sends a notification email to a team member when a new ticket is assigned to their team.
+    """
+    subject = f"[ID:{ticket_id}] New ticket for team {team_name}: {ticket_title}"
+
+    # Use the origin URL if provided, otherwise fallback to settings.FRONTEND_URL
+    base_url = request_origin if request_origin else settings.FRONTEND_URL
+    ticket_link = f"{base_url}/tickets/{ticket_id}"
+
+    html_content = create_team_ticket_notification_email_html(
+        agent_name,
+        team_name,
+        ticket_id,
+        ticket_title,
+        ticket_link,
+        sender_mailbox_display_name
+    )
+
+    try:
+        graph_service = MicrosoftGraphService(db=db)
+
+        success = await graph_service.send_email_with_user_token(
+            user_access_token=user_access_token,
+            sender_mailbox_email=sender_mailbox_email,
+            recipient_email=to_email,
+            subject=subject,
+            html_body=html_content,
+            task_id=ticket_id
+        )
+        if success:
+            logger.info(f"Team ticket notification email sent successfully to {to_email} from {sender_mailbox_email} ({sender_mailbox_display_name or 'No display name'})")
+            return True
+        else:
+            logger.error(f"Failed to send team ticket notification email to {to_email} using MicrosoftGraphService.send_email_with_user_token from {sender_mailbox_email}")
+            return False
+    except Exception as e:
+        logger.error(f"Exception in send_team_ticket_notification_email for {to_email}: {e}", exc_info=True)
+        return False
+
 def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
     """
     Validate a comma-separated string of email addresses.

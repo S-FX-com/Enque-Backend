@@ -1455,50 +1455,64 @@ class MicrosoftGraphService:
                         finally:
                             loop.close()
                     
-                    # 2. Notificar a todos los agentes activos en el workspace
-                    active_agents = self.db.query(Agent).filter(
-                        Agent.workspace_id == workspace_id,
-                        Agent.is_active == True,
-                        Agent.email != None,
-                        Agent.email != ""
-                    ).all()
-                    
-                    # Preparar variables de plantilla para notificaciones de agentes
-                    agent_template_vars = {
-                        "ticket_id": task.id,
-                        "ticket_title": task.title,
-                        "user_name": user.name if user else "Unknown User"
-                    }
-                    
-                    # Notificar a cada agente activo
-                    for agent in active_agents:
-                        # Si el agente es el asignado, añadir información adicional 
-                        if assigned_agent and agent.id == assigned_agent.id:
-                            agent_template_vars["agent_name"] = agent.name
-                        else:
-                            agent_template_vars["agent_name"] = agent.name
-                        
-                        # Solo enviar si el agente no está en un dominio del sistema
-                        if not any(domain in agent.email.lower() for domain in system_domains):
+                    # 2. Notificar a miembros del equipo si el ticket está asignado a un equipo sin agente específico
+                    if task.team_id and not task.assignee_id:
+                        try:
+                            from app.services.task_service import send_team_notification
                             loop = asyncio.new_event_loop()
                             try:
-                                loop.run_until_complete(
-                                    send_notification(
-                                        db=self.db,
-                                        workspace_id=workspace_id,
-                                        category="agents",
-                                        notification_type="new_ticket_created",
-                                        recipient_email=agent.email,
-                                        recipient_name=agent.name,
-                                        template_vars=agent_template_vars,
-                                        task_id=task.id
-                                    )
-                                )
-                                logger.info(f"Notification for new ticket {task.id} sent to agent {agent.name}")
-                            except Exception as agent_notify_err:
-                                logger.warning(f"Failed to send notification to agent {agent.name}: {str(agent_notify_err)}")
+                                loop.run_until_complete(send_team_notification(self.db, task))
+                                logger.info(f"Team notification sent for ticket {task.id} assigned to team {task.team_id}")
                             finally:
                                 loop.close()
+                        except Exception as team_notify_err:
+                            logger.warning(f"Failed to send team notification for ticket {task.id}: {str(team_notify_err)}")
+                    
+                    # 3. Notificar a todos los agentes activos en el workspace (solo si no es un ticket de equipo)
+                    elif not task.team_id:
+                        active_agents = self.db.query(Agent).filter(
+                            Agent.workspace_id == workspace_id,
+                            Agent.is_active == True,
+                            Agent.email != None,
+                            Agent.email != ""
+                        ).all()
+                    
+                        # Preparar variables de plantilla para notificaciones de agentes
+                        agent_template_vars = {
+                            "ticket_id": task.id,
+                            "ticket_title": task.title,
+                            "user_name": user.name if user else "Unknown User"
+                        }
+                        
+                        # Notificar a cada agente activo
+                        for agent in active_agents:
+                            # Si el agente es el asignado, añadir información adicional 
+                            if assigned_agent and agent.id == assigned_agent.id:
+                                agent_template_vars["agent_name"] = agent.name
+                            else:
+                                agent_template_vars["agent_name"] = agent.name
+                            
+                            # Solo enviar si el agente no está en un dominio del sistema
+                            if not any(domain in agent.email.lower() for domain in system_domains):
+                                loop = asyncio.new_event_loop()
+                                try:
+                                    loop.run_until_complete(
+                                        send_notification(
+                                            db=self.db,
+                                            workspace_id=workspace_id,
+                                            category="agents",
+                                            notification_type="new_ticket_created",
+                                            recipient_email=agent.email,
+                                            recipient_name=agent.name,
+                                            template_vars=agent_template_vars,
+                                            task_id=task.id
+                                        )
+                                    )
+                                    logger.info(f"Notification for new ticket {task.id} sent to agent {agent.name}")
+                                except Exception as agent_notify_err:
+                                    logger.warning(f"Failed to send notification to agent {agent.name}: {str(agent_notify_err)}")
+                                finally:
+                                    loop.close()
                     
                 except Exception as e:
                     logger.error(f"Error sending notifications for ticket {task.id} created from email: {str(e)}", exc_info=True)

@@ -1,27 +1,25 @@
 from typing import Any, List, Dict
-from datetime import datetime # Import datetime
+from datetime import datetime 
 import asyncio
 import base64
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
-from sqlalchemy.orm import Session, joinedload # Re-import joinedload
+from sqlalchemy.orm import Session, joinedload 
 from pydantic import BaseModel
 
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
-# Use aliases for clarity if needed, or use original names
 from app.models.agent import Agent as AgentModel
 from app.models.comment import Comment as CommentModel
-from app.models.task import Task as TaskModel # Keep TaskModel alias
-from app.models.activity import Activity # Añadir importación de Activity
-from app.models.microsoft import MailboxConnection # Import MailboxConnection
-# CommentSchema now includes the agent object due to previous edit
+from app.models.task import Task as TaskModel 
+from app.models.activity import Activity 
+from app.models.microsoft import MailboxConnection 
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
-from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails # Import Task schema and detailed schema
+from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails 
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
 from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
-from app.core.socketio import emit_comment_update_sync # Import Socket.IO sync function
+from app.core.socketio import emit_comment_update_sync 
 from app.core.config import settings
 from app.services.workflow_service import WorkflowService
 from app.services.s3_service import get_s3_service
@@ -30,7 +28,6 @@ from app.models.ticket_attachment import TicketAttachment
 
 router = APIRouter()
 
-# Create a response model for the comment creation endpoint
 class CommentResponseModel(BaseModel):
     comment: CommentSchema
     task: TicketWithDetails
@@ -53,7 +50,6 @@ async def read_comments(
     Retrieve all comments for a task, ensuring the task belongs to the user's workspace.
     Includes agent details for each comment.
     """
-    # Verificar que la tarea existe y pertenece al workspace del usuario (using model alias)
     task = db.query(TaskModel).filter(
         TaskModel.id == task_id,
         TaskModel.workspace_id == current_user.workspace_id, # Check workspace
@@ -65,11 +61,10 @@ async def read_comments(
         logger.error(f"Endpoint read_comments: Query failed to find active Task with id={task_id} in workspace {current_user.workspace_id}. Raising 404.")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found", # Keep detail generic for security
+            detail="Task not found", 
         )
 
-    # Query comments and explicitly load the 'agent' relationship
-    # because the updated CommentSchema now expects it.
+
     comments_orm = db.query(CommentModel).options(
         joinedload(CommentModel.agent), # Eager load agente
         joinedload(CommentModel.attachments) # Eager load adjuntos
@@ -77,9 +72,6 @@ async def read_comments(
         CommentModel.ticket_id == task_id # Use correct column name
     )
 
-    # Filter out private comments if the user is not an agent or admin
-    #if current_user.role != "admin":
-    #    comments_orm = comments_orm.filter(CommentModel.is_private == False)
 
     comments_orm = comments_orm.order_by(
         CommentModel.created_at.asc()  # Order ascending for conversation flow
@@ -148,6 +140,10 @@ async def create_comment(
 
     if not comment_in.is_private and task.status != "Closed":
         task.status = "With User"
+        db.add(task)
+
+    if task.status == "Closed":
+        task.status = "Open"
         db.add(task)
   
     if task.assignee_id is None and not comment_in.preserve_assignee:
@@ -248,10 +244,10 @@ async def create_comment(
         ticket_id=task_id,
         agent_id=current_user.id,
         workspace_id=current_user.workspace_id,
-        content=content_to_store,  # Usar contenido procesado
-        s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
-        other_destinaries=comment_in.other_destinaries,  # CC recipients
-        bcc_recipients=comment_in.bcc_recipients,        # BCC recipients
+        content=content_to_store,  
+        s3_html_url=s3_html_url,  
+        other_destinaries=comment_in.other_destinaries,  
+        bcc_recipients=comment_in.bcc_recipients,        
         is_private=comment_in.is_private
     )
     db.add(comment)
@@ -383,11 +379,9 @@ async def create_comment(
             
     except Exception as e:
         logger.error(f"Error processing workflows for comment {comment.id}: {str(e)}")
-        # Continue without failing the comment creation
 
-    # Log the activity (agent created comment) - ahora comment.id no será None
     try:
-        # Crear actividad para el comentario con información del ticket
+        # Crear  para el comentario con información del ticket
         activity = Activity(
             agent_id=current_user.id,
             source_type="Comment",  # Cambiar a Comment para distinguir de creación de tickets
@@ -399,9 +393,6 @@ async def create_comment(
         logger.info(f"Activity logged for comment creation: comment {comment.id} on task {task_id} by agent {current_user.id}")
     except Exception as e:
         logger.error(f"Error creating activity for comment {comment.id}: {e}")
-        # No hacemos rollback aquí, solo registramos el error
-
-    # Hacemos un commit final para guardar todo (activity)
     db.commit()
     db.refresh(task)  # Ensure the task is fresh
     db.refresh(comment)
@@ -417,10 +408,8 @@ async def create_comment(
             workspace_id=task.workspace_id,
             context=context
         )
-        
-        # Workflows específicos según el tipo de comentario
+
         if not comment_in.is_private:
-            # Determinar si es respuesta de agente o cliente
             if current_user:  # Es un agente
                 executed_workflows.extend(WorkflowService.execute_workflows(
                     db=db,
@@ -464,27 +453,16 @@ async def create_comment(
         except Exception as e:
             logger.error(f"Error scheduling assignment notification from comment: {e}", exc_info=True)
     
-    # --- Send Notifications Based on Settings ---
     try:
-        # Import notification service
         from app.services.notification_service import send_notification
 
-        # 1. For agent comments (solo notificar a otros agentes, NO a los usuarios)
         if not comment_in.is_private and not comment_in.is_attachment_upload:
-            # ELIMINAMOS LA NOTIFICACIÓN AL USUARIO CUANDO UN AGENTE RESPONDE
-            # Los usuarios solo deben recibir notificaciones cuando:
-            # 1. Se crea un ticket (ya implementado en _create_task_from_email)
-            # 2. Se resuelve un ticket (ya implementado en update_task cuando status='Closed')
-            
-            # Get the task user for reference (needed for agent notifications)
+
             task_user = None
             if task.user_id:
                 from app.models.user import User
                 task_user = db.query(User).filter(User.id == task.user_id).first()
-            
-            # 2. Notify other agents about new response
-            # La función send_notification ya verifica si la notificación está habilitada
-            # en la configuración del workspace
+
             agents = db.query(AgentModel).filter(
                 AgentModel.workspace_id == task.workspace_id,
                 AgentModel.is_active == True,
@@ -528,7 +506,6 @@ async def create_comment(
         db.rollback()
         raise HTTPException(status_code=500, detail="Error saving comment")
 
-    # Add email processing to background tasks if the comment is not private
     if not comment_in.is_private:
         try:
             # Get the database path for background task
@@ -573,7 +550,6 @@ async def create_comment(
         assignee_changed=assignee_changed
     )
     
-    # ✅ EMIT SOCKET.IO EVENT para actualización en tiempo real
     try:
         comment_data = {
             'id': comment.id,
@@ -671,16 +647,12 @@ async def update_comment(
             detail="Comment not found",
         )
 
-    # Verificar que el agente actual es el propietario del comentario o es admin
-    # Corrected: Check against agent_id, not user_id
     if comment.agent_id != current_user.id and current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not enough permissions to update this comment",
         )
 
-    # Check if the comment belongs to the current user's workspace before updating
-    # Although agent check above might suffice, this adds an explicit layer.
     if comment.workspace_id != current_user.workspace_id:
          raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -715,8 +687,7 @@ async def delete_comment(
             detail="Comment not found",
         )
 
-    # Verificar que el agente actual es el propietario del comentario o es admin
-    # Corrected: Check against agent_id, not user_id
+
     if comment.agent_id != current_user.id and current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -867,12 +838,10 @@ def get_comment_s3_content(
         comment = db.query(CommentModel).filter(CommentModel.id == comment_id).first()
         if not comment:
             raise HTTPException(status_code=404, detail="Comment not found")
-        
-        # Check workspace access
+
         if comment.workspace_id != current_user.workspace_id:
             raise HTTPException(status_code=403, detail="Not authorized to access this comment")
         
-        # Check if comment has S3 URL
         if not comment.s3_html_url:
             return {
                 "status": "content_in_database",
@@ -880,12 +849,10 @@ def get_comment_s3_content(
                 "message": "Comment content is stored in database, not S3"
             }
         
-        # Get content from S3 with optimized settings
         s3_service = get_s3_service()
         s3_content = s3_service.get_comment_html(comment.s3_html_url)
         
         if not s3_content:
-            # Fallback to database content if S3 fails
             logger.warning(f"Failed to retrieve content from S3 for comment {comment_id}, falling back to database")
             return {
                 "status": "s3_error_fallback",
@@ -893,7 +860,6 @@ def get_comment_s3_content(
                 "message": "Failed to retrieve from S3, showing database content"
             }
         
-        # NUEVO: Procesar imágenes CID que puedan estar en el contenido de S3
         try:
             # Buscar el ticket asociado para obtener el ID
             ticket = db.query(TaskModel).filter(TaskModel.id == comment.ticket_id).first()
@@ -901,12 +867,9 @@ def get_comment_s3_content(
                 # Procesar el HTML para las imágenes CID
                 from app.services.microsoft_service import MicrosoftGraphService
                 ms_service = MicrosoftGraphService(db)
-                
-                # Como no tenemos attachments reales, buscamos imágenes CID en el HTML
-                # que podrían no haberse procesado correctamente
+
                 processed_content = s3_content
                 
-                # Buscar patrones de imágenes CID no procesadas en el HTML
                 import re
                 from bs4 import BeautifulSoup
                 
@@ -916,16 +879,13 @@ def get_comment_s3_content(
                 if cid_images_found:
                     logger.info(f"Found {len(cid_images_found)} unprocessed CID images in S3 content for comment {comment_id}")
                     
-                    # Buscar adjuntos inline del comentario para procesar CID
                     inline_attachments = db.query(TicketAttachment).filter(
                         TicketAttachment.comment_id == comment_id
                     ).all()
                     
-                    # Convertir a EmailAttachment format para compatibility
                     email_attachments = []
                     for att in inline_attachments:
                         if att.content_bytes and att.content_type and att.content_type.startswith('image/'):
-                            # Crear EmailAttachment compatible
                             email_att = type('EmailAttachment', (), {
                                 'contentId': att.file_name.replace('.', '_'),  # Usar filename como contentId
                                 'is_inline': True,
@@ -935,7 +895,6 @@ def get_comment_s3_content(
                             email_attachments.append(email_att)
                     
                     if email_attachments:
-                        # Procesar con el método existente
                         processed_content = ms_service._process_html_body(
                             s3_content, 
                             email_attachments, 
@@ -943,7 +902,6 @@ def get_comment_s3_content(
                         )
                         logger.info(f"Processed CID images for S3 comment {comment_id}")
                 
-                # También procesar imágenes base64 que podrían estar en el contenido
                 final_content, extracted_images = extract_base64_images(processed_content, ticket.id)
                 
                 if extracted_images:
@@ -958,17 +916,13 @@ def get_comment_s3_content(
             processed_content = s3_content
         
         from fastapi import Response
-        
-        # Create response with caching headers for better performance
         response_data = {
             "status": "loaded_from_s3",
             "content": processed_content,  # Usar contenido procesado
             "s3_url": comment.s3_html_url,
             "message": "Content loaded from S3"
-        }
-        
-        return response_data
-        
+        }     
+        return response_data      
     except Exception as e:
         logger.error(f"❌ Error getting S3 content for comment {comment_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get comment content: {str(e)}")
