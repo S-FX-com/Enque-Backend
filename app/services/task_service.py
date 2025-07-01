@@ -138,7 +138,6 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
                 daemon=True
             ).start()
         
-        # Enviar notificación de equipo si se asigna a un equipo sin agente específico
         if ('team_id' in update_data or 'assignee_id' in update_data) and task.team_id and not task.assignee_id:
             threading.Thread(
                 target=_send_team_notification_thread,
@@ -499,6 +498,12 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
     try:
         # Solo enviar si el ticket tiene team_id pero NO tiene assignee_id
         if not task.team_id or task.assignee_id:
+            return
+            
+        # Verificar si las notificaciones de equipo están habilitadas
+        from app.services.notification_service import is_team_notification_enabled
+        if not is_team_notification_enabled(db, task.workspace_id):
+            logger.info(f"Team notifications are disabled for workspace {task.workspace_id}, skipping notification for ticket {task.id}")
             return
             
         # Obtener todos los miembros del equipo

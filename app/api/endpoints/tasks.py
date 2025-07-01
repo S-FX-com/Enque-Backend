@@ -259,20 +259,6 @@ async def create_task(
             logger.error(f"Failed to send assignment notification for task {task.id}: {str(e)}")
     # --- End Assignment Notification ---
 
-    # --- Team Notification ---
-    # Send notification to team members if ticket is assigned to team but no specific agent
-    if task.team_id and not task.assignee_id:
-        try:
-            request_origin = None
-            if request:
-                request_origin = str(request.headers.get("origin", ""))
-                logger.info(f"Request origin detected for team notification: {request_origin}")
-            from app.services.task_service import send_team_notification
-            await send_team_notification(db, task, request_origin)
-        except Exception as e:
-            logger.error(f"Failed to send team notification for task {task.id}: {str(e)}")
-    # --- End Team Notification ---
-
     # --- Socket.IO Event ---
     try:
         # Emit new ticket event to all workspace clients

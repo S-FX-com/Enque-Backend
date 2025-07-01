@@ -1024,6 +1024,99 @@ class MicrosoftGraphService:
             logger.error(f"❌ Error during mappings cleanup: {str(e)}")
             self.db.rollback()
 
+    def _extract_original_sender_from_forwarded_email(self, email_content: str, subject: str = "") -> tuple[Optional[str], Optional[str]]:
+        """
+        Detecta si un email es reenviado y extrae el remitente original del contenido.
+        
+        Returns:
+            tuple[email, name] del remitente original, o (None, None) si no se detecta forward
+        """
+        if not email_content:
+            return None, None
+        
+        # Patrones para detectar emails reenviados
+        forwarded_patterns = [
+            r"---------- Forwarded message ---------",
+            r"Begin forwarded message:",
+            r"-----Original Message-----",
+            r"-----Mensaje original-----",
+            r"From:.*?<br>",
+            r"De:.*?<br>",
+            r"Subject.*?FW:|Subject.*?Fwd:",
+            r"Asunto.*?RV:|Asunto.*?Reenviado:"
+        ]
+        
+        # Verificar si es un email reenviado
+        is_forwarded = any(re.search(pattern, email_content, re.IGNORECASE | re.DOTALL) 
+                          for pattern in forwarded_patterns)
+        
+        # También verificar el asunto
+        if subject:
+            subject_forwarded_patterns = [r"^FW:", r"^Fwd:", r"^RV:", r"^Reenviado:"]
+            is_forwarded = is_forwarded or any(re.search(pattern, subject, re.IGNORECASE) 
+                                             for pattern in subject_forwarded_patterns)
+        
+        if not is_forwarded:
+            return None, None
+        
+        logger.info(f"[FORWARD DETECTION] Email detected as forwarded. Extracting original sender...")
+        
+        # Patrones para extraer información del remitente original
+        # Formato típico: "From: Name <email@domain.com>"
+        original_sender_patterns = [
+            # Formato HTML
+            r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*&lt;([^&]+?)&gt;</p>",
+            r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*<([^>]+?)></p>",
+            r"<div[^>]*><strong>From:</strong>\s*([^<]+?)\s*&lt;([^&]+?)&gt;</div>",
+            
+            # Formato texto plano en HTML
+            r"From:\s*([^<\n]+?)\s*&lt;([^&\n]+?)&gt;",
+            r"From:\s*([^<\n]+?)\s*<([^>\n]+?)>",
+            r"De:\s*([^<\n]+?)\s*&lt;([^&\n]+?)&gt;",
+            r"De:\s*([^<\n]+?)\s*<([^>\n]+?)>",
+            
+            # Solo email sin nombre
+            r"From:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+            r"De:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+            
+            # Otros formatos comunes
+            r"From:\s*\"?([^\"<\n]+?)\"?\s*&lt;([^&\n]+?)&gt;",
+            r"From:\s*\"?([^\"<\n]+?)\"?\s*<([^>\n]+?)>"
+        ]
+        
+        for pattern in original_sender_patterns:
+            match = re.search(pattern, email_content, re.IGNORECASE | re.DOTALL)
+            if match:
+                if len(match.groups()) == 2:
+                    # Patrón con nombre y email
+                    name = match.group(1).strip().strip('"').strip("'")
+                    email = match.group(2).strip()
+                elif len(match.groups()) == 1:
+                    # Solo email
+                    email = match.group(1).strip()
+                    name = email.split('@')[0]  # Usar la parte antes del @ como nombre
+                else:
+                    continue
+                
+                # Validar que el email sea válido
+                if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+                    logger.info(f"[FORWARD DETECTION] Original sender found: {name} <{email}>")
+                    return email, name
+        
+        # Si no encontramos con patrones específicos, buscar cualquier email en el contenido
+        # que no sea el remitente actual
+        email_pattern = r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
+        emails_in_content = re.findall(email_pattern, email_content)
+        
+        if emails_in_content:
+            # Tomar el primer email encontrado (probablemente el original)
+            first_email = emails_in_content[0]
+            logger.info(f"[FORWARD DETECTION] Fallback: Using first email found in content: {first_email}")
+            return first_email, first_email.split('@')[0]
+        
+        logger.warning(f"[FORWARD DETECTION] Could not extract original sender from forwarded email")
+        return None, None
+
     def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
@@ -1131,7 +1224,25 @@ class MicrosoftGraphService:
             elif email.importance == "low": priority = "Low"
             workspace_id = config.workspace_id
             if not workspace_id: logger.error(f"Missing workspace_id in sync config {config.id}. Cannot create user/task."); return None
-            user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+            
+            # 🔧 NUEVA FUNCIONALIDAD: Detectar emails reenviados y extraer remitente original
+            original_email, original_name = self._extract_original_sender_from_forwarded_email(
+                email.body_content, email.subject
+            )
+            
+            if original_email and original_name:
+                # Email reenviado: usar remitente original como contacto principal
+                logger.info(f"[FORWARD DETECTION] Creating ticket with original sender: {original_name} <{original_email}>")
+                user = get_or_create_user(self.db, original_email, original_name, workspace_id=workspace_id)
+                
+                # Guardar información del forward para referencias futuras
+                forwarded_by_email = email.sender.address
+                forwarded_by_name = email.sender.name or "Unknown"
+                logger.info(f"[FORWARD DETECTION] Email was forwarded by: {forwarded_by_name} <{forwarded_by_email}>")
+            else:
+                # Email normal: usar remitente directo
+                user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+            
             if not user: logger.error(f"Could not get or create user for email: {email.sender.address} in workspace {workspace_id}"); return None
             company_id = user.company_id; assigned_agent = None
             if config.auto_assign and config.default_assignee_id:
@@ -1161,6 +1272,22 @@ class MicrosoftGraphService:
                     cc_recipients_str = ", ".join(cc_emails)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
             
+            # 🔧 NUEVA FUNCIONALIDAD: Incluir quien hizo forward en CC si aplica
+            if original_email and original_name:
+                # Si el email fue reenviado, agregar quien lo reenvió a los CCs
+                forwarded_by_email = email.sender.address
+                if cc_recipients_str:
+                    cc_recipients_str = f"{cc_recipients_str}, {forwarded_by_email}"
+                else:
+                    cc_recipients_str = forwarded_by_email
+                logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_email}")
+                
+                # Usar remitente original en email_sender
+                email_sender_field = f"{original_name} <{original_email}>"
+            else:
+                # Email normal
+                email_sender_field = f"{email.sender.name} <{email.sender.address}>"
+            
             # Crear el ticket sin descripción inicial
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
@@ -1168,7 +1295,7 @@ class MicrosoftGraphService:
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
                 email_message_id=email.id, email_conversation_id=email.conversation_id,
-                email_sender=f"{email.sender.name} <{email.sender.address}>", cc_recipients=cc_recipients_str)
+                email_sender=email_sender_field, cc_recipients=cc_recipients_str)
             self.db.add(task); self.db.flush()
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
@@ -1228,9 +1355,13 @@ class MicrosoftGraphService:
             # del contenido del comentario con un formato específico que el frontend detectará para mostrar al usuario original.
             # Esto evita aparecer como "Admin Demo" y muestra correctamente al usuario original.
             
-            # Formato especial para que el frontend reconozca este comentario como proveniente del usuario
-            # <original-sender>User_Name|user_email@example.com</original-sender>
-            special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
+            # 🔧 NUEVA FUNCIONALIDAD: Mostrar remitente original si fue reenviado
+            if original_email and original_name:
+                # Email reenviado: mostrar remitente original
+                special_metadata = f'<original-sender>{original_name}|{original_email}</original-sender>'
+            else:
+                # Email normal: usar usuario directo
+                special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
             
             # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
             content_to_store = special_metadata + processed_html

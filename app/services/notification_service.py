@@ -207,6 +207,37 @@ def format_notification_settings_response(
     return response
 
 
+def is_team_notification_enabled(db: Session, workspace_id: int) -> bool:
+    """
+    Check if team notifications are enabled for a workspace.
+    
+    Args:
+        db: Database session
+        workspace_id: Workspace ID
+        
+    Returns:
+        bool: Whether team notifications are enabled
+    """
+    try:
+        notification_setting = db.query(NotificationSetting).filter(
+            NotificationSetting.workspace_id == workspace_id,
+            NotificationSetting.category == "agents",
+            NotificationSetting.type == "new_ticket_for_team",
+            NotificationSetting.is_enabled == True
+        ).first()
+        
+        if not notification_setting:
+            return False
+        
+        # Check if email channel is enabled for this notification
+        channels = json.loads(notification_setting.channels) if isinstance(notification_setting.channels, str) else notification_setting.channels
+        return "email" in channels
+        
+    except Exception as e:
+        logger.error(f"Error checking team notification setting for workspace {workspace_id}: {str(e)}")
+        return False
+
+
 async def send_notification(
     db: Session,
     workspace_id: int,
