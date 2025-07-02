@@ -648,17 +648,26 @@ class MicrosoftGraphService:
                                     self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                 break
                     
-                    # Si es una notificación del sistema, continuamos con el siguiente correo
-                    if is_system_notification:
-                        continue
-                    
+                    # 🔧 PRIMERO obtener contenido completo del email
                     email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     conversation_id = email_content.get("conversationId")
                     
+                    # 🔧 PRIORIDAD MÁXIMA: Verificar si es respuesta a ticket existente ANTES de filtros
                     existing_mapping_by_conv = None
                     if conversation_id:
                         existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
+                    
+                    # 🔧 TAMBIÉN verificar por ID en asunto como método alternativo
+                    if not existing_mapping_by_conv and email_subject:
+                        # Buscar [ID:XXXX] en el asunto
+                        import re
+                        id_match = re.search(r'\[ID:(\d+)\]', email_subject, re.IGNORECASE)
+                        if id_match:
+                            ticket_id_from_subject = int(id_match.group(1))
+                            existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == ticket_id_from_subject).order_by(EmailTicketMapping.created_at.asc()).first()
+                            if existing_mapping_by_conv:
+                                logger.info(f"[MAIL SYNC] Found existing ticket {ticket_id_from_subject} by subject ID for email {email_id}")
                         
                     if existing_mapping_by_conv:
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
@@ -910,6 +919,13 @@ class MicrosoftGraphService:
                                 self._update_all_email_mappings_for_ticket(existing_mapping_by_conv.ticket_id, email_id, new_reply_id)
                         continue
                     else:
+                        # 🔧 APLICAR filtros solo para emails que NO son respuestas a tickets existentes
+                        
+                        # Si es una notificación del sistema, continuamos con el siguiente correo
+                        if is_system_notification:
+                            logger.info(f"[MAIL SYNC] Skipping system notification email: {email_subject}")
+                            continue
+                        
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: 
@@ -1183,17 +1199,34 @@ class MicrosoftGraphService:
         if email.subject:
             subject_lower = email.subject.lower()
             
-            # Lista completa de patrones de notificación
-            notification_patterns = [
-                "[id:", "new ticket #", "ticket #", "new response", 
-                "resolved", "assigned", "has been created", "notification:",
-                "automated message", "do not reply", "noreply"
-            ]
-            
-            # Si el asunto contiene patrones claros de notificación, rechazar
-            if any(pattern in subject_lower for pattern in notification_patterns):
-                logger.warning(f"Ignorando correo con asunto '{email.subject}' que parece ser una notificación del sistema")
-                return None
+            # 🔧 PERMITIR emails con FW/Fwd (forwards) independientemente del contenido
+            if any(fw_pattern in subject_lower for fw_pattern in ["fw:", "fwd:", "rv:", "reenviado:"]):
+                logger.info(f"Permitiendo email con forward en asunto: '{email.subject}'")
+            else:
+                # Lista completa de patrones de notificación (solo para emails que NO son forwards)
+                notification_patterns = [
+                    "new ticket #", "ticket #", "new response", 
+                    "resolved", "assigned", "has been created", "notification:",
+                    "automated message", "do not reply", "noreply"
+                ]
+                
+                # Si el asunto contiene patrones claros de notificación, rechazar
+                if any(pattern in subject_lower for pattern in notification_patterns):
+                    logger.warning(f"Ignorando correo con asunto '{email.subject}' que parece ser una notificación del sistema")
+                    return None
+                
+                # 🔧 PERMITIR respuestas legítimas: si contiene [ID:] pero viene de dominio externo, probablemente es respuesta de usuario
+                if "[id:" in subject_lower:
+                    sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
+                    system_domains = self._get_system_domains_for_workspace(config.workspace_id)
+                    core_system_domains = ["enque.cc", "microsoftexchange"]
+                    
+                    # Si viene de dominio externo (no del sistema), probablemente es respuesta legítima
+                    if sender_domain not in core_system_domains and sender_domain not in system_domains:
+                        logger.info(f"Permitiendo respuesta de usuario externo con [ID:] en asunto: {email.sender.address} - '{email.subject}'")
+                    else:
+                        logger.warning(f"Ignorando correo con [ID:] de dominio del sistema: {email.sender.address} - '{email.subject}'")
+                        return None
                 
         # Verificación adicional por dominio solo para notificaciones obvias
         sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
@@ -1355,10 +1388,14 @@ class MicrosoftGraphService:
             # del contenido del comentario con un formato específico que el frontend detectará para mostrar al usuario original.
             # Esto evita aparecer como "Admin Demo" y muestra correctamente al usuario original.
             
-            # 🔧 NUEVA FUNCIONALIDAD: Mostrar remitente original si fue reenviado
+            # 🔧 NUEVA FUNCIONALIDAD: Mostrar quien realmente envió el mensaje en la conversación
             if original_email and original_name:
-                # Email reenviado: mostrar remitente original
-                special_metadata = f'<original-sender>{original_name}|{original_email}</original-sender>'
+                # Email reenviado: mostrar quien hizo el forward en la conversación 
+                # (el contacto principal ya está correcto como Richard)
+                forward_sender_name = email.sender.name or "Unknown Forwarder"
+                forward_sender_email = email.sender.address
+                special_metadata = f'<original-sender>{forward_sender_name}|{forward_sender_email}</original-sender>'
+                logger.info(f"[FORWARD DETECTION] Conversation will show forwarder: {forward_sender_name} <{forward_sender_email}>")
             else:
                 # Email normal: usar usuario directo
                 special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
