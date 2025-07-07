@@ -351,7 +351,7 @@ def _format_notification_settings_optimized(
         "users": {
             "email": {
                 "new_ticket_created": {"is_enabled": False, "id": None, "template": None},
-                "ticket_resolved": {"is_enabled": False, "id": None, "template": None},
+                "ticket_closed": {"is_enabled": False, "id": None, "template": None},
                 "new_agent_response": {"is_enabled": False, "id": None, "template": None}
             }
         }
@@ -416,8 +416,8 @@ def _format_notification_settings_optimized(
                     "id": setting.id,
                     "template": template_content
                 }
-            elif setting.type == "ticket_resolved" and "email" in channels:
-                response_data["users"]["email"]["ticket_resolved"] = {
+            elif setting.type == "ticket_closed" and "email" in channels:
+                response_data["users"]["email"]["ticket_closed"] = {
                     "is_enabled": setting.is_enabled,
                     "id": setting.id,
                     "template": template_content

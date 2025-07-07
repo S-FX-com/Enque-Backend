@@ -277,13 +277,13 @@ def _send_closure_notification_thread(task_id: int):
                         db=background_db,
                         workspace_id=task_with_user.workspace_id,
                         category="users",
-                        notification_type="ticket_resolved",
+                        notification_type="ticket_closed",
                         recipient_email=task_with_user.user.email,
                         recipient_name=task_with_user.user.name,
                         template_vars=template_vars,
                         task_id=task_with_user.id
                     ))
-                    logger.info(f"✅ Background notification sent for resolved ticket {task_id} to user {task_with_user.user.name}")
+                    logger.info(f"✅ Background notification sent for closed ticket {task_id} to user {task_with_user.user.name}")
                 finally:
                     loop.close()
         finally:

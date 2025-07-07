@@ -142,9 +142,11 @@ async def create_comment(
         task.status = "With User"
         db.add(task)
 
+    # Reabrir tickets cerrados cuando agentes responden
     if task.status == "Closed":
-        task.status = "Open"
+        task.status = "In Progress"
         db.add(task)
+        logger.info(f"Ticket {task_id} status changed from Closed to In Progress after agent comment")
   
     if task.assignee_id is None and not comment_in.preserve_assignee:
         

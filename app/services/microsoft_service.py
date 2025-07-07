@@ -582,7 +582,7 @@ class MicrosoftGraphService:
                 "New response to your ticket #",
                 "Ticket", 
                 "[ID:",     # Detectar el formato de ID que agregamos a los asuntos
-                "has been resolved",
+
                 "has been assigned"
             ]
             
@@ -623,31 +623,6 @@ class MicrosoftGraphService:
                             else:
                                 continue
                     
-                    # Obtener el asunto del correo para verificar si es una notificación del sistema
-                    email_subject_lower = email_subject.lower()
-                    
-                    # Verificar si el correo es una notificación generada por el sistema
-                    is_system_notification = False
-                    
-                    # Obtener remitente para permitir respuestas de clientes/externos
-                    sender_email_lower = sender_email.lower()
-                    mailbox_email = user_email.lower()
-                    
-                    # Verificación más estricta: 
-                    # 1. Si viene del mismo buzón o un dominio del sistema
-                    # 2. Y el asunto contiene patrones típicos de notificación
-                    if any(domain in sender_email_lower for domain in system_domains) or sender_email_lower == mailbox_email:
-                        # Si el remitente es del mismo dominio, verificar si el asunto coincide con patrones de notificación
-                        for pattern in notification_subject_patterns:
-                            if pattern.lower() in email_subject_lower:
-                                is_system_notification = True
-                                
-                                # Marcar como leído y mover a carpeta procesada sin crear ticket
-                                self._mark_email_as_read(user_access_token, user_email, email_id)
-                                if processed_folder_id:
-                                    self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
-                                break
-                    
                     # 🔧 PRIMERO obtener contenido completo del email
                     email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
@@ -661,7 +636,6 @@ class MicrosoftGraphService:
                     # 🔧 TAMBIÉN verificar por ID en asunto como método alternativo
                     if not existing_mapping_by_conv and email_subject:
                         # Buscar [ID:XXXX] en el asunto
-                        import re
                         id_match = re.search(r'\[ID:(\d+)\]', email_subject, re.IGNORECASE)
                         if id_match:
                             ticket_id_from_subject = int(id_match.group(1))
@@ -803,6 +777,9 @@ class MicrosoftGraphService:
                                 # Continue with temp filename - not critical
                         
                         # NUEVO: Procesar workflows basados en el contenido del email
+                        # 🔧 OBTENER TICKET para workflows y actualización de estado
+                        ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
+                        
                         try:
                             from app.services.workflow_service import WorkflowService
                             
@@ -854,12 +831,19 @@ class MicrosoftGraphService:
                             email_subject=email.subject, email_sender=f"{email.sender.name} <{email.sender.address}>",
                             email_received_at=email.received_at, is_processed=True)
                         self.db.add(reply_email_mapping)
-                        ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
+                        
+                        # Actualizar estado del ticket si es necesario
                         if ticket_to_update and ticket_to_update.status == TaskStatus.WITH_USER:
-                             # User replied, updating status
+                             # User replied, updating status from WITH_USER to IN_PROGRESS
                              ticket_to_update.status = TaskStatus.IN_PROGRESS; self.db.add(ticket_to_update)
+                             logger.info(f"[MAIL SYNC] Ticket {existing_mapping_by_conv.ticket_id} status changed from WITH_USER to IN_PROGRESS after user reply")
+                        elif ticket_to_update and ticket_to_update.status == TaskStatus.CLOSED:
+                             # User replied to closed ticket, reopen to IN_PROGRESS
+                             ticket_to_update.status = TaskStatus.IN_PROGRESS; self.db.add(ticket_to_update)
+                             logger.info(f"[MAIL SYNC] Ticket {existing_mapping_by_conv.ticket_id} status changed from CLOSED to IN_PROGRESS after user reply")
                         elif ticket_to_update: pass  # User replied, no status update needed
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
+                        
                         self.db.commit(); added_comments_count += 1
                         # Comment added to ticket
                         
@@ -920,6 +904,31 @@ class MicrosoftGraphService:
                         continue
                     else:
                         # 🔧 APLICAR filtros solo para emails que NO son respuestas a tickets existentes
+                        
+                        # Obtener el asunto del correo para verificar si es una notificación del sistema
+                        email_subject_lower = email_subject.lower()
+                        
+                        # Verificar si el correo es una notificación generada por el sistema
+                        is_system_notification = False
+                        
+                        # Obtener remitente para permitir respuestas de clientes/externos
+                        sender_email_lower = sender_email.lower()
+                        mailbox_email = user_email.lower()
+                        
+                        # Verificación más estricta: 
+                        # 1. Si viene del mismo buzón o un dominio del sistema
+                        # 2. Y el asunto contiene patrones típicos de notificación
+                        if any(domain in sender_email_lower for domain in system_domains) or sender_email_lower == mailbox_email:
+                            # Si el remitente es del mismo dominio, verificar si el asunto coincide con patrones de notificación
+                            for pattern in notification_subject_patterns:
+                                if pattern.lower() in email_subject_lower:
+                                    is_system_notification = True
+                                    
+                                    # Marcar como leído y mover a carpeta procesada sin crear ticket
+                                    self._mark_email_as_read(user_access_token, user_email, email_id)
+                                    if processed_folder_id:
+                                        self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
+                                    break
                         
                         # Si es una notificación del sistema, continuamos con el siguiente correo
                         if is_system_notification:
@@ -1206,7 +1215,7 @@ class MicrosoftGraphService:
                 # Lista completa de patrones de notificación (solo para emails que NO son forwards)
                 notification_patterns = [
                     "new ticket #", "ticket #", "new response", 
-                    "resolved", "assigned", "has been created", "notification:",
+                    "assigned", "has been created", "notification:",
                     "automated message", "do not reply", "noreply"
                 ]
                 
@@ -2331,7 +2340,6 @@ class MicrosoftGraphService:
         original_sender = original_mapping.email_sender  # Format: "Name <email@domain.com>"
         
         # Extract email from original sender
-        import re
         email_match = re.search(r'<([^>]+)>', original_sender) if original_sender else None
         original_sender_email = email_match.group(1) if email_match else (original_sender or "")
         

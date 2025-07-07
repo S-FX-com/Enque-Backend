@@ -20,7 +20,7 @@ class Task(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', 'Resolved', name='ticket_status'), default='Unread', nullable=False) 
+    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', name='ticket_status'), default='Unread', nullable=False) 
     priority = Column(Enum('Low', 'Medium', 'High', 'Critical', name='ticket_priority'), default='Medium', nullable=False)
     assignee_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)

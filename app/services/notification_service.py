@@ -195,10 +195,10 @@ def format_notification_settings_response(
                 response.users.email.new_ticket_created.is_enabled = setting.is_enabled
                 response.users.email.new_ticket_created.id = setting.id
                 response.users.email.new_ticket_created.template = template_content
-            elif setting.type == "ticket_resolved" and "email" in channels:
-                response.users.email.ticket_resolved.is_enabled = setting.is_enabled
-                response.users.email.ticket_resolved.id = setting.id
-                response.users.email.ticket_resolved.template = template_content
+            elif setting.type == "ticket_closed" and "email" in channels:
+                response.users.email.ticket_closed.is_enabled = setting.is_enabled
+                response.users.email.ticket_closed.id = setting.id
+                response.users.email.ticket_closed.template = template_content
             elif setting.type == "new_agent_response" and "email" in channels:
                 response.users.email.new_agent_response.is_enabled = setting.is_enabled
                 response.users.email.new_agent_response.id = setting.id

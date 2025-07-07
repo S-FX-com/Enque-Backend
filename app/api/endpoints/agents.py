@@ -560,7 +560,7 @@ async def read_agent_teams(
 
         ticket_count = db.query(func.count(Task.id)).filter(
             Task.team_id == team_model.id,
-            Task.status.notin_(['Closed', 'Resolved']) 
+                            Task.status != 'Closed' 
         ).scalar() or 0
         
         team_schema = TeamSchema.from_orm(team_model)

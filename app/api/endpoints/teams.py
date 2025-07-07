@@ -55,7 +55,7 @@ async def read_teams(
                         )
                     )
                 ),
-                Task.status.notin_(['Closed', 'Resolved']),
+                Task.status != 'Closed',
                 Task.is_deleted == False,
                 Task.workspace_id == current_user.workspace_id  # Ensure workspace filtering
             ).scalar() or 0
@@ -64,7 +64,7 @@ async def read_teams(
             # Regular agent: Count tickets directly assigned to team + mailbox tickets if user is team member
             direct_ticket_count = db.query(func.count(Task.id)).filter(
                 Task.team_id == team.id,
-                Task.status.notin_(['Closed', 'Resolved']),
+                Task.status != 'Closed',
                 Task.is_deleted == False,
                 Task.workspace_id == current_user.workspace_id
             ).scalar() or 0
@@ -83,7 +83,7 @@ async def read_teams(
                 ).filter(
                     mailbox_team_assignments.c.team_id == team.id,
                     Task.team_id.is_(None),  # Only count mailbox tickets without direct team assignment
-                    Task.status.notin_(['Closed', 'Resolved']),
+                    Task.status != 'Closed',
                     Task.is_deleted == False,
                     Task.workspace_id == current_user.workspace_id
                 ).scalar() or 0
@@ -313,7 +313,7 @@ async def read_agent_teams(
                         )
                     )
                 ),
-                Task.status.notin_(['Closed', 'Resolved']),
+                Task.status != 'Closed',
                 Task.is_deleted == False,
                 Task.workspace_id == current_user.workspace_id
             ).scalar() or 0
@@ -334,7 +334,7 @@ async def read_agent_teams(
                         )
                     )
                 ),
-                Task.status.notin_(['Closed', 'Resolved']),
+                Task.status != 'Closed',
                 Task.is_deleted == False,
                 Task.workspace_id == current_user.workspace_id
             ).scalar() or 0

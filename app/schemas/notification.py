@@ -119,7 +119,7 @@ class AgentNotificationsConfig(BaseModel):
 class UserEmailNotificationsConfig(BaseModel):
     """Configuration for user email notifications."""
     new_ticket_created: NotificationTypeConfig = Field(default_factory=NotificationTypeConfig)
-    ticket_resolved: NotificationTypeConfig = Field(default_factory=NotificationTypeConfig)
+    ticket_closed: NotificationTypeConfig = Field(default_factory=NotificationTypeConfig)
     new_agent_response: NotificationTypeConfig = Field(default_factory=NotificationTypeConfig)
 
 

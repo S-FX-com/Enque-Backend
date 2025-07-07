@@ -15,8 +15,7 @@ class TaskStatus(str, PyEnum):
     OPEN = "Open"
     WITH_USER = "With User" 
     IN_PROGRESS = "In Progress" 
-    CLOSED = "Closed"
-    RESOLVED = "Resolved" 
+    CLOSED = "Closed" 
 
 
 class TaskPriority(str, PyEnum):
