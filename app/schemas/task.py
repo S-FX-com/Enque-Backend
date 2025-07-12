@@ -66,6 +66,7 @@ class TicketCreate(BaseModel):
     company_id: Optional[int] = None
     workspace_id: int
     category_id: Optional[int] = None 
+    to_recipients: Optional[str] = None
     cc_recipients: Optional[str] = None
     bcc_recipients: Optional[str] = None
 
@@ -78,6 +79,7 @@ class TicketUpdate(BaseModel):
     team_id: Optional[int] = None
     due_date: Optional[datetime] = None
     category_id: Optional[int] = None 
+    to_recipients: Optional[str] = None
     cc_recipients: Optional[str] = None
     bcc_recipients: Optional[str] = None
     user_id: Optional[int] = None
@@ -151,6 +153,7 @@ class TicketInDBBase(BaseModel):
     updated_at: datetime
     last_update: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
+    to_recipients: Optional[str] = None
     cc_recipients: Optional[str] = None
     bcc_recipients: Optional[str] = None
     

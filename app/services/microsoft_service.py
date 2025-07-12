@@ -1306,6 +1306,14 @@ class MicrosoftGraphService:
                     team_id = team_assignment.team_id
                     logger.info(f"Auto-assigning ticket to team {team_id} based on mailbox assignment")
             
+            # NUEVO: Procesar TO recipients para guardar en el ticket
+            to_recipients_str = None
+            if email.to_recipients:
+                to_emails = [to.address for to in email.to_recipients if to.address]
+                if to_emails:
+                    to_recipients_str = ", ".join(to_emails)
+                    logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
+            
             # NUEVO: Procesar CC recipients para guardar en el ticket
             cc_recipients_str = None
             if email.cc_recipients:
@@ -1337,7 +1345,7 @@ class MicrosoftGraphService:
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
                 email_message_id=email.id, email_conversation_id=email.conversation_id,
-                email_sender=email_sender_field, cc_recipients=cc_recipients_str)
+                email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str)
             self.db.add(task); self.db.flush()
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
