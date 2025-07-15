@@ -442,6 +442,7 @@ async def update_task_endpoint(
     return updated_task_obj
 
 
+
 @router.delete("/{task_id}")
 async def delete_task(
     task_id: int,

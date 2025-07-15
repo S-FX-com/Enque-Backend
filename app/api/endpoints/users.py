@@ -21,7 +21,7 @@ router = APIRouter()
 async def read_users(
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:

@@ -1142,11 +1142,42 @@ class MicrosoftGraphService:
         logger.warning(f"[FORWARD DETECTION] Could not extract original sender from forwarded email")
         return None, None
 
+    def _clean_email_address(self, email_string: str) -> Optional[str]:
+        """
+        Limpia y extrae una dirección de email válida de un string que puede estar malformado.
+        Ej: 'support support@ies.org' -> 'support@ies.org'
+        """
+        if not email_string:
+            return None
+        
+        import re
+        # Buscar patrón de email válido en el string
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        match = re.search(email_pattern, email_string)
+        
+        if match:
+            return match.group(0)
+        
+        # Si no se encuentra un patrón válido, intentar limpiar espacios extra
+        cleaned = email_string.strip()
+        if '@' in cleaned:
+            # Remover espacios extra alrededor del @
+            parts = cleaned.split('@')
+            if len(parts) == 2:
+                local_part = parts[0].strip().split()[-1]  # Tomar la última palabra antes del @
+                domain_part = parts[1].strip().split()[0]  # Tomar la primera palabra después del @
+                return f"{local_part}@{domain_part}"
+        
+        return None
+
     def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
-            sender = EmailAddress(name=sender_data.get("name", ""), address=sender_data.get("address", ""))
-            if not sender.address: logger.warning(f"Could not parse sender from email content: {email_content.get('id')}"); return None
+            sender_address = self._clean_email_address(sender_data.get("address", ""))
+            if not sender_address: 
+                logger.warning(f"Could not parse sender from email content: {email_content.get('id')}")
+                return None
+            sender = EmailAddress(name=sender_data.get("name", ""), address=sender_address)
             
             # Verificar si el correo es una notificación del sistema o proviene del mismo dominio
             sender_email = sender.address.lower()
@@ -1171,14 +1202,30 @@ class MicrosoftGraphService:
                     logger.warning(f"Email subject appears to be a system notification: {email_content.get('subject')}")
                     # No rechazar completamente, pero marcar para que luego se pueda filtrar
             
-            recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("toRecipients", []) if r.get("emailAddress")]
+            # Procesar TO recipients con limpieza de emails
+            recipients = []
+            for r in email_content.get("toRecipients", []):
+                if r.get("emailAddress"):
+                    cleaned_address = self._clean_email_address(r.get("emailAddress", {}).get("address", ""))
+                    if cleaned_address:
+                        recipients.append(EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=cleaned_address))
             if not recipients: recipients = [EmailAddress(name="", address=user_email)]
             
-            # NUEVO: Procesar CC recipients
-            cc_recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("ccRecipients", []) if r.get("emailAddress")]
+            # Procesar CC recipients con limpieza de emails
+            cc_recipients = []
+            for r in email_content.get("ccRecipients", []):
+                if r.get("emailAddress"):
+                    cleaned_address = self._clean_email_address(r.get("emailAddress", {}).get("address", ""))
+                    if cleaned_address:
+                        cc_recipients.append(EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=cleaned_address))
             
-            # NUEVO: Procesar BCC recipients (si están disponibles)
-            bcc_recipients = [EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=r.get("emailAddress", {}).get("address", "")) for r in email_content.get("bccRecipients", []) if r.get("emailAddress")]
+            # Procesar BCC recipients con limpieza de emails
+            bcc_recipients = []
+            for r in email_content.get("bccRecipients", []):
+                if r.get("emailAddress"):
+                    cleaned_address = self._clean_email_address(r.get("emailAddress", {}).get("address", ""))
+                    if cleaned_address:
+                        bcc_recipients.append(EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=cleaned_address))
             
             body_data = email_content.get("body", {}); body_content = body_data.get("content", ""); body_type = body_data.get("contentType", "html")
             received_time = datetime.utcnow(); received_dt_str = email_content.get("receivedDateTime")
@@ -1811,7 +1858,7 @@ class MicrosoftGraphService:
             params = {
                 "$top": min(top, 50),  # Limit to prevent large responses
                 "$orderby": "receivedDateTime DESC", 
-                "$select": "id,conversationId,subject,from,toRecipients,receivedDateTime,bodyPreview,importance,hasAttachments,body,isRead"
+                "$select": "id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,bodyPreview,importance,hasAttachments,body,isRead"
             }
             if filter_unread:
                 params["$filter"] = "isRead eq false"
