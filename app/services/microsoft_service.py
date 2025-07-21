@@ -1356,7 +1356,13 @@ class MicrosoftGraphService:
             # NUEVO: Procesar TO recipients para guardar en el ticket
             to_recipients_str = None
             if email.to_recipients:
-                to_emails = [to.address for to in email.to_recipients if to.address]
+                to_emails = []
+                for to in email.to_recipients:
+                    if to.address:
+                        if to.name and to.name.strip():
+                            to_emails.append(f"{to.name} <{to.address}>")
+                        else:
+                            to_emails.append(to.address)
                 if to_emails:
                     to_recipients_str = ", ".join(to_emails)
                     logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
@@ -1364,7 +1370,13 @@ class MicrosoftGraphService:
             # NUEVO: Procesar CC recipients para guardar en el ticket
             cc_recipients_str = None
             if email.cc_recipients:
-                cc_emails = [cc.address for cc in email.cc_recipients if cc.address]
+                cc_emails = []
+                for cc in email.cc_recipients:
+                    if cc.address:
+                        if cc.name and cc.name.strip():
+                            cc_emails.append(f"{cc.name} <{cc.address}>")
+                        else:
+                            cc_emails.append(cc.address)
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
@@ -1373,11 +1385,19 @@ class MicrosoftGraphService:
             if original_email and original_name:
                 # Si el email fue reenviado, agregar quien lo reenvió a los CCs
                 forwarded_by_email = email.sender.address
-                if cc_recipients_str:
-                    cc_recipients_str = f"{cc_recipients_str}, {forwarded_by_email}"
+                forwarded_by_name = email.sender.name
+                
+                # Usar formato "Nombre <email>" si hay nombre disponible
+                if forwarded_by_name and forwarded_by_name.strip():
+                    forwarded_by_formatted = f"{forwarded_by_name} <{forwarded_by_email}>"
                 else:
-                    cc_recipients_str = forwarded_by_email
-                logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_email}")
+                    forwarded_by_formatted = forwarded_by_email
+                
+                if cc_recipients_str:
+                    cc_recipients_str = f"{cc_recipients_str}, {forwarded_by_formatted}"
+                else:
+                    cc_recipients_str = forwarded_by_formatted
+                logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_formatted}")
                 
                 # Usar remitente original en email_sender
                 email_sender_field = f"{original_name} <{original_email}>"

@@ -3,7 +3,9 @@ from app.core.config import settings
 from app.services.microsoft_service import MicrosoftGraphService # Assuming this service can send mail
 from app.utils.logger import logger
 from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB session
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
+from app.models.agent import Agent
+from datetime import datetime
 
 # Placeholder for a more sophisticated HTML email template system
 def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url: str, workspace_name: str) -> str:
@@ -625,3 +627,671 @@ def parse_other_destinaries(other_destinaries: Optional[str]) -> List[str]:
         raise ValueError("Invalid email addresses in other_destinaries field")
 
     return emails
+
+
+def extract_mentions_from_html(html_content: str) -> List[str]:
+    import re
+    from html import unescape
+    
+    if not html_content:
+        return []
+    
+    # Múltiples patrones para diferentes formatos de TipTap
+    patterns = [
+        # Formato estándar de TipTap con data-type="mention" y data-id
+        r'<span[^>]*data-type="mention"[^>]*data-id="([^"]+)"[^>]*>.*?</span>',
+        # Formato con class="mention" y data-id
+        r'<span[^>]*class="mention"[^>]*data-id="([^"]+)"[^>]*>.*?</span>',
+        # Formato con data-mention
+        r'<span[^>]*data-mention="([^"]+)"[^>]*>.*?</span>',
+        # Formato con data-id sin class específica
+        r'<span[^>]*data-id="([^"]+)"[^>]*data-type="mention"[^>]*>.*?</span>',
+        # Formato más flexible con mention en cualquier atributo
+        r'<span[^>]*mention[^>]*data-id="([^"]+)"[^>]*>.*?</span>',
+    ]
+    
+    all_mentions = []
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
+        if matches:
+            all_mentions.extend(matches)
+    
+    # Limpiar y deduplicar menciones
+    clean_mentions = []
+    for mention in all_mentions:
+        clean_mention = unescape(mention.strip())
+        if clean_mention and clean_mention not in clean_mentions:
+            clean_mentions.append(clean_mention)
+    
+    if clean_mentions:
+        logger.info(f"Menciones extraídas: {clean_mentions}")
+    
+    return clean_mentions
+
+
+def create_mention_notification_email_html(
+    mentioned_agent_name: str, 
+    mentioning_agent_name: str,
+    ticket_id: int, 
+    ticket_title: str, 
+    ticket_link: str,
+    note_content: str,
+    sender_name: Optional[str] = None
+) -> str:
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+    max_content_length = 200
+    if len(note_content) > max_content_length:
+        truncated_content = note_content[:max_content_length] + "..."
+    else:
+        truncated_content = note_content
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>You've been mentioned in a private note</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+                margin: 0;
+                padding: 20px;
+                background-color: #f4f4f7;
+                color: #333;
+            }}
+            .container {{
+                background-color: #ffffff;
+                max-width: 600px;
+                margin: 20px auto;
+                padding: 30px;
+                border-radius: 8px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                text-align: left;
+            }}
+
+            p {{
+                font-size: 16px;
+                line-height: 1.6;
+                margin-bottom: 1em;
+            }}
+            a.button {{
+                display: inline-block;
+                background-color: #007bff;
+                color: #ffffff;
+                padding: 12px 25px;
+                text-decoration: none;
+                border-radius: 5px;
+                margin-top: 20px;
+                font-weight: 500;
+            }}
+            a.button:hover {{
+                background-color: #0056b3;
+            }}
+            .mention-badge {{
+                background-color: #e3f2fd;
+                color: #1976d2;
+                padding: 2px 8px;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: 500;
+                border: 1px solid #bbdefb;
+            }}
+            .note-preview {{
+                background-color: #f8f9fa;
+                border-left: 4px solid #007bff;
+                padding: 15px;
+                margin: 20px 0;
+                border-radius: 4px;
+                font-style: italic;
+                color: #666;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <p>Hello {mentioned_agent_name},</p>
+
+            <p>You have been mentioned in a private note by <strong>{mentioning_agent_name}</strong> on the following ticket:</p>
+
+            <p><strong>Ticket ID:</strong> {ticket_id}</p>
+            <p><strong>Subject:</strong> {ticket_title}</p>
+
+            <div class="note-preview">
+                <strong>Private Note Preview:</strong><br>
+                {truncated_content}
+            </div>
+
+            <a href="{ticket_link}" class="button">View Ticket</a>
+
+            <p style="margin-top: 30px;">Best regards,<br>{footer_sender}</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+
+async def send_mention_notification_email(
+    db: Session,
+    mentioned_agent_email: str,
+    mentioned_agent_name: str,
+    mentioning_agent_name: str,
+    ticket_id: int,
+    ticket_title: str,
+    note_content: str,
+    sender_mailbox_email: str,
+    sender_mailbox_display_name: Optional[str],
+    user_access_token: str,
+    request_origin: Optional[str] = None
+) -> bool:
+   
+    subject = f"[ID:{ticket_id}] You've been mentioned in a private note: {ticket_title}"
+
+    base_url = request_origin if request_origin else settings.FRONTEND_URL
+    ticket_link = f"{base_url}/tickets/{ticket_id}"
+
+    html_content = create_mention_notification_email_html(
+        mentioned_agent_name=mentioned_agent_name,
+        mentioning_agent_name=mentioning_agent_name,
+        ticket_id=ticket_id,
+        ticket_title=ticket_title,
+        ticket_link=ticket_link,
+        note_content=note_content,
+        sender_name=sender_mailbox_display_name
+    )
+
+    try:
+        graph_service = MicrosoftGraphService(db=db)
+
+        success = await graph_service.send_email_with_user_token(
+            user_access_token=user_access_token,
+            sender_mailbox_email=sender_mailbox_email,
+            recipient_email=mentioned_agent_email,
+            subject=subject,
+            html_body=html_content,
+            task_id=ticket_id
+        )
+        
+        if success:
+            logger.info(f"Mention notification email sent successfully to {mentioned_agent_email} from {sender_mailbox_email} ({sender_mailbox_display_name or 'No display name'})")
+            return True
+        else:
+            logger.error(f"Failed to send mention notification email to {mentioned_agent_email} using MicrosoftGraphService.send_email_with_user_token from {sender_mailbox_email}")
+            return False
+    except Exception as e:
+        logger.error(f"Exception in send_mention_notification_email for {mentioned_agent_email}: {e}", exc_info=True)
+        return False
+
+
+async def process_mention_notifications(
+    db: Session,
+    comment_content: str,
+    workspace_id: int,
+    ticket_id: int,
+    ticket_title: str,
+    mentioning_agent_id: int,
+    request_origin: Optional[str] = None
+) -> List[str]:
+    if not comment_content:
+        return []
+    
+    mentioned_names = extract_mentions_from_html(comment_content)
+    
+    if not mentioned_names:
+        return []
+    
+    notified_agents = []
+    
+    from app.models.task import Task
+    from app.models.microsoft import MailboxConnection, MicrosoftToken
+    
+    task = db.query(Task).filter(Task.id == ticket_id).first()
+    preferred_mailbox = None
+    
+    if task and task.mailbox_connection_id:
+        logger.info(f"Ticket {ticket_id} tiene mailbox específico ID: {task.mailbox_connection_id}")
+        
+        mailbox_token_info = db.query(MailboxConnection, MicrosoftToken)\
+            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+            .filter(
+                MailboxConnection.id == task.mailbox_connection_id,
+                MailboxConnection.is_active == True
+            ).first()
+        
+        if mailbox_token_info:
+            preferred_mailbox = {
+                'connection': mailbox_token_info[0],
+                'token': mailbox_token_info[1]
+            }
+        else:
+            logger.warning(f"No se encontró token válido para el mailbox específico del ticket {ticket_id}")
+    
+    if not preferred_mailbox:
+        logger.info(f"Buscando mailbox activo para workspace {workspace_id}")
+        
+        mailbox_info = db.query(MailboxConnection, MicrosoftToken)\
+            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+            .filter(
+                MailboxConnection.workspace_id == workspace_id,
+                MailboxConnection.is_active == True
+            ).first()
+        
+        if mailbox_info:
+            preferred_mailbox = {
+                'connection': mailbox_info[0],
+                'token': mailbox_info[1]
+            }
+        else:
+            logger.error(f"No se encontró ningún mailbox activo para workspace {workspace_id}")
+            return []
+    
+    from datetime import datetime
+    
+    token = preferred_mailbox['token']
+    if token.expires_at <= datetime.utcnow():
+        try:
+            from app.services.microsoft_service import MicrosoftGraphService
+            ms_service = MicrosoftGraphService(db)
+            await ms_service.refresh_token_async(token)
+            db.refresh(token)
+        except Exception as e:
+            logger.error(f"Error refreshing token for mention notifications: {str(e)}")
+            return []
+    
+    for mentioned_name in mentioned_names:
+        try:
+            mentioned_agent = db.query(Agent).filter(
+                Agent.name == mentioned_name,
+                Agent.workspace_id == workspace_id,
+                Agent.is_active == True
+            ).first()
+            
+            if not mentioned_agent:
+                logger.warning(f"Agent '{mentioned_name}' no encontrado en workspace {workspace_id}")
+                continue
+            
+            if mentioned_agent.id == mentioning_agent_id:
+                logger.info(f"Skipping self-mention for agent {mentioned_name}")
+                continue
+            
+            import re
+            clean_content = re.sub(r'<[^>]+>', '', comment_content)
+            clean_content = re.sub(r'\s+', ' ', clean_content).strip()
+            
+            mentioning_agent = db.query(Agent).filter(Agent.id == mentioning_agent_id).first()
+            mentioning_agent_name = mentioning_agent.name if mentioning_agent else "Unknown Agent"
+            
+            success = await send_mention_notification_email(
+                db=db,
+                mentioned_agent_email=mentioned_agent.email,
+                mentioned_agent_name=mentioned_agent.name,
+                mentioning_agent_name=mentioning_agent_name,
+                ticket_id=ticket_id,
+                ticket_title=ticket_title,
+                note_content=clean_content,
+                sender_mailbox_email=preferred_mailbox['connection'].email,
+                sender_mailbox_display_name=preferred_mailbox['connection'].display_name,
+                user_access_token=token.access_token,
+                request_origin=request_origin
+            )
+            
+            if success:
+                notified_agents.append(mentioned_agent.name)
+                logger.info(f"✅ Mention notification sent to {mentioned_agent.email}")
+            else:
+                logger.error(f"❌ Failed to send mention notification to {mentioned_agent.email}")
+                
+        except Exception as e:
+            logger.error(f"Error processing mention for '{mentioned_name}': {str(e)}")
+            continue
+    
+    return notified_agents
+
+
+def get_agent_closed_tickets_last_week(db: Session, agent_id: int) -> List[Dict[str, Any]]:
+
+    from datetime import datetime, timedelta
+    from app.models.task import Task
+    today = datetime.now().date()
+    days_since_monday = today.weekday()  # 0 = Monday, 6 = Sunday
+    
+    last_sunday = today - timedelta(days=days_since_monday + 7 - 6)
+    last_monday = last_sunday - timedelta(days=6)
+    
+    start_date = datetime.combine(last_monday, datetime.min.time())
+    end_date = datetime.combine(last_sunday, datetime.max.time())
+    
+    tickets = db.query(Task).filter(
+        Task.assignee_id == agent_id,
+        Task.status == 'Closed',
+        Task.updated_at >= start_date,
+        Task.updated_at <= end_date,
+        Task.is_deleted == False
+    ).order_by(Task.created_at.desc()).all()
+    
+    result = []
+    for ticket in tickets:
+        result.append({
+            'id': ticket.id,
+            'title': ticket.title,
+            'created_at': ticket.created_at,
+            'updated_at': ticket.updated_at,
+            'status': ticket.status
+        })
+    
+    return result
+
+
+def create_weekly_summary_email_html(
+    agent_name: str,
+    tickets: List[Dict[str, Any]],
+    week_start: datetime,
+    week_end: datetime,
+    sender_name: Optional[str] = None
+) -> str:
+    """
+    Genera HTML para el email de resumen semanal de agente.
+    """
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+    
+    week_range = f"{week_start.strftime('%B %d')} - {week_end.strftime('%B %d, %Y')}"
+    
+    tickets_html = ""
+    if tickets:
+        for ticket in tickets:
+            created_date = ticket['created_at'].strftime('%m/%d/%Y')
+            closed_date = ticket['updated_at'].strftime('%m/%d/%Y')
+            
+            tickets_html += f"""
+            <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {created_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {closed_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #1f2937;">
+                    <strong>#{ticket['id']}</strong> - {ticket['title']}
+                </td>
+            </tr>
+            """
+    else:
+        tickets_html = """
+        <tr>
+            <td colspan="3" style="padding: 20px; text-align: center; font-size: 14px; color: #6b7280; font-style: italic;">
+                No tickets were closed this week.
+            </td>
+        </tr>
+        """
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Weekly Summary</title>
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f8fafc;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            
+            <!-- Header -->
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white !important; padding: 30px; text-align: center;">
+                <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: white !important;">🎟️ Weekly Summary</h1>
+                <p style="margin: 10px 0 0 0; font-size: 16px; opacity: 0.9; color: white !important;">
+                    {agent_name} • {week_range}
+                </p>
+            </div>
+            
+            <!-- Content -->
+            <div style="padding: 30px;">
+                <p style="font-size: 16px; color: #374151; margin-bottom: 25px;">
+                    Hello {agent_name},
+                </p>
+                
+                <p style="font-size: 16px; color: #374151; margin-bottom: 25px;">
+                    The following tickets that were assigned to you have been marked as closed or resolved over the last 7 days.
+                </p>
+                
+                <!-- Tickets Table -->
+                <table style="width: 100%; border-collapse: collapse; margin: 25px 0; background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
+                    <thead>
+                        <tr style="background-color: #f9fafb;">
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Ticket Created
+                            </th>
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Marked Closed
+                            </th>
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Ticket Name
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tickets_html}
+                    </tbody>
+                </table>
+                
+                <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border-left: 4px solid #667eea;">
+                    <p style="margin: 0; font-size: 14px; color: #6b7280;">
+                        <strong>Summary:</strong> You closed {len(tickets)} ticket{'s' if len(tickets) != 1 else ''} this week.
+                    </p>
+                </div>
+            </div>
+            
+            <!-- Footer -->
+            <div style="background-color: #f8fafc; padding: 25px; text-align: center; border-top: 1px solid #e5e7eb;">
+                <p style="margin: 0; font-size: 14px; color: #6b7280;">
+                    Best regards,<br>
+                    {footer_sender}
+                </p>
+                <p style="margin: 15px 0 0 0; font-size: 12px; color: #9ca3af;">
+                    This is an automated weekly summary from Enque.
+                </p>
+            </div>
+            
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+
+async def send_weekly_summary_email(
+    db: Session,
+    agent_email: str,
+    agent_name: str,
+    tickets: List[Dict[str, Any]],
+    week_start: datetime,
+    week_end: datetime,
+    access_token: str,
+    sender_email: str
+) -> bool:
+    """
+    Envía email de resumen semanal a un agente.
+    """
+    
+    week_date = week_end.strftime("%B %d, %Y")
+    subject = f"Enque 🎟️ Weekly Summary for {agent_name} for {week_date}"
+    
+    html_body = create_weekly_summary_email_html(
+        agent_name=agent_name,
+        tickets=tickets,
+        week_start=week_start,
+        week_end=week_end,
+        sender_name=None
+    )
+    
+    message = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": agent_email,
+                        "name": agent_name
+                    }
+                }
+            ]
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
+                json=message,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            if response.status_code == 202:
+                logger.info(f"✅ Weekly summary email sent successfully to {agent_email}")
+                return True
+            else:
+                logger.error(f"❌ Failed to send weekly summary email to {agent_email}. Status: {response.status_code}, Response: {response.text}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"❌ Error sending weekly summary email to {agent_email}: {str(e)}")
+        return False
+
+
+async def process_weekly_agent_summaries(db: Session) -> Dict[str, Any]:
+
+    from datetime import datetime, timedelta
+    from app.models.agent import Agent
+    from app.models.microsoft import MailboxConnection, MicrosoftToken
+    from app.models.notification import NotificationSetting
+    import json
+    
+    setting = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "agents",
+        NotificationSetting.type == "weekly_agent_summary",
+        NotificationSetting.is_enabled == True
+    ).first()
+    
+    if not setting:
+        logger.info("Weekly agent summary feature is disabled or not configured")
+        return {"success": False, "message": "Feature disabled"}
+    
+    # Calculate last week's date range (Monday to Sunday)
+    import pytz
+    et_timezone = pytz.timezone("America/New_York")
+    today = datetime.now(et_timezone).date()
+    
+    # Find last Monday (start of last week)
+    days_since_monday = today.weekday()  # Monday = 0, Sunday = 6
+    days_to_last_monday = days_since_monday + 7  # Go back to last Monday
+    last_monday = today - timedelta(days=days_to_last_monday)
+    
+    # Find last Sunday (end of last week) 
+    last_sunday = last_monday + timedelta(days=6)
+    
+    week_start = datetime.combine(last_monday, datetime.min.time())
+    week_end = datetime.combine(last_sunday, datetime.max.time())
+    
+    workspace_settings = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "agents",
+        NotificationSetting.type == "weekly_agent_summary",
+        NotificationSetting.is_enabled == True
+    ).all()
+    
+    results = {
+        "success": True,
+        "total_agents": 0,
+        "summaries_sent": 0,
+        "errors": []
+    }
+    
+    for workspace_setting in workspace_settings:
+        workspace_id = workspace_setting.workspace_id
+        
+        try:
+            mailbox_info = db.query(MailboxConnection, MicrosoftToken)\
+                .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                .filter(
+                    MailboxConnection.workspace_id == workspace_id,
+                    MailboxConnection.is_active == True
+                ).first()
+            
+            if not mailbox_info:
+                logger.warning(f"No active mailbox found for workspace {workspace_id}")
+                continue
+            
+            connection, token = mailbox_info
+            
+            if token.expires_at <= datetime.utcnow():
+                try:
+                    from app.services.microsoft_service import MicrosoftGraphService
+                    ms_service = MicrosoftGraphService(db)
+                    await ms_service.refresh_token_async(token)
+                    db.refresh(token)
+                except Exception as e:
+                    logger.error(f"Error refreshing token for workspace {workspace_id}: {str(e)}")
+                    continue
+            
+            agents = db.query(Agent).filter(
+                Agent.workspace_id == workspace_id,
+                Agent.is_active == True,
+                Agent.email.isnot(None)
+            ).all()
+            
+            results["total_agents"] += len(agents)
+            
+            for agent in agents:
+                try:
+                    tickets = get_agent_closed_tickets_last_week(db, agent.id)
+
+                    success = await send_weekly_summary_email(
+                        db=db,
+                        agent_email=agent.email,
+                        agent_name=agent.name,
+                        tickets=tickets,
+                        week_start=week_start,
+                        week_end=week_end,
+                        access_token=token.access_token,
+                        sender_email=connection.email
+                    )
+                    
+                    if success:
+                        results["summaries_sent"] += 1
+                        logger.info(f"✅ Weekly summary sent to {agent.name} ({agent.email})")
+                    else:
+                        results["errors"].append(f"Failed to send to {agent.name} ({agent.email})")
+                        
+                except Exception as e:
+                    error_msg = f"Error processing agent {agent.name}: {str(e)}"
+                    results["errors"].append(error_msg)
+                    logger.error(error_msg)
+                    continue
+                    
+        except Exception as e:
+            error_msg = f"Error processing workspace {workspace_id}: {str(e)}"
+            results["errors"].append(error_msg)
+            logger.error(error_msg)
+            continue
+    
+    logger.info(f"Weekly agent summaries processed: {results['summaries_sent']}/{results['total_agents']} sent")
+    return results

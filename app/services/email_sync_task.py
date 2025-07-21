@@ -185,6 +185,8 @@ def refresh_tokens_job():
     """
     Background job to check and renew Microsoft tokens before they expire
     """
+    import asyncio
+    
     logger.info("Starting token refresh job")
     db = None
     
@@ -192,11 +194,75 @@ def refresh_tokens_job():
         db = SessionLocal()
         service = MicrosoftGraphService(db)
     
-        service.check_and_refresh_all_tokens()
+        # Create event loop for async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            loop.run_until_complete(service.check_and_refresh_all_tokens_async())
+        finally:
+            loop.close()
         
         logger.info("Token refresh job completed")
     except Exception as e:
         logger.error(f"Error refreshing tokens: {e}")
+    finally:
+        if db is not None:
+            db.close()
+
+
+def weekly_agent_summary_job():
+    """
+    Background job to send weekly summaries to agents every Friday at 3pm ET
+    """
+    import asyncio
+    from app.services.email_service import process_weekly_agent_summaries
+    
+    logger.info("Starting weekly agent summary job")
+    db = None
+    
+    try:
+        # Check if it's Friday (weekday 4 = Friday, 0 = Monday) in ET timezone
+        import pytz
+        et_timezone = pytz.timezone("America/New_York")
+        now_et = datetime.now(et_timezone)
+        
+        if now_et.weekday() != 4:  # Not Friday
+            logger.info(f"Today is not Friday (weekday: {now_et.weekday()}) in ET, skipping weekly summary")
+            return
+        
+        # Check if it's approximately 3pm ET (15:00)
+        current_hour_et = now_et.hour
+        current_minute_et = now_et.minute
+        
+        # Allow 3-4pm ET range for flexibility (15:00-15:59)
+        if current_hour_et != 15:
+            logger.info(f"Current time {current_hour_et}:{current_minute_et:02d} ET is not 3pm hour, skipping weekly summary")
+            return
+            
+        logger.info(f"Current time {current_hour_et}:{current_minute_et:02d} ET is in the 3pm range, proceeding with weekly summary")
+        
+        db = SessionLocal()
+        
+        # Create event loop for async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            result = loop.run_until_complete(process_weekly_agent_summaries(db))
+            
+            if result["success"]:
+                logger.info(f"✅ Weekly agent summaries completed: {result['summaries_sent']}/{result['total_agents']} sent")
+                if result["errors"]:
+                    logger.warning(f"⚠️ Some errors occurred: {result['errors']}")
+            else:
+                logger.info(f"Weekly agent summaries skipped: {result.get('message', 'Unknown reason')}")
+                
+        finally:
+            loop.close()
+        
+    except Exception as e:
+        logger.error(f"❌ Error in weekly agent summary job: {str(e)}", exc_info=True)
     finally:
         if db is not None:
             db.close()
@@ -216,7 +282,8 @@ def start_scheduler():
     schedule.every(30).seconds.do(sync_emails_job)  # Optimized frequency
     schedule.every(3).hours.do(refresh_tokens_job)  # More frequent token refresh
     
-
+    # Weekly agent summary - check every hour on Fridays for the 3pm window
+    schedule.every().hour.do(weekly_agent_summary_job)
     
     # Run in a separate thread with better error handling
     def run_scheduler():
@@ -232,6 +299,11 @@ def start_scheduler():
     scheduler_thread = threading.Thread(target=run_scheduler, name="EmailSyncScheduler")
     scheduler_thread.daemon = True
     scheduler_thread.start()
+    
+    logger.info("📅 Scheduler started with jobs:")
+    logger.info("  - Email sync: every 30 seconds")
+    logger.info("  - Token refresh: every 3 hours") 
+    logger.info("  - Weekly agent summaries: every hour (executes only on Fridays at 3pm)")
     
 
 

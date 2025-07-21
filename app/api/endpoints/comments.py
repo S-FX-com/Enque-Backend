@@ -585,6 +585,37 @@ async def create_comment(
     except Exception as e:
         logger.error(f"❌ Error emitting Socket.IO event for comment {comment.id}: {str(e)}")
     
+    # --- Process Mention Notifications for Private Notes ---
+    if comment_in.is_private and comment_in.content:
+        try:
+            # Obtener la URL de origen para usar el subdominio correcto
+            origin_url = None
+            if request:
+                origin_url = str(request.headers.get("origin", ""))
+            if not origin_url:
+                origin_url = settings.FRONTEND_URL
+            
+            # Procesar menciones en background para no bloquear la respuesta
+            from app.services.email_service import process_mention_notifications
+            notified_agents = await process_mention_notifications(
+                db=db,
+                comment_content=comment_in.content,
+                workspace_id=current_user.workspace_id,
+                ticket_id=task_id,
+                ticket_title=task.title,
+                mentioning_agent_id=current_user.id,
+                request_origin=origin_url
+            )
+            
+            if notified_agents:
+                logger.info(f"✅ Mention notifications sent for comment {comment.id} on ticket {task_id}: {notified_agents}")
+            else:
+                logger.info(f"📝 No mention notifications sent for comment {comment.id} on ticket {task_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing mention notifications for comment {comment.id}: {str(e)}", exc_info=True)
+    # --- End Process Mention Notifications ---
+    
     # Add workflow results to response if any were executed
     if workflow_results:
         # Add to response as extra field (will be ignored by Pydantic but available in JSON)
