@@ -583,6 +583,10 @@ async def send_team_ticket_notification_email(
 def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
     """
     Validate a comma-separated string of email addresses.
+    
+    Supports both formats:
+    - Simple: "email@domain.com"
+    - With name: "Name <email@domain.com>"
 
     Args:
         email_string: String containing comma-separated email addresses
@@ -593,16 +597,17 @@ def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
     if not email_string or not email_string.strip():
         return True, []
 
-    # Split by comma and clean up
     emails = [email.strip() for email in email_string.split(',') if email.strip()]
 
-    # Email regex pattern
     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 
     valid_emails = []
     for email in emails:
-        if re.match(email_pattern, email):
-            valid_emails.append(email)
+        email_match = re.search(r'<([^>]+)>', email)
+        extracted_email = email_match.group(1).strip() if email_match else email.strip()
+        
+        if re.match(email_pattern, extracted_email):
+            valid_emails.append(email)  # Keep original format for display
         else:
             logger.warning(f"Invalid email address found: {email}")
             return False, []

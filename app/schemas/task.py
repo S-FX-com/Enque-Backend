@@ -178,10 +178,11 @@ class TicketBodySchema(BaseModel):
         from_attributes = True
 
 class TicketWithDetails(Ticket): 
-    workspace: WorkspaceRef
+    workspace: Optional[WorkspaceRef] = None  # 🔧 CORREGIDO: Hacer workspace Optional
     team: Optional[TeamRef] = None
     company: Optional[CompanyRef] = None
     user: Optional[UserRef] = None 
+    assignee: Optional[AgentRef] = None  # 🔧 AGREGADO: Campo assignee faltante
     sent_from: Optional[AgentRef] = None 
     sent_to: Optional[AgentRef] = None
     category: Optional[CategoryRef] = None 

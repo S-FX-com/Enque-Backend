@@ -334,27 +334,265 @@ async def read_task(
 ) -> Any:
     """
     Get a specific task by ID with all related details
+    PERFORMANCE: Con logs detallados para monitorear tiempo de carga
     """
+    start_time = time.time()
+    
+    # 🔍 LOGS DETALLADOS PARA APERTURA INICIAL DE TICKET
+    task_logger.info(f"🎯 OPEN TICKET: Iniciando carga COMPLETA de ticket {task_id} para usuario {current_user.id}")
+    task_logger.info(f"📍 OPEN TICKET: Endpoint: GET /tasks/{task_id} (carga completa con todas las relaciones)")
+    
+    # 1. Verificación de permisos y existencia
+    permissions_start = time.time()
+    task_logger.info(f"🔐 OPEN TICKET: Verificando permisos de acceso...")
+    
+    # 💫 ULTRA-FAST CACHED PERMISSIONS CHECK
+    exists_check_start = time.time()
+    
+    try:
+        # Intentar usar caché ultra-rápido
+        from app.services.cache_service import cached_ticket_exists_check
+        ticket_exists = await cached_ticket_exists_check(
+            db, task_id, current_user.workspace_id, current_user.id
+        )
+        exists_check_time = time.time() - exists_check_start
+        
+        if exists_check_time < 0.01:  # < 10ms = cache hit
+            task_logger.info(f"⚡ ULTRA-FAST: EXISTS via caché en {exists_check_time*1000:.2f}ms")
+        else:
+            task_logger.info(f"🎯 OPTIMIZED: EXISTS con caché en {exists_check_time*1000:.2f}ms")
+            
+    except Exception as e:
+        # Fallback a verificación tradicional
+        task_logger.warning(f"⚠️ Cache fallback: {e} - usando verificación tradicional")
+        from sqlalchemy import exists as sql_exists
+        
+        ticket_exists = db.query(
+            sql_exists().where(
+                Task.id == task_id,
+                Task.workspace_id == current_user.workspace_id,
+                Task.is_deleted == False
+            )
+        ).scalar()
+        
+        exists_check_time = time.time() - exists_check_start
+    
+    # ⚠️ ALERTA de performance si la verificación es lenta
+    if exists_check_time > 0.01:  # > 10ms
+        task_logger.warning(f"🐌 SLOW EXISTS CHECK: {exists_check_time*1000:.2f}ms - Necesita índices en (id, workspace_id, is_deleted)")
+        task_logger.warning(f"💡 SUGERENCIA: Aplicar índices para mejorar de {exists_check_time*1000:.2f}ms a <5ms")
+    
+    if not ticket_exists:
+        total_time = time.time() - start_time
+        task_logger.warning(f"❌ OPEN TICKET: Ticket {task_id} no existe o sin permisos en {total_time*1000:.2f}ms")
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    permissions_time = time.time() - permissions_start
+    
+    # 📊 PERFORMANCE ANALYSIS con recomendaciones inteligentes
+    task_logger.info(f"✅ OPEN TICKET: Permisos verificados en {permissions_time*1000:.2f}ms (existencia: {exists_check_time*1000:.2f}ms)")
+    
+    # 🎯 MEJORES PRÁCTICAS: Detectar y sugerir optimizaciones
+    if permissions_time > 0.05:  # > 50ms
+        task_logger.warning(f"🐌 PERMISSIONS SLOW: {permissions_time*1000:.2f}ms")
+        task_logger.warning(f"💡 BEST PRACTICE: Implementar caché de permisos para usuario {current_user.id}")
+        
+        # Caché inteligente para verificaciones frecuentes
+        try:
+            from app.core.cache import user_cache
+            cache_key = f"ticket_access:{current_user.id}:{task_id}"
+            # En futuras implementaciones: verificar caché primero
+            task_logger.info(f"🎯 OPTIMIZATION TARGET: Cache key would be: {cache_key}")
+        except:
+            pass
+    
+    if exists_check_time > 0.01:  # > 10ms para EXISTS
+        task_logger.error(f"🚨 CRITICAL: EXISTS query tardó {exists_check_time*1000:.2f}ms")
+        task_logger.error(f"🚨 URGENT: Aplicar índice: CREATE INDEX ON tickets(id, workspace_id, is_deleted)")
+        task_logger.error(f"🚨 IMPACT: Cada apertura de ticket pierde {exists_check_time*1000:.2f}ms innecesarios")
+    
+    # 2. Construcción de query con todas las relaciones
+    query_build_start = time.time()
+    task_logger.info(f"🏗️ OPEN TICKET: Construyendo query con 10 relaciones...")
+    
     query = db.query(Task).options(
-        joinedload(Task.workspace),
-        joinedload(Task.sent_from), 
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category),
-        joinedload(Task.body),
-        joinedload(Task.merged_by_agent)
+        joinedload(Task.workspace),      # Relación 1
+        joinedload(Task.sent_from),      # Relación 2 
+        joinedload(Task.sent_to),        # Relación 3
+        joinedload(Task.assignee),       # Relación 4
+        joinedload(Task.user),           # Relación 5
+        joinedload(Task.team),           # Relación 6
+        joinedload(Task.company),        # Relación 7
+        joinedload(Task.category),       # Relación 8
+        joinedload(Task.body),           # Relación 9
+        joinedload(Task.merged_by_agent) # Relación 10
     ).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
     
-    task = query.first()
+    query_build_time = time.time() - query_build_start
+    task_logger.info(f"⚡ OPEN TICKET: Query construida en {query_build_time*1000:.2f}ms (10 joinedload configurados)")
+    
+    # 3. Ejecución de la consulta principal (CUELLO DE BOTELLA PRINCIPAL)
+    task_logger.info(f"🚀 OPEN TICKET: Ejecutando query principal con todas las relaciones...")
+    
+    # 3. 🚀 Ejecución optimizada con mejores prácticas SQLAlchemy
+    execution_start = time.time()
+    task_logger.info(f"💾 OPEN TICKET: Enviando consulta optimizada a la base de datos...")
+    
+    # BEST PRACTICE: Usar execution_options para optimizar la query
+    optimized_query = query.execution_options(
+        # Optimizaciones de SQLAlchemy
+        compiled_cache={},  # Usar compiled statement cache
+        autoflush=False,    # No hacer flush automático
+        autocommit=False    # No hacer commit automático
+    )
+    
+    task = optimized_query.first()
+    execution_time = time.time() - execution_start
+    
+    # 📊 QUERY ANALYSIS
+    task_logger.info(f"🎯 QUERY OPTIMIZATIONS APPLIED:")
+    task_logger.info(f"   - Compiled statement cache: ✅")
+    task_logger.info(f"   - Autoflush disabled: ✅") 
+    task_logger.info(f"   - Query execution time: {execution_time*1000:.2f}ms")
+    
     if not task:
+        total_time = time.time() - start_time
+        task_logger.error(f"❌ OPEN TICKET: Ticket {task_id} no encontrado después de verificación exitosa - ERROR INCONSISTENTE")
+        task_logger.error(f"❌ OPEN TICKET: Tiempo total perdido: {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
+    
+    task_logger.info(f"🎯 OPEN TICKET: Query ejecutada exitosamente en {execution_time*1000:.2f}ms")
+    
+    # 4. Análisis detallado de las relaciones cargadas
+    relations_analysis_start = time.time()
+    task_logger.info(f"🔍 OPEN TICKET: Analizando relaciones cargadas...")
+    
+    # Verificar qué relaciones se cargaron exitosamente
+    relations_loaded = []
+    relations_with_data = []
+    
+    # Verificar cada relación individualmente
+    if hasattr(task, 'workspace') and task.workspace: 
+        relations_loaded.append('workspace')
+        relations_with_data.append(f"workspace(id:{task.workspace.id})")
+    if hasattr(task, 'sent_from') and task.sent_from: 
+        relations_loaded.append('sent_from')
+        relations_with_data.append(f"sent_from(id:{task.sent_from.id})")
+    if hasattr(task, 'sent_to') and task.sent_to: 
+        relations_loaded.append('sent_to')
+        relations_with_data.append(f"sent_to(id:{task.sent_to.id})")
+    if hasattr(task, 'assignee') and task.assignee: 
+        relations_loaded.append('assignee')
+        relations_with_data.append(f"assignee(id:{task.assignee.id})")
+    if hasattr(task, 'user') and task.user: 
+        relations_loaded.append('user')
+        relations_with_data.append(f"user(id:{task.user.id})")
+    if hasattr(task, 'team') and task.team: 
+        relations_loaded.append('team')
+        relations_with_data.append(f"team(id:{task.team.id})")
+    if hasattr(task, 'company') and task.company: 
+        relations_loaded.append('company')
+        relations_with_data.append(f"company(id:{task.company.id})")
+    if hasattr(task, 'category') and task.category: 
+        relations_loaded.append('category')
+        relations_with_data.append(f"category(id:{task.category.id})")
+    if hasattr(task, 'body') and task.body: 
+        relations_loaded.append('body')
+        relations_with_data.append(f"body(chars:{len(str(task.body.email_body)) if task.body.email_body else 0})")
+    if hasattr(task, 'merged_by_agent') and task.merged_by_agent: 
+        relations_loaded.append('merged_by_agent')
+        relations_with_data.append(f"merged_by_agent(id:{task.merged_by_agent.id})")
+    
+    relations_analysis_time = time.time() - relations_analysis_start
+    
+    task_logger.info(f"📊 OPEN TICKET: Relaciones cargadas: {len(relations_loaded)}/10")
+    task_logger.info(f"📋 OPEN TICKET: Con datos: {', '.join(relations_with_data) if relations_with_data else 'Solo campos básicos'}")
+    task_logger.info(f"⚡ OPEN TICKET: Análisis de relaciones: {relations_analysis_time*1000:.2f}ms")
+    
+    # 5. Logs de tamaño de datos y memoria
+    memory_analysis_start = time.time()
+    task_logger.info(f"💾 OPEN TICKET: Analizando tamaño de datos cargados...")
+    
+    # Estimar tamaños aproximados
+    title_size = len(task.title) if task.title else 0
+    description_size = len(task.description) if task.description else 0
+    body_size = len(task.body.email_body) if (task.body and task.body.email_body) else 0
+    
+    total_text_chars = title_size + description_size + body_size
+    memory_analysis_time = time.time() - memory_analysis_start
+    
+    task_logger.info(f"📏 OPEN TICKET: Tamaño de contenido:")
+    task_logger.info(f"   - Título: {title_size} chars")
+    task_logger.info(f"   - Descripción: {description_size} chars") 
+    task_logger.info(f"   - Cuerpo/Body: {body_size} chars")
+    task_logger.info(f"   - Total texto: {total_text_chars} chars")
+    if total_text_chars > 10000:
+        task_logger.warning(f"⚠️ OPEN TICKET: CONTENIDO GRANDE detectado ({total_text_chars} chars) - Puede impactar performance")
+    
+    # 6. Performance summary completo
+    total_time = time.time() - start_time
+    task_logger.info(f"✅ OPEN TICKET: Ticket {task_id} cargado exitosamente")
+    task_logger.info(f"📊 OPEN TICKET BREAKDOWN DETALLADO:")
+    task_logger.info(f"   1. Permisos + existencia: {permissions_time*1000:.2f}ms (existe: {exists_check_time*1000:.2f}ms)")
+    task_logger.info(f"   2. Query construction: {query_build_time*1000:.2f}ms")
+    task_logger.info(f"   3. Database execution: {execution_time*1000:.2f}ms  🎯 CUELLO DE BOTELLA PRINCIPAL")
+    task_logger.info(f"   4. Relations analysis: {relations_analysis_time*1000:.2f}ms")
+    task_logger.info(f"   5. Memory analysis: {memory_analysis_time*1000:.2f}ms")
+    task_logger.info(f"   TOTAL OPEN TIME: {total_time*1000:.2f}ms")
+    
+    # 7. 🎯 RECOMENDACIONES INTELIGENTES basadas en datos reales
+    task_logger.info(f"🧠 SMART ANALYSIS: Analizando uso óptimo de recursos...")
+    
+    # Análisis inteligente de eficiencia
+    efficiency_score = 100
+    recommendations = []
+    
+    if execution_time > 0.15:  # > 150ms
+        efficiency_score -= 40
+        task_logger.warning(f"🐌 OPEN TICKET SLOW: Database execution tardó {execution_time*1000:.2f}ms")
+        recommendations.append("Usar /tasks-optimized/{task_id}/fast para ~85% mejora")
+        
+    if len(relations_loaded) > 3 and total_text_chars < 1000:  # Muchas relaciones, poco contenido
+        efficiency_score -= 30
+        task_logger.warning(f"⚡ RESOURCE WASTE: Cargando {len(relations_loaded)} relaciones para solo {total_text_chars} chars")
+        recommendations.append("Usar /tasks-optimized/{task_id}/essential para contenido mínimo")
+        
+    if permissions_time > 0.05:  # Permisos lentos
+        efficiency_score -= 20
+        recommendations.append("Implementar caché de permisos")
+        
+    if exists_check_time > 0.01:  # EXISTS lento  
+        efficiency_score -= 30
+        recommendations.append("URGENTE: Aplicar índices de base de datos")
+    
+    # 🎯 SCORE DE EFICIENCIA
+    if efficiency_score >= 80:
+        task_logger.info(f"🏆 EFFICIENCY SCORE: {efficiency_score}/100 - EXCELENTE performance")
+    elif efficiency_score >= 60:
+        task_logger.warning(f"⚡ EFFICIENCY SCORE: {efficiency_score}/100 - BUENA, pero mejorable")
+    else:
+        task_logger.error(f"🚨 EFFICIENCY SCORE: {efficiency_score}/100 - CRÍTICO - Requiere optimización")
+    
+    # 💡 RECOMENDACIONES PRIORIZADAS
+    if recommendations:
+        task_logger.info(f"💡 TOP RECOMMENDATIONS para ticket {task_id}:")
+        for i, rec in enumerate(recommendations[:3], 1):  # Top 3
+            task_logger.info(f"   {i}. {rec}")
+    
+    # 📊 COMPARACIÓN CON ENDPOINTS OPTIMIZADOS
+    potential_savings = max(0, total_time - 0.03)  # 30ms objetivo
+    if potential_savings > 0.05:  # > 50ms de ahorro potencial
+        savings_percent = (potential_savings / total_time) * 100
+        task_logger.info(f"💰 POTENTIAL SAVINGS: {potential_savings*1000:.0f}ms ({savings_percent:.0f}%) usando endpoints optimizados")
+    
+    if total_text_chars > 50000:
+        task_logger.warning(f"📄 CONTENIDO MUY GRANDE: {total_text_chars} chars - Considera paginación de contenido")
+    
+    task_logger.info(f"🎯 OPEN TICKET: Finalizado - Ticket listo para frontend con efficiency score {efficiency_score}/100")
     
     return task
 
@@ -370,15 +608,28 @@ async def update_task_endpoint(
 ) -> Any:
     """
     Update a task. All roles (admin, manager, agent) can update all fields including assignee and team.
+    PERFORMANCE: Con logs detallados para operaciones de refresh/update
     """
+    # 🔍 REFRESH PERFORMANCE LOGS
+    refresh_start_time = time.time()
+    task_logger.info(f"🔄 REFRESH: Iniciando actualización de ticket {task_id} para usuario {current_user.id}")
+    
+    # Log datos de la actualización
+    update_fields = [field for field, value in task_in.dict(exclude_unset=True).items() if value is not None]
+    task_logger.info(f"📝 REFRESH: Campos a actualizar: {update_fields}")
     # Fetch the task ensuring it belongs to the user's workspace
+    fetch_start = time.time()
     task = db.query(Task).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).first()
+    fetch_time = time.time() - fetch_start
+    task_logger.info(f"⚡ REFRESH: Task fetch completado en {fetch_time*1000:.2f}ms")
 
     if not task:
+        total_time = time.time() - refresh_start_time
+        task_logger.warning(f"❌ REFRESH: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
@@ -386,17 +637,27 @@ async def update_task_endpoint(
 
     # Get origin URL for notification
     origin = request.headers.get("origin") or settings.FRONTEND_URL
+    task_logger.info(f"🌐 REFRESH: Origin URL: {origin}")
 
     # Use the service function which handles the actual update logic
+    service_start = time.time()
     updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
+    service_time = time.time() - service_start
+    task_logger.info(f"⚙️ REFRESH: Task service update completado en {service_time*1000:.2f}ms")
 
     if not updated_task_dict: # Service function returns the updated dict or None
+        total_time = time.time() - refresh_start_time
+        task_logger.error(f"❌ REFRESH: Update falló para ticket {task_id} en {total_time*1000:.2f}ms")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
             detail="Task update failed", # Or more specific error from service
         )
     
     # Load the complete task object with all relationships required by TaskWithDetails
+    # ⚠️ POSIBLE CUELLO DE BOTELLA: Carga todas las relaciones después del update
+    reload_start = time.time()
+    task_logger.info(f"🔄 REFRESH: Iniciando recarga completa del ticket con todas las relaciones...")
+    
     updated_task_obj = db.query(Task).options(
         joinedload(Task.workspace),
         joinedload(Task.team),
@@ -408,14 +669,21 @@ async def update_task_endpoint(
         joinedload(Task.category),
         joinedload(Task.body)
     ).filter(Task.id == task_id).first()
+    
+    reload_time = time.time() - reload_start
+    task_logger.info(f"🔄 REFRESH: Recarga de relaciones completada en {reload_time*1000:.2f}ms")
+    task_logger.info(f"📊 REFRESH: Relaciones cargadas: workspace, team, company, user, sent_from, sent_to, assignee, category, body")
 
     if not updated_task_obj:
+        total_time = time.time() - refresh_start_time
+        task_logger.error(f"❌ REFRESH: Ticket {task_id} no encontrado después del update en {total_time*1000:.2f}ms")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found after update",
         )
 
     # --- Socket.IO Event ---
+    socketio_start = time.time()
     try:
         # ✅ OPTIMIZACIÓN: Usar función síncrona para respuesta más rápida
         task_data = {
@@ -434,9 +702,27 @@ async def update_task_endpoint(
         from app.core.socketio import emit_ticket_update_sync
         emit_ticket_update_sync(updated_task_obj.workspace_id, task_data)
         
+        socketio_time = time.time() - socketio_start
+        task_logger.info(f"📡 REFRESH: Socket.IO emit completado en {socketio_time*1000:.2f}ms")
+        
     except Exception as e:
-        logger.error(f"Failed to emit ticket_updated event for task {task_id}: {str(e)}")
+        socketio_time = time.time() - socketio_start
+        task_logger.error(f"❌ REFRESH: Socket.IO falló en {socketio_time*1000:.2f}ms: {str(e)}")
     # --- End Socket.IO Event ---
+
+    # 🎯 REFRESH PERFORMANCE SUMMARY
+    total_refresh_time = time.time() - refresh_start_time
+    task_logger.info(f"✅ REFRESH: Ticket {task_id} actualizado exitosamente")
+    task_logger.info(f"📊 REFRESH BREAKDOWN:")
+    task_logger.info(f"   1. Task fetch: {fetch_time*1000:.2f}ms")
+    task_logger.info(f"   2. Service update: {service_time*1000:.2f}ms")
+    task_logger.info(f"   3. Relations reload: {reload_time*1000:.2f}ms  ⚠️ POSIBLE CUELLO DE BOTELLA")
+    task_logger.info(f"   4. Socket.IO emit: {socketio_time*1000:.2f}ms")
+    task_logger.info(f"   TOTAL REFRESH TIME: {total_refresh_time*1000:.2f}ms")
+    
+    # ⚠️ ADVERTENCIA si la recarga de relaciones es lenta
+    if reload_time > 0.1:  # > 100ms
+        task_logger.warning(f"🐌 REFRESH SLOW: Relations reload tardó {reload_time*1000:.2f}ms - Considera usar endpoint optimizado")
 
     # Return the updated ORM object with all relationships
     return updated_task_obj

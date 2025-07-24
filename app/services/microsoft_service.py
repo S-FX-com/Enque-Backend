@@ -1,5 +1,5 @@
 # ⚡ Optimized imports for performance
-import orjson  # Ultra-fast JSON (2-4x faster than standard json)
+import orjson  
 import asyncio
 import requests
 import urllib.parse
@@ -8,14 +8,12 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
 
-# 🚀 Import performance services
 try:
     from app.services.cache_service import cache_service, cached_microsoft_graph
     from app.services.rate_limiter import rate_limiter, rate_limited
     PERFORMANCE_SERVICES_AVAILABLE = True
 except ImportError:
     PERFORMANCE_SERVICES_AVAILABLE = False
-    # Fallback decorators when services not available
     def cached_microsoft_graph(ttl=300, key_prefix="msg"):
         def decorator(func):
             return func
@@ -26,7 +24,7 @@ except ImportError:
         return decorator
 from app.models.microsoft import MicrosoftIntegration, MicrosoftToken, EmailTicketMapping, EmailSyncConfig, MailboxConnection
 from app.schemas.microsoft import EmailData, EmailAddress, EmailAttachment, MicrosoftTokenCreate, EmailTicketMappingCreate
-from app.schemas.task import TaskStatus # Import TaskStatus Enum
+from app.schemas.task import TaskStatus 
 from app.models.task import Task, TicketBody
 from app.models.agent import Agent
 from app.models.user import User
@@ -36,22 +34,20 @@ from app.models.workspace import Workspace
 from app.models.ticket_attachment import TicketAttachment
 from app.services.utils import get_or_create_user
 from app.utils.logger import logger, log_important
-from app.core.socketio import emit_comment_update_sync # Import Socket.IO sync function
+from app.core.socketio import emit_comment_update_sync 
 import base64
-import json # Ensure json is imported
+import json 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
-import httpx # Moved import to top level
-# Removed unused import: get_current_active_user
+import httpx 
 from urllib.parse import urlencode
 import uuid
 import time
 from sqlalchemy import or_, and_, desc
 import re
-from app.utils.image_processor import extract_base64_images  # Importamos nuestra nueva utilidad
-from app.services.token_service import TokenService  # NEW: dedicated auth service
-import boto3  # For S3 file downloads
-
+from app.utils.image_processor import extract_base64_images  
+from app.services.token_service import TokenService 
+import boto3  
 
 class MicrosoftGraphService:
     """Service for interacting with Microsoft Graph API"""
@@ -65,10 +61,8 @@ class MicrosoftGraphService:
         self.token_url = settings.MICROSOFT_TOKEN_URL
         self.graph_url = settings.MICROSOFT_GRAPH_URL
 
-        # Instantiate dedicated TokenService
         self.token_service = TokenService(db, self.integration)
 
-        # Legacy app-token attrs retained for backward-compat (not used anymore)
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
         
@@ -76,7 +70,7 @@ class MicrosoftGraphService:
         self.tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
 
         if self.integration:
-            pass  # Microsoft service initialized
+            pass  
         elif self.has_env_config:
             logger.info("Microsoft service initialized with environment variables (no DB integration)")
         else:
@@ -575,18 +569,15 @@ class MicrosoftGraphService:
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
             
-            # Lista mejorada de filtros para identificar correos generados por notificaciones
             notification_subject_patterns = [
                 "New ticket #", 
                 "Ticket #",
                 "New response to your ticket #",
-                "Ticket", 
-                "[ID:",     # Detectar el formato de ID que agregamos a los asuntos
-
+                "Enque 🎟️",  
+                "[ID:",      
                 "has been assigned"
             ]
             
-            # Lista de dominios del sistema - detectados automáticamente por workspace
             system_domains = self._get_system_domains_for_workspace(sync_config.workspace_id)
             
             for email_data in emails:
@@ -596,23 +587,18 @@ class MicrosoftGraphService:
                 
                 if not email_id: logger.warning("[MAIL SYNC] Skipping email with missing ID."); continue
                 try:
-                    # Verificar si el correo ya fue procesado
                     existing_mapping = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first()
                     if existing_mapping:
-                        # VALIDACIÓN DE INTEGRIDAD: Verificar que el ticket realmente existe
                         ticket_exists = self.db.query(Task).filter(Task.id == existing_mapping.ticket_id).first()
                         if not ticket_exists:
                             logger.warning(f"🚨 ORPHANED MAPPING: Email {email_id} maps to non-existent ticket #{existing_mapping.ticket_id}. Cleaning up...")
                             self.db.delete(existing_mapping)
                             self.db.commit()
                             logger.info(f"✅ Cleaned orphaned mapping for email {email_id}")
-                            # Continue processing as if it's a new email
                         else:
-                            # VALIDACIÓN AVANZADA: Verificar coherencia de contenido
                             mapping_subject = existing_mapping.email_subject or ""
                             current_subject = email_subject or ""
                             
-                            # Si los subjects son muy diferentes, probablemente es un mapping incorrecto
                             if mapping_subject and current_subject and mapping_subject.lower() != current_subject.lower():
                                 logger.warning(f"🚨 INCONSISTENT MAPPING: Email {email_id} mapped to ticket #{existing_mapping.ticket_id}")
                                 logger.warning(f"   Removing inconsistent mapping...")
@@ -623,19 +609,15 @@ class MicrosoftGraphService:
                             else:
                                 continue
                     
-                    # 🔧 PRIMERO obtener contenido completo del email
                     email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     conversation_id = email_content.get("conversationId")
                     
-                    # 🔧 PRIORIDAD MÁXIMA: Verificar si es respuesta a ticket existente ANTES de filtros
                     existing_mapping_by_conv = None
                     if conversation_id:
                         existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
                     
-                    # 🔧 TAMBIÉN verificar por ID en asunto como método alternativo
                     if not existing_mapping_by_conv and email_subject:
-                        # Buscar [ID:XXXX] en el asunto
                         id_match = re.search(r'\[ID:(\d+)\]', email_subject, re.IGNORECASE)
                         if id_match:
                             ticket_id_from_subject = int(id_match.group(1))
@@ -652,13 +634,10 @@ class MicrosoftGraphService:
                         if not workspace: logger.error(f"Workspace ID {sync_config.workspace_id} not found for reply. Skipping comment creation."); continue
                         processed_reply_html = self._process_html_body(email.body_content, email.attachments, f"reply email {email.id}")
                         
-                        # Eliminar cualquier línea "From:" que pueda estar en el contenido del correo para evitar duplicidad
                         processed_reply_html = re.sub(r'^<p><strong>From:</strong>.*?</p>', '', processed_reply_html, flags=re.DOTALL | re.IGNORECASE)
                         
-                        # Usar el formato con metadatos especiales para el remitente
                         special_metadata = f'<original-sender>{reply_user.name}|{reply_user.email}</original-sender>'
                         
-                        # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
                         content_to_store = special_metadata + processed_reply_html
                         s3_html_url = None
                         
@@ -667,7 +646,6 @@ class MicrosoftGraphService:
                                 from app.services.s3_service import get_s3_service
                                 s3_service = get_s3_service()
                                 
-                                # Verificar si el contenido es muy grande o debe ir a S3
                                 content_length = len(content_to_store)
                                 should_migrate_to_s3 = (
                                     content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
@@ -675,25 +653,19 @@ class MicrosoftGraphService:
                                 )
                                 
                                 if should_migrate_to_s3:
-                                    # Pre-migrating large content to S3
-                                    
-                                    # Generar un ID temporal para el archivo S3
                                     import uuid
                                     temp_id = str(uuid.uuid4())
                                     
-                                    # Almacenar en S3 con ID temporal
                                     s3_url = s3_service.upload_html_content(
                                         html_content=content_to_store,
                                         filename=f"temp-comment-{temp_id}.html",
                                         folder="comments"
                                     )
                                     
-                                    # Actualizar variables para la BD
                                     s3_html_url = s3_url
                                     content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
                         except Exception as e:
                             logger.error(f"❌ [MAIL SYNC] Error pre-migrating content to S3: {str(e)}")
-                            # Continue with original content if S3 fails
                             content_to_store = special_metadata + processed_reply_html
                             s3_html_url = None
 
@@ -701,12 +673,11 @@ class MicrosoftGraphService:
                             ticket_id=existing_mapping_by_conv.ticket_id,
                             agent_id=system_agent.id,
                             workspace_id=workspace.id,
-                            content=content_to_store,  # Usar contenido procesado
-                            s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
+                            content=content_to_store,  
+                            s3_html_url=s3_html_url,  
                             is_private=False
                         )
 
-                        # Procesar y añadir adjuntos al nuevo comentario
                         if email.attachments:
                             non_inline_attachments = [att for att in email.attachments if not att.is_inline and att.contentBytes]
                             if non_inline_attachments:
@@ -714,16 +685,13 @@ class MicrosoftGraphService:
                                     try:
                                         decoded_bytes = base64.b64decode(att.contentBytes)
                                         
-                                        # 🔧 FIX: Subir adjunto a S3 en lugar de guardar en BD
                                         s3_url = None
                                         try:
                                             from app.services.s3_service import get_s3_service
                                             s3_service = get_s3_service()
                                             
-                                            # Determinar carpeta según tipo de archivo
                                             folder = "images" if att.content_type.startswith("image/") else "documents"
                                             
-                                            # Subir a S3
                                             s3_url = s3_service.upload_file(
                                                 file_content=decoded_bytes,
                                                 filename=att.name,
@@ -735,15 +703,13 @@ class MicrosoftGraphService:
                                             
                                         except Exception as s3_error:
                                             logger.error(f"❌ Error subiendo adjunto '{att.name}' a S3: {str(s3_error)}")
-                                            # Fallback: guardar en BD si S3 falla
                                             pass
                                         
-                                        # Crear adjunto en BD con S3 URL o bytes según disponibilidad
                                         db_attachment = TicketAttachment(
                                             file_name=att.name,
                                             content_type=att.content_type,
                                             file_size=att.size,
-                                            s3_url=s3_url,  # ✅ FIX: Incluir URL de S3
+                                            s3_url=s3_url,  
                                             content_bytes=decoded_bytes if not s3_url else None  # Solo bytes si S3 falló
                                         )
                                         new_comment.attachments.append(db_attachment) # SQLAlchemy manejará el comment_id
@@ -752,46 +718,35 @@ class MicrosoftGraphService:
                                         logger.error(f"Error al procesar/decodificar adjunto '{att.name}' para comentario en ticket {existing_mapping_by_conv.ticket_id}: {e}", exc_info=True)
                         
                         self.db.add(new_comment)
-                        
-                        # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
+
                         if s3_html_url and not s3_html_url.endswith(f"comment-{new_comment.id}.html"):
                             try:
-                                # Hacer flush para obtener el ID real del comentario
                                 self.db.flush()
                                 
-                                # Renombrar archivo en S3 con el ID real del comentario
                                 from app.services.s3_service import get_s3_service
                                 s3_service = get_s3_service()
                                 
-                                # ARREGLO: Usar el contenido original, no el placeholder
                                 original_content = special_metadata + processed_reply_html
                                 
-                                # Crear nueva URL con ID real
                                 final_s3_url = s3_service.store_comment_html(new_comment.id, original_content)
                                 
-                                # Actualizar la URL en el comentario
                                 new_comment.s3_html_url = final_s3_url
                                 new_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
                             except Exception as e:
                                 logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for comment {new_comment.id}: {str(e)}")
-                                # Continue with temp filename - not critical
-                        
-                        # NUEVO: Procesar workflows basados en el contenido del email
-                        # 🔧 OBTENER TICKET para workflows y actualización de estado
+
                         ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
                         
                         try:
                             from app.services.workflow_service import WorkflowService
                             
-                            # Solo procesar si hay contenido significativo
                             if email.body_content and email.body_content.strip():
                                 workflow_service = WorkflowService(self.db)
                                 
-                                # Preparar contexto para workflows
                                 workflow_context = {
                                     'task_id': existing_mapping_by_conv.ticket_id,
-                                    'comment_id': None,  # Se establecerá después del commit
-                                    'agent_id': system_agent.id,  # Agente del sistema que procesa
+                                    'comment_id': None,  
+                                    'agent_id': system_agent.id,  
                                     'workspace_id': workspace.id,
                                     'task_status': ticket_to_update.status if ticket_to_update else 'unknown',
                                     'task_priority': getattr(ticket_to_update, 'priority', 'normal') if ticket_to_update else 'normal',
@@ -801,7 +756,6 @@ class MicrosoftGraphService:
                                     'email_sender_name': reply_user.name
                                 }
                                 
-                                # Procesar workflows basados en contenido del email
                                 workflow_results = workflow_service.process_message_for_workflows(
                                     email.body_content,
                                     workspace.id,
@@ -816,12 +770,11 @@ class MicrosoftGraphService:
                         except Exception as workflow_error:
                             logger.error(f"[MAIL SYNC] Error processing workflows for email reply: {str(workflow_error)}")
                         
-                        # AGREGAR: Crear actividad para la respuesta del usuario por email
                         user_activity = Activity(
-                            agent_id=None,  # No hay agente, es un usuario quien responde
-                            action=f"{reply_user.name} replied via email",  # Quitar "User" para simplificar
+                            agent_id=None,  
+                            action=f"{reply_user.name} replied via email",  
                             source_type="Comment",
-                            source_id=existing_mapping_by_conv.ticket_id,  # Usar ticket_id como source_id
+                            source_id=existing_mapping_by_conv.ticket_id,  
                             workspace_id=workspace.id
                         )
                         self.db.add(user_activity)
@@ -832,36 +785,25 @@ class MicrosoftGraphService:
                             email_received_at=email.received_at, is_processed=True)
                         self.db.add(reply_email_mapping)
                         
-                        # Actualizar estado del ticket si es necesario
                         if ticket_to_update and ticket_to_update.status == TaskStatus.WITH_USER:
-                             # User replied, updating status from WITH_USER to IN_PROGRESS
                              ticket_to_update.status = TaskStatus.IN_PROGRESS; self.db.add(ticket_to_update)
                              logger.info(f"[MAIL SYNC] Ticket {existing_mapping_by_conv.ticket_id} status changed from WITH_USER to IN_PROGRESS after user reply")
                         elif ticket_to_update and ticket_to_update.status == TaskStatus.CLOSED:
-                             # User replied to closed ticket, reopen to IN_PROGRESS
                              ticket_to_update.status = TaskStatus.IN_PROGRESS; self.db.add(ticket_to_update)
                              logger.info(f"[MAIL SYNC] Ticket {existing_mapping_by_conv.ticket_id} status changed from CLOSED to IN_PROGRESS after user reply")
-                        elif ticket_to_update: pass  # User replied, no status update needed
+                        elif ticket_to_update: pass  
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
                         
                         self.db.commit(); added_comments_count += 1
-                        # Comment added to ticket
                         
-                        # ✅ EMIT SOCKET.IO EVENT para actualización en tiempo real
                         try:
-                            # Hacer flush para obtener el ID del comentario
                             self.db.flush()
                             
-                            # 🔧 FIX: Usar contenido completo del comentario para socket en lugar de email truncado
                             full_content = ""
                             if new_comment.s3_html_url:
-                                # Si está en S3, usar el contenido procesado completo
                                 full_content = special_metadata + processed_reply_html
                             else:
-                                # Si está en BD, usar el contenido almacenado
                                 full_content = new_comment.content or ""
-                            
-                            # 🔧 FIX: Incluir adjuntos en datos del socket
                             attachments_data = []
                             for attachment in new_comment.attachments:
                                 attachments_data.append({
@@ -869,22 +811,20 @@ class MicrosoftGraphService:
                                     'file_name': attachment.file_name,
                                     'content_type': attachment.content_type,
                                     'file_size': attachment.file_size,
-                                    'download_url': attachment.s3_url  # Usar s3_url como download_url
+                                    'download_url': attachment.s3_url  
                                 })
                             
                             comment_data = {
                                 'id': new_comment.id,
                                 'ticket_id': existing_mapping_by_conv.ticket_id,
-                                'agent_id': None,  # Es un usuario, no un agente
-                                'user_id': reply_user.id,  # ✅ AGREGAR user_id para consistencia
+                                'agent_id': None,  
+                                'user_id': reply_user.id,  
                                 'user_name': reply_user.name,
-                                'content': full_content,  # ✅ FIX: Usar contenido completo en lugar de truncado
+                                'content': full_content, 
                                 'is_private': False,
                                 'created_at': new_comment.created_at.isoformat() if new_comment.created_at else None,
-                                'attachments': attachments_data  # ✅ FIX: Incluir adjuntos
+                                'attachments': attachments_data  
                             }
-                            
-                            # Emitir evento de forma síncrona (compatible con email sync)
                             emit_comment_update_sync(
                                 workspace_id=workspace.id,
                                 comment_data=comment_data
@@ -894,43 +834,31 @@ class MicrosoftGraphService:
                         except Exception as e:
                             logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for comment {new_comment.id}: {str(e)}")
                         
-                        # 🔧 MEJORADO: Mover email de respuesta y actualizar mappings si cambia el ID
                         if processed_folder_id: 
                             new_reply_id = self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                             if new_reply_id and new_reply_id != email_id:
-                                # Email ID changed after move, updating ALL related mappings for this reply
                                 logger.info(f"📧 Reply email moved - ID changed from {email_id[:50]}... to {new_reply_id[:50]}...")
                                 self._update_all_email_mappings_for_ticket(existing_mapping_by_conv.ticket_id, email_id, new_reply_id)
                         continue
                     else:
-                        # 🔧 APLICAR filtros solo para emails que NO son respuestas a tickets existentes
                         
-                        # Obtener el asunto del correo para verificar si es una notificación del sistema
                         email_subject_lower = email_subject.lower()
                         
-                        # Verificar si el correo es una notificación generada por el sistema
                         is_system_notification = False
                         
-                        # Obtener remitente para permitir respuestas de clientes/externos
                         sender_email_lower = sender_email.lower()
                         mailbox_email = user_email.lower()
-                        
-                        # Verificación más estricta: 
-                        # 1. Si viene del mismo buzón o un dominio del sistema
-                        # 2. Y el asunto contiene patrones típicos de notificación
+
                         if any(domain in sender_email_lower for domain in system_domains) or sender_email_lower == mailbox_email:
-                            # Si el remitente es del mismo dominio, verificar si el asunto coincide con patrones de notificación
                             for pattern in notification_subject_patterns:
                                 if pattern.lower() in email_subject_lower:
                                     is_system_notification = True
                                     
-                                    # Marcar como leído y mover a carpeta procesada sin crear ticket
                                     self._mark_email_as_read(user_access_token, user_email, email_id)
                                     if processed_folder_id:
                                         self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                     break
                         
-                        # Si es una notificación del sistema, continuamos con el siguiente correo
                         if is_system_notification:
                             logger.info(f"[MAIL SYNC] Skipping system notification email: {email_subject}")
                             continue
@@ -941,9 +869,7 @@ class MicrosoftGraphService:
                             logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation.")
                             continue
                         
-                        # Verificación adicional del remitente para evitar bucles
                         sender_email = email.sender.address if email.sender else ""
-                        # Si el remitente es el propio buzón o una dirección conocida del sistema
                         if sender_email.lower() == user_email.lower() or "microsoftexchange" in sender_email.lower():
                             logger.warning(f"[MAIL SYNC] Email from system address or self ({sender_email}). Marking as read and skipping ticket creation.")
                             self._mark_email_as_read(user_access_token, user_email, email_id)

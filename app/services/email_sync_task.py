@@ -99,7 +99,8 @@ def sync_single_config(config: EmailSyncConfig) -> int:
             return -1
             
         token = config_db.query(MicrosoftToken).filter(
-            MicrosoftToken.integration_id == integration.id
+            MicrosoftToken.integration_id == integration.id,
+            MicrosoftToken.mailbox_connection_id == config.mailbox_connection_id
         ).first()
         
         if not token:
