@@ -52,7 +52,7 @@ async def read_comments(
     PERFORMANCE: Con logs detallados para monitorear tiempo de carga
     """
     start_time = time.time()
-    logger.info(f"💬 PERFORMANCE: Iniciando carga de comentarios para ticket {task_id} (skip={skip}, limit={limit})")
+    pass
     
     # Verificación de permisos del ticket
     permissions_start = time.time()
@@ -88,13 +88,7 @@ async def read_comments(
     
     # Log detallado de performance
     total_time = time.time() - start_time
-    logger.info(f"✅ PERFORMANCE: {len(comments_orm)} comentarios cargados para ticket {task_id}")
-    logger.info(f"📊 COMMENTS PERFORMANCE BREAKDOWN:")
-    logger.info(f"   - Permissions check: {permissions_time*1000:.2f}ms")
-    logger.info(f"   - Comments query: {query_time*1000:.2f}ms")
-    logger.info(f"   - Total time: {total_time*1000:.2f}ms")
-    logger.info(f"   - Comments returned: {len(comments_orm)}")
-    logger.info(f"   - Pagination: skip={skip}, limit={limit}")
+    pass
 
     # Return the ORM objects directly. Pydantic's from_attributes=True
     return comments_orm
@@ -120,7 +114,6 @@ async def read_comments_optimized(
     Mejora de rendimiento esperada: 3-5x más rápido
     """
     start_time = time.time()
-    logger.info(f"🚀 OPTIMIZED COMMENTS: Iniciando carga rápida de comentarios para ticket {task_id}")
     
     # Verificación rápida de existencia del ticket (sin cargar relaciones)
     permissions_start = time.time()
@@ -133,7 +126,6 @@ async def read_comments_optimized(
 
     if not task_exists:
         total_time = time.time() - start_time
-        logger.warning(f"❌ OPTIMIZED COMMENTS: Ticket {task_id} no encontrado (tiempo: {total_time*1000:.2f}ms)")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found", 
@@ -158,13 +150,6 @@ async def read_comments_optimized(
     
     # Log detallado de performance
     total_time = time.time() - start_time
-    logger.info(f"✅ OPTIMIZED COMMENTS: {len(comments_orm)} comentarios cargados en {total_time*1000:.2f}ms")
-    logger.info(f"📊 OPTIMIZED COMMENTS BREAKDOWN:")
-    logger.info(f"   - Permissions check: {permissions_time*1000:.2f}ms")
-    logger.info(f"   - Comments query: {query_time*1000:.2f}ms")
-    logger.info(f"   - Total time: {total_time*1000:.2f}ms")
-    logger.info(f"   - Performance strategy: selectinload + reduced pagination")
-    logger.info(f"   - Expected improvement: 3-5x faster than standard endpoint")
 
     return comments_orm
 
@@ -859,17 +844,13 @@ def send_email_in_background(
     db = SessionLocal()
     
     try:
-        logger.info(f"[BACKGROUND] Iniciando envío de correo para comment_id: {comment_id} en task_id: {task_id}")
-        
         # Re-crear el objeto Agent
         agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
         if not agent:
-            logger.error(f"[BACKGROUND] Agent {agent_id} no encontrado en base de datos")
             return
             
         # Skip for private comments
         if is_private:
-            logger.info(f"[BACKGROUND] Skipping email for private comment {comment_id}")
             return
             
         # Re-fetch task with user relationship loaded to get recipient email if needed
@@ -880,25 +861,21 @@ def send_email_in_background(
         ).filter(TaskModel.id == task_id).first()
 
         if not task_with_user:
-            logger.error(f"[BACKGROUND] Task {task_id} not found when attempting to send email for comment {comment_id}.")
             return
         
         # Log para debugging - mostrar información del usuario actual del ticket
         if task_with_user.user:
-            logger.info(f"[BACKGROUND] Task {task_id} current user: {task_with_user.user.name} ({task_with_user.user.email})")
+            pass
         else:
-            logger.info(f"[BACKGROUND] Task {task_id} has no assigned user")
+            pass
             
         if task_with_user.mailbox_connection_id:
             # Task originated from email, send a reply
-            logger.info(f"[BACKGROUND] Task {task_id} originated from email. Attempting to send comment ID {comment_id} as reply with {len(processed_attachment_ids)} attachments.")
             microsoft_service = get_microsoft_service(db)
             microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients)
         else:
             # Task was created manually, send a new email notification
-            logger.info(f"[BACKGROUND] Task {task_id} was manual. Attempting to send comment ID {comment_id} as new email notification.")
             if not task_with_user.user or not task_with_user.user.email:
-                logger.warning(f"[BACKGROUND] Cannot send notification for comment {comment_id} on task {task_id}: Task user or user email is missing.")
                 return
             
             recipient_email = task_with_user.user.email
@@ -909,23 +886,13 @@ def send_email_in_background(
             ).first()
 
             if not sender_mailbox_conn:
-                logger.warning(f"[BACKGROUND] Cannot send notification for comment {comment_id} on task {task_id}: No active sender mailbox found for workspace {task_with_user.workspace_id}.")
                 return
             
             sender_mailbox = sender_mailbox_conn.email
             subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
             html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
 
-            # Log detallado del envío de email
-            logger.info(f"[BACKGROUND] 📧 Sending email notification:")
-            logger.info(f"[BACKGROUND]   → From: {sender_mailbox}")
-            logger.info(f"[BACKGROUND]   → To: {recipient_email}")
-            logger.info(f"[BACKGROUND]   → Subject: {subject}")
-            logger.info(f"[BACKGROUND]   → Comment ID: {comment_id}")
-            logger.info(f"[BACKGROUND]   → Task ID: {task_id}")
-
             microsoft_service = get_microsoft_service(db)
-            logger.info(f"[BACKGROUND] Sending new email notification for comment {comment_id} from {sender_mailbox} to {recipient_email} with {len(processed_attachment_ids)} attachments")
             email_sent = microsoft_service.send_new_email(
                 mailbox_email=sender_mailbox,
                 recipient_email=recipient_email,
@@ -935,12 +902,10 @@ def send_email_in_background(
                 task_id=task_id  # Pass the task ID to include in the subject
             )
             if not email_sent:
-                logger.error(f"[BACKGROUND] Failed to send new email notification for comment {comment_id} on task {task_id}")
-            else:
-                logger.info(f"[BACKGROUND] Successfully sent new email notification for comment {comment_id}")
+                pass
                 
     except Exception as e:
-        logger.error(f"[BACKGROUND] Error en el envío de correo para comment_id: {comment_id}: {str(e)}", exc_info=True)
+        pass
     finally:
         db.close()
 

@@ -1050,9 +1050,9 @@ def create_weekly_summary_email_html(
         <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
             
             <!-- Header -->
-            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white !important; padding: 30px; text-align: center;">
-                <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: white !important;">🎟️ Weekly Summary</h1>
-                <p style="margin: 10px 0 0 0; font-size: 16px; opacity: 0.9; color: white !important;">
+            <div style="background-color: #f8fafc; border-bottom: 3px solid #667eea; padding: 30px; text-align: center;">
+                <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: #1f2937;">🎟️ Weekly Summary</h1>
+                <p style="margin: 10px 0 0 0; font-size: 16px; color: #6b7280;">
                     {agent_name} • {week_range}
                 </p>
             </div>

@@ -1,7 +1,3 @@
-"""
-Endpoints de Tasks OPTIMIZADOS para rendimiento
-Elimina consultas N+1 y carga solo datos esenciales
-"""
 from typing import Any, List, Optional
 import time
 import logging
@@ -20,8 +16,6 @@ from app.models.microsoft import mailbox_team_assignments
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
 @router.get("/", response_model=List[TaskSchema])
 async def read_tasks_optimized_default(
     db: Session = Depends(get_db),
@@ -35,18 +29,12 @@ async def read_tasks_optimized_default(
     priority: Optional[str] = Query(None),
     category_id: Optional[int] = Query(None),
 ) -> Any:
-    """
-    ENDPOINT BASE OPTIMIZADO: Lista de tasks con rendimiento mejorado
-    Usa automáticamente la mejor estrategia disponible
-    """
-    # Redirigir al endpoint /fast para mantener la misma lógica optimizada
+
     return await read_tasks_optimized(
         db=db, skip=skip, limit=limit, current_user=current_user,
         subject=subject, status=status, team_id=team_id,
         assignee_id=assignee_id, priority=priority, category_id=category_id
     )
-
-
 @router.get("/fast", response_model=List[TaskSchema])
 async def read_tasks_optimized(
     db: Session = Depends(get_db),
@@ -60,18 +48,14 @@ async def read_tasks_optimized(
     priority: Optional[str] = Query(None),
     category_id: Optional[int] = Query(None),
 ) -> Any:
-    """
-    VERSIÓN OPTIMIZADA: Obtiene tasks sin cargar relaciones pesadas
-    Mejora de rendimiento 10-50x vs versión original
-    """
+
     start_time = time.time()
-    
-    # Consulta base SIN relaciones para máximo rendimiento
+
     query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # CRÍTICO: Evitar cargar relaciones automáticamente
+
         noload(Task.workspace),
         noload(Task.assignee),
         noload(Task.sent_from),
@@ -85,8 +69,6 @@ async def read_tasks_optimized(
         noload(Task.mailbox_connection),
         noload(Task.category)
     )
-
-    # Aplicar filtros
     if subject:
         query = query.filter(Task.title.ilike(f"%{subject}%"))
     if status:
@@ -113,11 +95,7 @@ async def read_tasks_optimized(
     if category_id:
         query = query.filter(Task.category_id == category_id)
 
-    # Ejecutar consulta optimizada
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    
-    query_time = time.time() - start_time
-    logger.info(f"OPTIMIZED TASKS QUERY: {len(tasks)} tasks obtenidos en {query_time*1000:.2f}ms (user: {current_user.id})")
     
     return tasks
 
@@ -133,9 +111,7 @@ async def read_assigned_tasks_optimized(
     status: Optional[str] = Query(None),
     priority: Optional[str] = Query(None),
 ) -> Any:
-    """
-    VERSIÓN OPTIMIZADA: Obtiene tasks asignados sin relaciones pesadas
-    """
+
     start_time = time.time()
     
     query = db.query(Task).filter(
@@ -143,7 +119,7 @@ async def read_assigned_tasks_optimized(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # Sin relaciones para máximo rendimiento
+
         noload(Task.workspace),
         noload(Task.assignee),
         noload(Task.sent_from),
@@ -158,7 +134,6 @@ async def read_assigned_tasks_optimized(
         noload(Task.category)
     )
 
-    # Aplicar filtros
     if subject:
         query = query.filter(Task.title.ilike(f"%{subject}%"))
     if status:
@@ -169,7 +144,6 @@ async def read_assigned_tasks_optimized(
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
     
     query_time = time.time() - start_time
-    logger.info(f"OPTIMIZED ASSIGNEE TASKS: {len(tasks)} tasks para agente {agent_id} en {query_time*1000:.2f}ms")
     
     return tasks
 
@@ -182,10 +156,7 @@ async def read_assignee_tasks_optimized(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    ENDPOINT OPTIMIZADO: Tasks asignadas a un agente específico
-    Implementa la misma lógica optimizada que /fast
-    """
+
     start_time = time.time()
     
     query = db.query(Task).filter(
@@ -193,7 +164,7 @@ async def read_assignee_tasks_optimized(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # Sin relaciones para máximo rendimiento
+
         noload(Task.workspace),
         noload(Task.assignee),
         noload(Task.sent_from),
@@ -211,7 +182,6 @@ async def read_assignee_tasks_optimized(
     tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
     
     query_time = time.time() - start_time
-    logger.info(f"OPTIMIZED ASSIGNEE TASKS (base): {len(tasks)} tasks para agente {agent_id} en {query_time*1000:.2f}ms")
     
     return tasks
 
@@ -228,8 +198,7 @@ async def read_team_tasks_optimized(
     ENDPOINT OPTIMIZADO: Tasks asignadas a un equipo específico
     """
     start_time = time.time()
-    
-    # Consulta optimizada sin relaciones pesadas
+
     query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
@@ -241,12 +210,8 @@ async def read_team_tasks_optimized(
         noload(Task.user),
         noload(Task.category),
         noload(Task.comments),
-        noload(Task.attachments),
-        noload(Task.activities),
-        noload(Task.workflows)
     )
-    
-    # Filtrar por team_id usando la relación
+
     from app.models.agent import Agent
     query = query.join(Agent, Task.assignee_id == Agent.id).filter(
         Agent.team_id == team_id
@@ -259,7 +224,6 @@ async def read_team_tasks_optimized(
     query_time = time.time() - query_start
     
     total_time = time.time() - start_time
-    logger.info(f"OPTIMIZED TEAM TASKS: {len(tasks)} tasks para equipo {team_id} en {query_time*1000:.2f}ms")
     
     return tasks
 
@@ -272,9 +236,7 @@ async def search_tasks_optimized(
     limit: int = 30,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    ENDPOINT OPTIMIZADO: Búsqueda de tasks por término
-    """
+
     start_time = time.time()
     
     # Consulta optimizada de búsqueda
@@ -295,9 +257,6 @@ async def search_tasks_optimized(
         noload(Task.user),
         noload(Task.category),
         noload(Task.comments),
-        noload(Task.attachments),
-        noload(Task.activities),
-        noload(Task.workflows)
     ).offset(skip).limit(limit)
     
     query_start = time.time()
@@ -305,7 +264,6 @@ async def search_tasks_optimized(
     query_time = time.time() - query_start
     
     total_time = time.time() - start_time
-    logger.info(f"OPTIMIZED SEARCH: {len(tasks)} tasks encontradas para '{q}' en {query_time*1000:.2f}ms")
     
     return tasks
 
@@ -317,9 +275,7 @@ async def get_tasks_count(
     status: Optional[str] = Query(None),
     assignee_id: Optional[int] = Query(None),
 ) -> dict:
-    """
-    Contador rápido de tasks sin cargar relaciones
-    """
+
     start_time = time.time()
     
     query = db.query(func.count(Task.id)).filter(
@@ -345,9 +301,7 @@ async def get_tasks_stats(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> dict:
-    """
-    Estadísticas rápidas de tasks agrupadas por status
-    """
+
     start_time = time.time()
     
     stats = db.query(
@@ -375,26 +329,12 @@ async def read_single_task_optimized(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    ENDPOINT OPTIMIZADO para carga rápida de tickets individuales
-    
-    Estrategia de optimización:
-    1. Sin joinedload - evita consultas N+1 pesadas
-    2. Carga solo campos esenciales del ticket
-    3. Logs detallados de performance
-    4. Respuesta 10-20x más rápida que la versión completa
-    
-    Para datos adicionales como comentarios, usar endpoints específicos
-    """
+
     start_time = time.time()
-    logger.info(f"🚀 OPTIMIZED FAST: Iniciando carga ultra-rápida de ticket {task_id} para usuario {current_user.id}")
-    logger.info(f"📍 OPTIMIZED FAST: Endpoint /tasks-optimized/{task_id}/fast (SIN relaciones)")
     
-    # 1. 🚀 Verificación ultra-optimizada con EXISTS
     exists_start = time.time()
     from sqlalchemy import exists as sql_exists
     
-    # BEST PRACTICE: EXISTS es más eficiente que .first() para verificaciones booleanas
     ticket_exists = db.query(
         sql_exists().where(
             Task.id == task_id,
@@ -404,28 +344,22 @@ async def read_single_task_optimized(
     ).scalar()
     
     exists_time = time.time() - exists_start
-    
-    # Performance monitoring con alertas
-    if exists_time > 0.005:  # > 5ms es sospechoso para un EXISTS
-        logger.warning(f"🐌 OPTIMIZED EXISTS SLOW: {exists_time*1000:.2f}ms - Requiere índices")
+
+    if exists_time > 0.005:  
+        pass
     
     if not ticket_exists:
         total_time = time.time() - start_time
-        logger.warning(f"❌ OPTIMIZED FAST: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
     
-    logger.info(f"✅ OPTIMIZED FAST: Existencia verificada en {exists_time*1000:.2f}ms")
-    
-    # 2. Consulta ultra-optimizada SIN relaciones
     query_start = time.time()
-    logger.info(f"🚀 OPTIMIZED FAST: Ejecutando query SIN relaciones (máxima velocidad)...")
     
     task = db.query(Task).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # CRÍTICO: Bloquear carga automática de relaciones (10 noload)
+
         noload(Task.workspace),
         noload(Task.assignee),
         noload(Task.sent_from),
@@ -442,41 +376,18 @@ async def read_single_task_optimized(
     ).first()
     
     query_time = time.time() - query_start
-    logger.info(f"💾 OPTIMIZED FAST: Query ejecutada en {query_time*1000:.2f}ms (sin cargar relaciones)")
     
     if not task:
         total_time = time.time() - start_time
-        logger.error(f"❌ OPTIMIZED FAST: Ticket {task_id} no encontrado después de verificación - ERROR INCONSISTENTE")
-        logger.error(f"❌ OPTIMIZED FAST: Tiempo total perdido: {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # 3. Análisis de contenido básico (sin relaciones)
+
     content_analysis_start = time.time()
     title_size = len(task.title) if task.title else 0
     description_size = len(task.description) if task.description else 0
     content_analysis_time = time.time() - content_analysis_start
     
-    # 4. Performance summary optimizado
     total_time = time.time() - start_time
-    logger.info(f"✅ OPTIMIZED FAST: Ticket {task_id} cargado exitosamente")
-    logger.info(f"📊 OPTIMIZED FAST BREAKDOWN:")
-    logger.info(f"   1. Existence check: {exists_time*1000:.2f}ms")
-    logger.info(f"   2. Database query: {query_time*1000:.2f}ms (SIN relaciones)")
-    logger.info(f"   3. Content analysis: {content_analysis_time*1000:.2f}ms")
-    logger.info(f"   TOTAL FAST TIME: {total_time*1000:.2f}ms")
-    logger.info(f"   📏 Content: título({title_size} chars) + descripción({description_size} chars)")
-    logger.info(f"   🚀 Relations loaded: 0/10 (máxima optimización)")
-    logger.info(f"   💡 Performance gain: ~85-90% más rápido vs endpoint completo")
     
-    # Comparación con endpoint completo
-    if total_time < 0.05:  # < 50ms
-        logger.info(f"🏆 OPTIMIZED FAST: EXCELENTE performance en {total_time*1000:.2f}ms")
-    elif total_time < 0.1:  # < 100ms  
-        logger.info(f"✅ OPTIMIZED FAST: BUENA performance en {total_time*1000:.2f}ms")
-    else:
-        logger.warning(f"⚠️ OPTIMIZED FAST: Performance por debajo de lo esperado: {total_time*1000:.2f}ms")
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas
     return TaskWithDetails.from_orm(task)
 
 
@@ -487,22 +398,10 @@ async def read_single_task_with_cache(
     current_user: Agent = Depends(get_current_active_user),
     force_refresh: bool = False
 ) -> Any:
-    """
-    ENDPOINT ULTRA-OPTIMIZADO con caché Redis/Memory
-    
-    Estrategia de optimización avanzada:
-    1. Caché Redis/Memory de 5 minutos para tickets frecuentes
-    2. Sin relaciones de base de datos (noload)
-    3. Invalidación automática de caché
-    4. Force refresh opcional para actualizaciones
-    5. Logs detallados de hit/miss ratio
-    
-    Mejora esperada: 50-100x más rápido para tickets cacheados
-    """
+
     start_time = time.time()
     logger.info(f"🎯 CACHED: Iniciando carga con caché para ticket {task_id} (force_refresh={force_refresh})")
-    
-    # Intentar obtener desde caché primero (si no es force refresh)
+
     cached_data = None
     if not force_refresh:
         try:
@@ -513,21 +412,15 @@ async def read_single_task_with_cache(
             
             if cached_data:
                 total_time = time.time() - start_time
-                logger.info(f"🎯 CACHE HIT: Ticket {task_id} obtenido desde caché en {total_time*1000:.2f}ms")
-                logger.info(f"📊 CACHE PERFORMANCE:")
-                logger.info(f"   - Cache lookup: {cache_time*1000:.2f}ms")
-                logger.info(f"   - Total time: {total_time*1000:.2f}ms")
-                logger.info(f"   - Performance gain: ~50-100x vs database")
+                pass
                 
-                # Reconstruir objeto Task desde datos cacheados
                 task = Task(**cached_data)
-                # 🔧 CORREGIDO: Retornar schema con relaciones expandidas
+
                 return TaskWithDetails.from_orm(task)
                 
         except Exception as e:
             logger.warning(f"Error accediendo caché para ticket {task_id}: {e}")
-    
-    # Cache miss o force refresh - consultar base de datos
+
     logger.info(f"💫 CACHE MISS: Consultando base de datos para ticket {task_id}")
     
     db_start = time.time()
@@ -536,7 +429,7 @@ async def read_single_task_with_cache(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     ).options(
-        # CRÍTICO: Sin relaciones para máximo rendimiento
+
         noload(Task.workspace),
         noload(Task.assignee),
         noload(Task.sent_from),
@@ -558,13 +451,11 @@ async def read_single_task_with_cache(
         total_time = time.time() - start_time
         logger.warning(f"❌ CACHED: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Cachear el resultado para próximas consultas
+
     try:
         from app.services.cache_service import cache_service
         cache_start = time.time()
-        
-        # Convertir ORM object a dict para cachear
+
         task_dict = {
             'id': task.id,
             'title': task.title,
@@ -600,17 +491,10 @@ async def read_single_task_with_cache(
     except Exception as e:
         logger.warning(f"Error cacheando ticket {task_id}: {e}")
         cache_time = 0
-    
-    # Logs de performance detallados
+
     total_time = time.time() - start_time
-    logger.info(f"✅ CACHED: Ticket {task_id} cargado desde DB y cacheado")
-    logger.info(f"📊 CACHED BREAKDOWN:")
-    logger.info(f"   - Database query: {db_time*1000:.2f}ms")
-    logger.info(f"   - Cache storage: {cache_time*1000:.2f}ms")
-    logger.info(f"   - Total time: {total_time*1000:.2f}ms")
-    logger.info(f"   - Next access will be ~50-100x faster")
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas
+    pass
+
     return TaskWithDetails.from_orm(task)
 
 
@@ -620,24 +504,8 @@ async def read_single_task_essential_relations(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    ENDPOINT HÍBRIDO - Solo relaciones esenciales
-    
-    Carga únicamente las relaciones más críticas para el frontend:
-    - assignee (para mostrar quién tiene asignado el ticket)
-    - user (para mostrar información del cliente)  
-    - category (para mostrar categoría del ticket)
-    
-    Omite relaciones pesadas como: workspace, sent_from, sent_to, team, 
-    company, body, merged_by_agent
-    
-    Mejora esperada: De 200ms a 60-80ms (60-70% más rápido)
-    """
+
     start_time = time.time()
-    logger.info(f"🎯 ESSENTIAL: Iniciando carga híbrida de ticket {task_id} para usuario {current_user.id}")
-    logger.info(f"📍 ESSENTIAL: Endpoint /tasks-optimized/{task_id}/essential (solo 3 relaciones críticas)")
-    
-    # 1. Verificación de existencia
     exists_start = time.time()
     ticket_exists = db.query(Task.id).filter(
         Task.id == task_id,
@@ -652,20 +520,18 @@ async def read_single_task_essential_relations(
         raise HTTPException(status_code=404, detail="Task not found")
     
     logger.info(f"✅ ESSENTIAL: Existencia verificada en {exists_time*1000:.2f}ms")
-    
-    # 2. Consulta híbrida con solo las relaciones más críticas
+
     from sqlalchemy.orm import joinedload
     
     query_start = time.time()
     logger.info(f"🔀 ESSENTIAL: Ejecutando query híbrida (3 relaciones esenciales + 7 omitidas)...")
     
     task = db.query(Task).options(
-        # ✅ CARGAR solo relaciones esenciales (3 de 10)
-        joinedload(Task.assignee),  # Necesario para mostrar quién está asignado
-        joinedload(Task.user),      # Necesario para mostrar info del cliente
-        joinedload(Task.category),  # Necesario para mostrar categoría
-        
-        # ❌ OMITIR relaciones pesadas (7 de 10) - Optimización clave
+
+        joinedload(Task.assignee),  
+        joinedload(Task.user),      
+        joinedload(Task.category),  
+
         noload(Task.workspace),
         noload(Task.sent_from),
         noload(Task.sent_to),
@@ -713,64 +579,27 @@ async def read_single_task_essential_relations(
     
     # 5. Performance summary híbrido
     total_time = time.time() - start_time
-    logger.info(f"✅ ESSENTIAL: Ticket {task_id} cargado con relaciones esenciales")
-    logger.info(f"📊 ESSENTIAL BREAKDOWN:")
-    logger.info(f"   1. Existence check: {exists_time*1000:.2f}ms")
-    logger.info(f"   2. Hybrid query: {query_time*1000:.2f}ms (3 relaciones críticas)")
-    logger.info(f"   3. Relations analysis: {relations_analysis_time*1000:.2f}ms")
-    logger.info(f"   4. Content analysis: {content_analysis_time*1000:.2f}ms")
-    logger.info(f"   TOTAL ESSENTIAL TIME: {total_time*1000:.2f}ms")
-    logger.info(f"   📏 Content: título({title_size} chars) + descripción({description_size} chars)")
-    logger.info(f"   🔗 Relations loaded: {len(essential_relations)}/10 (híbrido optimizado)")
-    logger.info(f"   📋 Essential data: {', '.join(essential_relations) if essential_relations else 'Solo campos básicos'}")
-    logger.info(f"   💡 Performance gain: ~65-75% más rápido vs endpoint completo")
-    
-    # Comparación de performance híbrida
-    if total_time < 0.08:  # < 80ms
-        logger.info(f"🏆 ESSENTIAL: EXCELENTE performance híbrida en {total_time*1000:.2f}ms")
-    elif total_time < 0.12:  # < 120ms
-        logger.info(f"✅ ESSENTIAL: BUENA performance híbrida en {total_time*1000:.2f}ms")
-    else:
-        logger.warning(f"⚠️ ESSENTIAL: Performance híbrida por debajo de lo esperado: {total_time*1000:.2f}ms")
-        logger.warning(f"💡 SUGERENCIA: Considerar usar /fast (sin relaciones) para máxima velocidad")
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas
+
     return TaskWithDetails.from_orm(task)
 
 
 @router.put("/{task_id}/refresh", response_model=TaskWithDetails)
 async def update_task_optimized_for_refresh(
     task_id: int,
-    task_in: TicketUpdate,  # 🔧 CORREGIDO: Usando schema Pydantic correcto
-    request: Request,  # 🔧 CORREGIDO: Añadido tipo
+    task_in: TicketUpdate, 
+    request: Request,  
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    🚀 ENDPOINT OPTIMIZADO PARA REFRESH
-    
-    Actualiza un ticket pero evita la recarga pesada de todas las relaciones.
-    Perfecto para operaciones de refresh que solo necesitan confirmar la actualización.
-    
-    OPTIMIZACIONES CLAVE:
-    1. Actualiza el ticket normalmente 
-    2. NO recarga todas las relaciones (elimina el cuello de botella principal)
-    3. Retorna solo campos esenciales + assignee, user, category
-    
-    Mejora esperada: De ~200ms a ~40-60ms (70-80% más rápido)
-    """
+
     from fastapi import Request as FastAPIRequest
     from app.core.config import settings
     from sqlalchemy.orm import joinedload
     
     refresh_start_time = time.time()
-    logger.info(f"🚀 REFRESH OPTIMIZED: Iniciando actualización optimizada de ticket {task_id}")
-    
-    # Log campos a actualizar
+
     update_fields = [field for field, value in task_in.dict(exclude_unset=True).items() if value is not None]
-    logger.info(f"📝 REFRESH OPTIMIZED: Campos a actualizar: {update_fields}")
-    
-    # 1. Verificar existencia del ticket (rápido)
+
     fetch_start = time.time()
     task = db.query(Task).filter(
         Task.id == task_id,
@@ -781,10 +610,8 @@ async def update_task_optimized_for_refresh(
     
     if not task:
         total_time = time.time() - refresh_start_time
-        logger.warning(f"❌ REFRESH OPTIMIZED: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # 2. Ejecutar actualización usando el servicio
+
     service_start = time.time()
     origin = request.headers.get("origin") or settings.FRONTEND_URL
     from app.services.task_service import update_task
@@ -793,19 +620,16 @@ async def update_task_optimized_for_refresh(
     
     if not updated_task_dict:
         total_time = time.time() - refresh_start_time
-        logger.error(f"❌ REFRESH OPTIMIZED: Update falló para ticket {task_id} en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=400, detail="Task update failed")
-    
-    # 3. 🎯 OPTIMIZACIÓN CLAVE: Recargar SOLO relaciones críticas para PRIMARY CONTACT
+
     reload_start = time.time()
     updated_task = db.query(Task).filter(Task.id == task_id).options(
-        # ✅ CARGAR relaciones críticas para PRIMARY CONTACT (4 de 10)
-        joinedload(Task.assignee),  # Para mostrar quién está asignado
-        joinedload(Task.user),      # Para mostrar contacto primario
-        joinedload(Task.sent_from), # Para contacto alternativo (CRÍTICO para primary contact)
-        joinedload(Task.category),  # Para mostrar categoría
-        
-        # ❌ NO cargar relaciones pesadas (6 de 10) - ELIMINA CUELLO DE BOTELLA
+
+        joinedload(Task.assignee),  
+        joinedload(Task.user),      
+        joinedload(Task.sent_from), 
+        joinedload(Task.category),  
+
         noload(Task.workspace),
         noload(Task.sent_to),
         noload(Task.team),
@@ -843,14 +667,6 @@ async def update_task_optimized_for_refresh(
     
     # 5. 📊 Performance summary
     total_time = time.time() - refresh_start_time
-    logger.info(f"✅ REFRESH OPTIMIZED: Ticket {task_id} actualizado exitosamente")
-    logger.info(f"📊 REFRESH OPTIMIZED BREAKDOWN:")
-    logger.info(f"   1. Task fetch: {fetch_time*1000:.2f}ms")
-    logger.info(f"   2. Service update: {service_time*1000:.2f}ms")
-    logger.info(f"   3. Optimized reload: {reload_time*1000:.2f}ms (solo 3 relaciones vs 10)")
-    logger.info(f"   4. Socket.IO emit: {socketio_time*1000:.2f}ms")
-    logger.info(f"   TOTAL OPTIMIZED REFRESH: {total_time*1000:.2f}ms")
-    logger.info(f"   🚀 MEJORA vs refresh completo: ~70-80% más rápido")
     
     # 🔧 CORREGIDO: Retornar schema con relaciones expandidas para mostrar contacto
     return TaskWithDetails.from_orm(updated_task)
@@ -862,17 +678,7 @@ async def performance_comparison_test(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    🧪 ENDPOINT DE PRUEBA DE PERFORMANCE
-    
-    Ejecuta todos los métodos de carga y compara los tiempos.
-    Útil para identificar el mejor método para casos específicos.
-    
-    NO usar en producción - solo para análisis de performance.
-    """
-    logger.info(f"🧪 PERFORMANCE TEST: Iniciando comparación completa para ticket {task_id}")
-    logger.info(f"📍 Usuario: {current_user.id} | Workspace: {current_user.workspace_id}")
-    
+
     results = {}
     
     # Verificar que el ticket existe primero
@@ -885,12 +691,9 @@ async def performance_comparison_test(
     exists_time = time.time() - exists_start
     
     if not ticket_exists:
-        logger.error(f"❌ PERFORMANCE TEST: Ticket {task_id} no encontrado")
         raise HTTPException(status_code=404, detail="Task not found")
     
-    logger.info(f"✅ PERFORMANCE TEST: Ticket existe, iniciando pruebas comparativas...")
-    
-    # MÉTODO 1: Query sin relaciones (FAST)
+
     try:
         method1_start = time.time()
         task_fast = db.query(Task).filter(
@@ -914,8 +717,7 @@ async def performance_comparison_test(
     except Exception as e:
         logger.error(f"❌ MÉTODO 1 falló: {e}")
         results['fast_no_relations'] = {'error': str(e)}
-    
-    # MÉTODO 2: Query con relaciones esenciales (ESSENTIAL)
+
     try:
         method2_start = time.time()
         task_essential = db.query(Task).filter(
@@ -939,8 +741,7 @@ async def performance_comparison_test(
     except Exception as e:
         logger.error(f"❌ MÉTODO 2 falló: {e}")
         results['essential_relations'] = {'error': str(e)}
-    
-    # MÉTODO 3: Query con todas las relaciones (FULL)
+
     try:
         method3_start = time.time()
         task_full = db.query(Task).filter(
@@ -964,12 +765,10 @@ async def performance_comparison_test(
     except Exception as e:
         logger.error(f"❌ MÉTODO 3 falló: {e}")
         results['full_relations'] = {'error': str(e)}
-    
-    # ANÁLISIS COMPARATIVO
+
     test_total_time = time.time() - exists_start
     
-    logger.info(f"🏁 PERFORMANCE TEST COMPLETED en {test_total_time*1000:.2f}ms total")
-    logger.info(f"📊 COMPARATIVE RESULTS:")
+    pass
     
     valid_results = {k: v for k, v in results.items() if 'error' not in v}
     if valid_results:
@@ -982,14 +781,12 @@ async def performance_comparison_test(
         
         if len(sorted_methods) > 1:
             improvement = ((slowest_data['time_ms'] - fastest_data['time_ms']) / slowest_data['time_ms']) * 100
-            logger.info(f"💡 PERFORMANCE GAIN: {improvement:.1f}% mejora usando método más rápido")
         
         # Recomendaciones
-        logger.info(f"🎯 RECOMENDACIONES:")
         if fastest_data['time_ms'] < 30:
-            logger.info(f"   ✅ Método óptimo identificado: {fastest_method}")
+            pass
         if slowest_data['time_ms'] > 150:
-            logger.info(f"   ⚠️ Evitar método: {slowest_method} (muy lento)")
+            pass
         
         results['comparison_summary'] = {
             'fastest_method': fastest_method,
@@ -1022,21 +819,10 @@ async def read_task_smart_optimization(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    🧠 ENDPOINT INTELIGENTE - Auto-selección del método óptimo
-    
-    Analiza el ticket y selecciona automáticamente el método más eficiente:
-    1. Verifica tamaño de contenido
-    2. Analiza relaciones necesarias  
-    3. Considera historial de accesso
-    4. Selecciona método óptimo automáticamente
-    
-    BEST PRACTICE: Un solo endpoint que siempre usa la estrategia más eficiente
-    """
+
     smart_start = time.time()
     logger.info(f"🧠 SMART OPTIMIZATION: Iniciando análisis inteligente para ticket {task_id}")
-    
-    # 1. Pre-análisis rápido para tomar decisión inteligente
+
     analysis_start = time.time()
     
     # Verificar existencia con EXISTS optimizado
@@ -1053,8 +839,7 @@ async def read_task_smart_optimization(
         total_time = time.time() - smart_start
         logger.warning(f"❌ SMART: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Pre-análisis: obtener datos básicos para tomar decisión
+
     basic_data = db.query(
         Task.id, Task.title, Task.description, 
         Task.assignee_id, Task.user_id, Task.category_id,
@@ -1097,14 +882,8 @@ async def read_task_smart_optimization(
     
     decision_time = time.time() - decision_start
     
-    logger.info(f"🧠 SMART ANALYSIS COMPLETE:")
-    logger.info(f"   📏 Content: {total_content} chars")  
-    logger.info(f"   🔗 Relations needed: {relations_needed}/3")
-    logger.info(f"   🎯 Optimal strategy: {strategy}")
-    logger.info(f"   📊 Analysis time: {analysis_time*1000:.2f}ms")
-    logger.info(f"   🧠 Decision time: {decision_time*1000:.2f}ms")
-    
-    # 3. 🚀 EJECUTAR ESTRATEGIA SELECCIONADA
+    pass
+
     execution_start = time.time()
     
     if strategy == "ULTRA_FAST":
@@ -1122,7 +901,6 @@ async def read_task_smart_optimization(
         ).first()
         
     elif strategy == "FAST":
-        # Rápido - sin relaciones
         task = db.query(Task).filter(
             Task.id == task_id,
             Task.workspace_id == current_user.workspace_id,
@@ -1136,7 +914,6 @@ async def read_task_smart_optimization(
         ).first()
         
     elif strategy == "ESSENTIAL":
-        # Híbrido - solo relaciones críticas
         from sqlalchemy.orm import joinedload
         task = db.query(Task).filter(
             Task.id == task_id,
@@ -1152,8 +929,7 @@ async def read_task_smart_optimization(
             noload(Task.merged_by_agent)
         ).first()
         
-    else:  # SELECTIVE
-        # Carga selectiva basada en necesidad real
+    else:  
         from sqlalchemy.orm import joinedload
         task = db.query(Task).filter(
             Task.id == task_id,
@@ -1169,28 +945,10 @@ async def read_task_smart_optimization(
     
     execution_time = time.time() - execution_start
     
-    # 4. 📊 SMART PERFORMANCE REPORT
     total_time = time.time() - smart_start
     
-    logger.info(f"✅ SMART OPTIMIZATION: Ticket {task_id} cargado exitosamente")
-    logger.info(f"📊 SMART BREAKDOWN:")
-    logger.info(f"   1. Pre-analysis: {analysis_time*1000:.2f}ms")
-    logger.info(f"   2. Smart decision: {decision_time*1000:.2f}ms")
-    logger.info(f"   3. Optimized execution: {execution_time*1000:.2f}ms")
-    logger.info(f"   TOTAL SMART TIME: {total_time*1000:.2f}ms")
-    logger.info(f"   🧠 Strategy used: {strategy}")
-    logger.info(f"   📈 Method: {method}")
+    pass
     
-    # Comparación con endpoints fijos
-    estimated_full_time = total_time * 3  # Estimación conservadora
-    savings = estimated_full_time - total_time
-    savings_percent = (savings / estimated_full_time) * 100
-    
-    logger.info(f"💡 SMART EFFICIENCY:")
-    logger.info(f"   🚀 Time saved: ~{savings*1000:.0f}ms ({savings_percent:.0f}%)")
-    logger.info(f"   🎯 Auto-optimización exitosa")
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas
     return TaskWithDetails.from_orm(task) 
 
 
@@ -1200,27 +958,13 @@ async def get_task_ultra_smart_optimized(
     current_user: Agent = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ) -> Any:
-    """
-    🚀 ULTRA-SMART ENDPOINT: Máxima optimización con caché inteligente
-    
-    Combina:
-    - Caché de permisos ultra-rápido (~2ms vs 124ms)
-    - Selección automática de estrategia óptima
-    - Queries optimizadas con mejores prácticas
-    
-    Rendimiento esperado:
-    - Primera llamada: ~25-40ms (75-85% mejora)
-    - Llamadas subsecuentes: ~5-15ms (95% mejora)
-    """
+
     import time
     from app.services.cache_service import cached_ticket_exists_check
     from sqlalchemy.orm import joinedload, noload
     
     ultra_start = time.time()
     
-    logger.info(f"🚀 ULTRA-SMART: Iniciando carga ultra-optimizada de ticket {task_id} para usuario {current_user.id}")
-    
-    # 1. 🎯 ULTRA-FAST PERMISSIONS CHECK con caché (2ms vs 124ms)
     permissions_start = time.time()
     
     try:  
@@ -1228,7 +972,7 @@ async def get_task_ultra_smart_optimized(
             db, task_id, current_user.workspace_id, current_user.id
         )
     except Exception as e:
-        # Fallback a verificación tradicional si el caché falla
+
         logger.warning(f"⚠️ Cache fallback: {e}")
         from sqlalchemy import exists as sql_exists
         ticket_exists = db.query(
@@ -1243,12 +987,9 @@ async def get_task_ultra_smart_optimized(
         raise HTTPException(status_code=404, detail="Task not found")
     
     permissions_time = time.time() - permissions_start
-    logger.info(f"⚡ ULTRA-PERMISSIONS: Verificado en {permissions_time*1000:.2f}ms")
     
-    # 2. 🧠 SMART ANALYSIS ULTRARRÁPIDO (sin query adicional)
     analysis_start = time.time()
     
-    # Análisis eficiente: usar datos que ya tenemos
     basic_query = db.query(Task.title, Task.description, Task.assignee_id, Task.user_id, Task.category_id).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id,
@@ -1260,14 +1001,12 @@ async def get_task_ultra_smart_optimized(
     
     title, description, assignee_id, user_id, category_id = basic_query
     
-    # Análisis inteligente ultrarrápido
     title_size = len(title) if title else 0
     desc_size = len(description) if description else 0
     total_content = title_size + desc_size
     
     relations_count = sum([bool(assignee_id), bool(user_id), bool(category_id)])
     
-    # 🧠 ESTRATEGIA ULTRA-INTELIGENTE
     if total_content < 50 and relations_count == 0:
         strategy = "MINIMAL"
         expected_time = "~5-10ms"
@@ -1283,16 +1022,8 @@ async def get_task_ultra_smart_optimized(
     
     analysis_time = time.time() - analysis_start
     
-    logger.info(f"🧠 ULTRA-ANALYSIS: {analysis_time*1000:.2f}ms")
-    logger.info(f"   📏 Content: {title_size + desc_size} chars")
-    logger.info(f"   🔗 Relations: {relations_count}/3") 
-    logger.info(f"   🎯 Strategy: {strategy}")
-    logger.info(f"   ⏱️ Expected: {expected_time}")
-    
-    # 3. 🚀 ULTRA-OPTIMIZED QUERY EXECUTION
     execution_start = time.time()
     
-    # Query base ultra-optimizada
     base_query = db.query(Task).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id,
@@ -1302,30 +1033,24 @@ async def get_task_ultra_smart_optimized(
         autoflush=False,
         autocommit=False
     )
-    
-    # Aplicar estrategia seleccionada
+
     if strategy == "MINIMAL":
-        # Ultra-mínimo: solo datos básicos + CONTACTO ESENCIAL
         task = base_query.options(
-            # 🔧 CORREGIDO: SIEMPRE cargar ambas relaciones de contacto
-            joinedload(Task.user),      # Para mostrar contacto primario
-            joinedload(Task.sent_from), # Para contactos alternativos/email
-            # No cargar otras relaciones pesadas  
+            joinedload(Task.user),      
+            joinedload(Task.sent_from), 
             noload(Task.workspace), noload(Task.assignee), noload(Task.category),
             noload(Task.sent_to), noload(Task.team), noload(Task.company), 
             noload(Task.comments), noload(Task.body), noload(Task.merged_by_agent)
         ).first()
         
     elif strategy == "ESSENTIAL_LITE":
-        # 🔧 CORREGIDO: SIEMPRE incluir contacto + 1 relación adicional
-        # Base: siempre cargar contacto primario
+
         options = [
-            # 🔧 CONTACTO PRIMARIO GARANTIZADO (CRÍTICO para frontend)
-            joinedload(Task.user),      # Siempre cargar usuario
-            joinedload(Task.sent_from), # Siempre cargar info de email
+
+            joinedload(Task.user),      
+            joinedload(Task.sent_from), 
         ]
-        
-        # Añadir 1 relación adicional por prioridad
+
         if assignee_id:
             options.append(joinedload(Task.assignee))
             options.append(noload(Task.category))
@@ -1334,8 +1059,6 @@ async def get_task_ultra_smart_optimized(
             options.append(joinedload(Task.category))
         else:
             options.extend([noload(Task.assignee), noload(Task.category)])
-            
-        # No cargar relaciones pesadas
         options.extend([
             noload(Task.workspace), noload(Task.sent_to), noload(Task.team), 
             noload(Task.company), noload(Task.comments), noload(Task.body), 
@@ -1345,68 +1068,26 @@ async def get_task_ultra_smart_optimized(
         task = base_query.options(*options).first()
         
     elif strategy == "BALANCED":
-        # 🔧 CORREGIDO: 2-3 relaciones esenciales + CONTACTO GARANTIZADO
         task = base_query.options(
-            # 🔧 CONTACTO PRIMARIO GARANTIZADO (CRÍTICO)
-            joinedload(Task.user),      # Siempre cargar usuario
-            joinedload(Task.sent_from), # Siempre cargar info de email
-            # Otras relaciones esenciales
+            joinedload(Task.user),      
+            joinedload(Task.sent_from), 
             joinedload(Task.assignee) if assignee_id else noload(Task.assignee),
             joinedload(Task.category) if category_id else noload(Task.category),
-            # No cargar relaciones pesadas
             noload(Task.workspace), noload(Task.sent_to),
             noload(Task.team), noload(Task.company), noload(Task.comments),
             noload(Task.body), noload(Task.merged_by_agent)
         ).first()
         
-    else:  # COMPLETE
-        # 🔧 CORREGIDO: Estrategia completa con CONTACTO GARANTIZADO
+    else:  
         task = base_query.options(
-            # Relaciones esenciales
             joinedload(Task.assignee),
             joinedload(Task.user), 
             joinedload(Task.category),
             joinedload(Task.workspace),
-            # 🔧 CORREGIDO: Cargar sent_from para contactos alternativos
             joinedload(Task.sent_from),
-            # Optimización: no cargar relaciones muy pesadas
             noload(Task.sent_to), noload(Task.team), noload(Task.company), 
             noload(Task.comments), noload(Task.body), noload(Task.merged_by_agent)
         ).first()
     
     execution_time = time.time() - execution_start
-    
-    # 4. 📊 ULTRA-PERFORMANCE REPORT
-    total_time = time.time() - ultra_start
-    
-    # Comparar con baseline lento (206ms del log)
-    baseline_slow = 206  # ms del ticket 5535
-    improvement_ms = baseline_slow - (total_time * 1000)
-    improvement_percent = (improvement_ms / baseline_slow) * 100
-    
-    logger.info(f"✅ ULTRA-SMART COMPLETE: Ticket {task_id} en {total_time*1000:.2f}ms")
-    logger.info(f"📊 ULTRA-BREAKDOWN:")
-    logger.info(f"   1. Ultra-permissions: {permissions_time*1000:.2f}ms")
-    logger.info(f"   2. Smart analysis: {analysis_time*1000:.2f}ms")  
-    logger.info(f"   3. Optimized query: {execution_time*1000:.2f}ms")
-    logger.info(f"   TOTAL ULTRA TIME: {total_time*1000:.2f}ms")
-    
-    logger.info(f"🏆 ULTRA-PERFORMANCE:")
-    logger.info(f"   🚀 Improvement: +{improvement_ms:.0f}ms ({improvement_percent:.1f}%)")
-    logger.info(f"   🎯 Strategy: {strategy}")
-    logger.info(f"   💡 Caché available for next access")
-    
-    # Efficiency score
-    if total_time < 0.025:  # < 25ms
-        efficiency = "EXCELENTE (95-98%)"
-    elif total_time < 0.050:  # < 50ms  
-        efficiency = "MUY BUENO (85-95%)"
-    elif total_time < 0.080:  # < 80ms
-        efficiency = "BUENO (70-85%)"
-    else:
-        efficiency = "MEJORABLE (<70%)"
-    
-    logger.info(f"📈 ULTRA-EFFICIENCY: {efficiency}")
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas para mostrar contacto
     return TaskWithDetails.from_orm(task) 

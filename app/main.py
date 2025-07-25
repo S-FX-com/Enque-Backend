@@ -61,6 +61,50 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 # Socket.IO integration
 socket_app = socketio.ASGIApp(sio, app)
 
+# 🔧 SIMPLIFIED: Basic health check endpoint 
+@app.get("/health-detailed")
+async def health_check_detailed():
+    """Detailed health check including database pool status"""
+    try:
+        from app.database.session import get_pool_status, is_pool_healthy
+        
+        health_status = {
+            "status": "healthy",
+            "timestamp": time.time(),
+            "services": {
+                "api": "running",
+                "socketio": "connected" if sio else "unavailable"
+            }
+        }
+        
+        # Check database pool health (safely)
+        try:
+            pool_status = get_pool_status()
+            health_status["database"] = {
+                "pool_healthy": is_pool_healthy(),
+                "pool_status": pool_status
+            }
+            
+            # Determine overall health
+            if not is_pool_healthy():
+                health_status["status"] = "degraded"
+                health_status["warnings"] = ["Database connection pool usage is high"]
+        except Exception as db_error:
+            health_status["database"] = {
+                "pool_healthy": False,
+                "error": str(db_error)
+            }
+            health_status["status"] = "degraded"
+            health_status["warnings"] = ["Database pool monitoring failed"]
+            
+        return health_status
+    except Exception as e:
+        return {
+            "status": "error",
+            "timestamp": time.time(),
+            "error": str(e)
+        }
+
 @app.on_event("startup")
 def startup_event():
     """Initialize email sync scheduler on startup"""
@@ -76,8 +120,3 @@ def startup_event():
 def read_root():
     """Root endpoint"""
     return {"message": "Enque API is running"}
-
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    return {"status": "OK", "timestamp": time.time()}

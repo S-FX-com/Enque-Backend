@@ -386,7 +386,6 @@ async def cached_ticket_exists_check(db, task_id: int, workspace_id: int, user_i
     cached_result = await get_cached_ticket_permissions(user_id, task_id, workspace_id)
     if cached_result:
         cache_time = time.time() - check_start
-        logger.info(f"⚡ ULTRA-FAST CACHE: EXISTS check in {cache_time*1000:.2f}ms (cached)")
         return cached_result['exists']
     
     # 2. Cache miss - do optimized DB check
@@ -408,8 +407,7 @@ async def cached_ticket_exists_check(db, task_id: int, workspace_id: int, user_i
     # 3. Cache the result for future ultra-fast access
     await cache_ticket_permissions(user_id, task_id, workspace_id, ticket_exists, ttl=600)  # 10 min cache
     
-    logger.info(f"🎯 OPTIMIZED EXISTS: DB {db_time*1000:.2f}ms + cache {(total_time-db_time)*1000:.2f}ms = {total_time*1000:.2f}ms total")
-    logger.info(f"💡 NEXT ACCESS: Will be ultra-fast ~2ms (95% improvement)")
+    pass
     
     return ticket_exists
 

@@ -94,18 +94,19 @@ class Settings(BaseSettings):
     CACHE_EXPIRE_FOLDERS: int = 1800  # Folder list cache (30 minutes)
     
     # Database Connection Pool
-    DB_POOL_SIZE: int = 10  # Connection pool size
-    DB_MAX_OVERFLOW: int = 20  # Max overflow connections
-    DB_POOL_TIMEOUT: int = 30  # Pool timeout in seconds
+    DB_POOL_SIZE: int = 25  # Increased from 10 to 25
+    DB_MAX_OVERFLOW: int = 50  # Increased from 20 to 50 
+    DB_POOL_TIMEOUT: int = 60  # Increased from 30 to 60 seconds
     DB_POOL_RECYCLE: int = 3600  # Recycle connections after 1 hour
     
     # Rate Limiting for Microsoft Graph
     MS_GRAPH_RATE_LIMIT: int = 10  # Requests per second to Microsoft Graph
     MS_GRAPH_BURST_LIMIT: int = 50  # Burst limit
     
-    # Background Job Configuration
-    EMAIL_SYNC_BATCH_SIZE: int = 25  # Process emails in batches
+    # Background Job Configuration - OPTIMIZED
+    EMAIL_SYNC_BATCH_SIZE: int = 10  # Reduced from 25 to 10 for less concurrent connections
     EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 3  # Max concurrent mailbox syncs
+    EMAIL_SYNC_FREQUENCY_SECONDS: int = 120  # Reduced frequency from 30 to 120 seconds
 
     class Config:
         # Leer variables de entorno directamente, sin depender de archivos .env
