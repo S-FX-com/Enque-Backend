@@ -58,6 +58,10 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
     if not task_data.get('sent_from_id') and current_user_id:
         task_data['sent_from_id'] = current_user_id
     
+    # Initialize last_update when creating new task
+    if 'last_update' not in task_data:
+        task_data['last_update'] = datetime.utcnow()
+    
     task = Task(**task_data)
     db.add(task)
     db.commit()

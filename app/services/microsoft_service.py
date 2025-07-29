@@ -794,6 +794,12 @@ class MicrosoftGraphService:
                         elif ticket_to_update: pass  
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
                         
+                        # Update last_update when user replies via email
+                        if ticket_to_update:
+                            ticket_to_update.last_update = datetime.utcnow()
+                            self.db.add(ticket_to_update)
+                            logger.info(f"[MAIL SYNC] Updated last_update for ticket {existing_mapping_by_conv.ticket_id} after user reply")
+                        
                         self.db.commit(); added_comments_count += 1
                         
                         try:
@@ -1338,7 +1344,8 @@ class MicrosoftGraphService:
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
                 email_message_id=email.id, email_conversation_id=email.conversation_id,
-                email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str)
+                email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str,
+                last_update=datetime.utcnow())
             self.db.add(task); self.db.flush()
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
