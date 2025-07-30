@@ -7,7 +7,7 @@ class Activity(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
-    action = Column(String(255), nullable=False)
+    action = Column(String(1000), nullable=False)  # Increased from 255 to 1000 for long forward email addresses
     source_type = Column(String(50), nullable=False)
     source_id = Column(Integer, nullable=False)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
