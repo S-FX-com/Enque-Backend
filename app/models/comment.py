@@ -24,3 +24,4 @@ class Comment(Base):
     user = relationship("User", back_populates="comments")
     workspace = relationship("Workspace", back_populates="comments")
     attachments = relationship("TicketAttachment", back_populates="comment", cascade="all, delete-orphan")
+    schedule = relationship("Schedule", back_populates="comments")

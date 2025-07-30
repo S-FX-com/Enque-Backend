@@ -17,7 +17,6 @@ class CannedReply(Base):
     usage_count = Column(Integer, nullable=False, default=0)  # Track how often it's used
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
-    #scheduled_for = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
     # Relationships
     workspace = relationship("Workspace", back_populates="canned_replies")
