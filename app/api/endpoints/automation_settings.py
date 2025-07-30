@@ -27,6 +27,7 @@ class AutomationsResponse(BaseModel):
     team_notifications: AutomationSetting
     weekly_agent_summary: AutomationSetting
     daily_outstanding_tasks: AutomationSetting  # 🔧 ADDED: New automation for daily outstanding tasks
+    weekly_manager_summary: AutomationSetting  # 🔧 ADDED: New automation for weekly manager summaries
 
 
 class AutomationToggleRequest(BaseModel):
@@ -67,6 +68,13 @@ async def get_workspace_automation_settings(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "agents",
         NotificationSetting.type == "daily_outstanding_tasks"
+    ).first()
+    
+    # 🔧 ADDED: Get weekly manager summary setting
+    weekly_manager_setting = db.query(NotificationSetting).filter(
+        NotificationSetting.workspace_id == workspace_id,
+        NotificationSetting.category == "teams",
+        NotificationSetting.type == "weekly_manager_summary"
     ).first()
     
     # If no team notification setting exists, create a default one
@@ -123,10 +131,29 @@ async def get_workspace_automation_settings(
             description="Send daily outstanding tasks report to agents at 7am ET"
         )
     
+    # 🔧 ADDED: Weekly Manager Summary setting
+    if not weekly_manager_setting:
+        weekly_manager_summary = AutomationSetting(
+            id=0,
+            is_enabled=False,
+            type="weekly_manager_summary",
+            name="Weekly Manager Summary",
+            description="Send weekly team summary emails to team managers on Fridays at 4pm ET"
+        )
+    else:
+        weekly_manager_summary = AutomationSetting(
+            id=weekly_manager_setting.id,
+            is_enabled=weekly_manager_setting.is_enabled,
+            type=weekly_manager_setting.type,
+            name="Weekly Manager Summary",
+            description="Send weekly team summary emails to team managers on Fridays at 4pm ET"
+        )
+    
     return AutomationsResponse(
         team_notifications=team_notifications,
         weekly_agent_summary=weekly_agent_summary,
-        daily_outstanding_tasks=daily_outstanding_tasks  # 🔧 ADDED: Include new automation
+        daily_outstanding_tasks=daily_outstanding_tasks,  # 🔧 ADDED: Include new automation
+        weekly_manager_summary=weekly_manager_summary  # 🔧 ADDED: Include weekly manager summary
     )
 
 
@@ -293,4 +320,55 @@ async def create_daily_outstanding_setting(
         db.commit()
         db.refresh(new_setting)
     
-    return {"success": True, "message": "Daily outstanding tasks setting updated successfully"} 
+    return {"success": True, "message": "Daily outstanding tasks setting updated successfully"}
+
+
+# New endpoint specifically for creating weekly manager summary setting
+@router.post("/{workspace_id}/weekly-manager-summary", response_model=dict)
+async def create_weekly_manager_summary_setting(
+    toggle_data: AutomationToggleRequest,
+    workspace_id: int = Path(...),
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Create or update weekly manager summary setting.
+    """
+    if current_user.workspace_id != workspace_id and current_user.role != "superadmin":
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to modify this workspace's settings",
+        )
+    
+    import json
+    from datetime import datetime
+    
+    # Check if setting already exists
+    existing_setting = db.query(NotificationSetting).filter(
+        NotificationSetting.workspace_id == workspace_id,
+        NotificationSetting.category == "teams",
+        NotificationSetting.type == "weekly_manager_summary"
+    ).first()
+    
+    if existing_setting:
+        # Update existing setting
+        existing_setting.is_enabled = toggle_data.is_enabled
+        existing_setting.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing_setting)
+    else:
+        # Create new setting
+        new_setting = NotificationSetting(
+            workspace_id=workspace_id,
+            category="teams",
+            type="weekly_manager_summary",
+            is_enabled=toggle_data.is_enabled,
+            channels=json.dumps(["email"]),
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(new_setting)
+        db.commit()
+        db.refresh(new_setting)
+    
+    return {"success": True, "message": "Weekly manager summary setting updated successfully"} 

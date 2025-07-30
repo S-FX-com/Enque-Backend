@@ -42,7 +42,7 @@ class Task(Base):
     # Email-related columns
     email_message_id = Column(String(255), nullable=True, index=True)
     email_conversation_id = Column(String(255), nullable=True)
-    email_sender = Column(String(255), nullable=True)
+    email_sender = Column(String(1000), nullable=True)  # Increased for long forwarded email addresses
     to_recipients = Column(Text, nullable=True)
     cc_recipients = Column(Text, nullable=True)
     bcc_recipients = Column(Text, nullable=True)

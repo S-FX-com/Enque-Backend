@@ -1668,3 +1668,389 @@ async def process_daily_outstanding_reports(db: Session) -> Dict[str, Any]:
     
     logger.info(f"Daily outstanding tasks reports processed: {results['reports_sent']}/{results['total_agents']} sent")
     return results
+
+
+def get_team_closed_tickets_last_week(db: Session, team_id: int) -> List[Dict[str, Any]]:
+    """
+    Obtiene todos los tickets cerrados/resueltos de un team en la semana pasada.
+    """
+    from datetime import datetime, timedelta
+    import pytz
+    from app.models.task import Task
+    from app.models.agent import Agent
+    
+    # Calculate last week's date range (Monday to Sunday)
+    et_timezone = pytz.timezone("America/New_York")
+    today = datetime.now(et_timezone).date()
+    
+    # Find last Monday (start of last week)
+    days_since_monday = today.weekday()  # Monday = 0, Sunday = 6
+    days_to_last_monday = days_since_monday + 7  # Go back to last Monday
+    last_monday = today - timedelta(days=days_to_last_monday)
+    
+    # Find last Sunday (end of last week) 
+    last_sunday = last_monday + timedelta(days=6)
+    
+    week_start = datetime.combine(last_monday, datetime.min.time())
+    week_end = datetime.combine(last_sunday, datetime.max.time())
+    
+    # Query tickets that were closed/resolved in the last week and assigned to this team
+    tickets = db.query(Task).join(Agent, Task.assignee_id == Agent.id, isouter=True).filter(
+        Task.team_id == team_id,
+        Task.status.in_(['Closed', 'Resolved']),
+        Task.updated_at >= week_start,
+        Task.updated_at <= week_end
+    ).all()
+    
+    tickets_data = []
+    for ticket in tickets:
+        tickets_data.append({
+            'id': ticket.id,
+            'title': ticket.title,
+            'status': ticket.status,
+            'priority': ticket.priority,
+            'created_at': ticket.created_at,
+            'last_activity': ticket.updated_at,
+            'assigned_agent': ticket.assignee.name if ticket.assignee else 'Unassigned'
+        })
+    
+    return tickets_data
+
+
+def create_weekly_manager_summary_email_html(
+    manager_name: str,
+    team_name: str,
+    tickets: List[Dict[str, Any]],
+    week_start: datetime,
+    week_end: datetime,
+    sender_name: Optional[str] = None
+) -> str:
+    """
+    Genera HTML para el email de resumen semanal del manager.
+    """
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+    
+    start_date = week_start.strftime('%B %d')
+    end_date = week_end.strftime('%B %d, %Y')
+    date_range = f"{start_date} - {end_date}"
+    
+    tickets_html = ""
+    if tickets:
+        for ticket in tickets:
+            created_date = ticket['created_at'].strftime('%m/%d/%Y')
+            last_activity_date = ticket['last_activity'].strftime('%m/%d/%Y')
+            assigned_agent = ticket['assigned_agent']
+            
+            tickets_html += f"""
+            <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {created_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {last_activity_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {assigned_agent}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #1f2937;">
+                    <strong>#{ticket['id']}</strong> - {ticket['title']}
+                </td>
+            </tr>
+            """
+    else:
+        tickets_html = """
+        <tr>
+            <td colspan="4" style="padding: 20px; text-align: center; font-size: 14px; color: #6b7280; font-style: italic;">
+                🎉 Great job! Your team had no tickets closed this week.
+            </td>
+        </tr>
+        """
+    
+    tickets_count = len(tickets)
+    summary_text = f"Your team closed {tickets_count} ticket{'s' if tickets_count != 1 else ''} this week."
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Weekly Team Summary</title>
+    </head>
+    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333333; background-color: #f8fafc;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            
+            <!-- Header -->
+            <div style="background-color: #f8fafc; border-bottom: 3px solid #667eea; padding: 30px; text-align: center;">
+                <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: #1f2937;">🎟️ Weekly Summary for {team_name}</h1>
+                <p style="margin: 10px 0 0 0; font-size: 16px; color: #6b7280;">
+                    {manager_name} • {date_range}
+                </p>
+            </div>
+            
+            <!-- Content -->
+            <div style="padding: 30px;">
+                <p style="margin: 0 0 20px 0; font-size: 16px; color: #374151;">
+                    Hello {manager_name},
+                </p>
+                
+                <p style="margin: 0 0 20px 0; font-size: 16px; color: #374151;">
+                    The following tickets that were assigned to your team have been marked as closed or resolved over the last 7 days.
+                </p>
+                
+                <!-- Tickets Table -->
+                <div style="margin: 25px 0; overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
+                        <thead style="background-color: #f9fafb;">
+                            <tr>
+                                <th style="padding: 12px 8px; text-align: left; font-size: 14px; font-weight: 600; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                    Ticket Created
+                                </th>
+                                <th style="padding: 12px 8px; text-align: left; font-size: 14px; font-weight: 600; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                    Last Activity
+                                </th>
+                                <th style="padding: 12px 8px; text-align: left; font-size: 14px; font-weight: 600; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                    Assigned Agent
+                                </th>
+                                <th style="padding: 12px 8px; text-align: left; font-size: 14px; font-weight: 600; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                    Ticket Name
+                                </th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {tickets_html}
+                        </tbody>
+                    </table>
+                </div>
+                
+                <!-- Summary -->
+                <div style="background-color: #f0f9ff; border: 1px solid #0ea5e9; border-radius: 8px; padding: 16px; margin: 20px 0;">
+                    <p style="margin: 0; font-size: 16px; font-weight: 500; color: #0c4a6e;">
+                        <strong>Summary:</strong> {summary_text}
+                    </p>
+                </div>
+            </div>
+            
+            <!-- Footer -->
+            <div style="background-color: #f8fafc; padding: 20px; text-align: center; border-top: 1px solid #e5e7eb;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #6b7280;">
+                    Best regards,<br>
+                    {footer_sender}
+                </p>
+                <p style="margin: 10px 0 0 0; font-size: 12px; color: #9ca3af;">
+                    This is an automated weekly summary from Enque.
+                </p>
+            </div>
+            
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+
+async def send_weekly_manager_summary_email(
+    db: Session,
+    manager_email: str,
+    manager_name: str,
+    team_name: str,
+    tickets: List[Dict[str, Any]],
+    week_start: datetime,
+    week_end: datetime,
+    access_token: str,
+    sender_email: str
+) -> bool:
+    """
+    Envía email de resumen semanal a un team manager.
+    """
+    
+    start_date = week_start.strftime("%B %d")
+    end_date = week_end.strftime("%B %d, %Y")
+    subject = f"Enque 🎟️ Weekly Summary for {team_name} for {start_date} - {end_date}"
+    
+    html_body = create_weekly_manager_summary_email_html(
+        manager_name=manager_name,
+        team_name=team_name,
+        tickets=tickets,
+        week_start=week_start,
+        week_end=week_end,
+        sender_name=None
+    )
+    
+    message = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": manager_email,
+                        "name": manager_name
+                    }
+                }
+            ]
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            response = await client.post(
+                "https://graph.microsoft.com/v1.0/me/sendMail",
+                json=message,
+                headers=headers
+            )
+            
+            if response.status_code == 202:
+                logger.info(f"✅ Weekly manager summary email sent successfully to {manager_email}")
+                return True
+            else:
+                logger.error(f"❌ Failed to send weekly manager summary email to {manager_email}. Status: {response.status_code}, Response: {response.text}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"❌ Exception sending weekly manager summary email to {manager_email}: {str(e)}")
+        return False
+
+
+async def process_weekly_manager_summaries(db: Session) -> Dict[str, Any]:
+    """
+    Procesa y envía resúmenes semanales a todos los team managers.
+    """
+    from datetime import datetime, timedelta
+    from app.models.team import Team
+    from app.models.agent import Agent
+    from app.models.microsoft import MailboxConnection, MicrosoftToken
+    from app.models.notification import NotificationSetting
+    import json
+    
+    # Check if weekly manager summary feature is enabled
+    setting = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "teams",
+        NotificationSetting.type == "weekly_manager_summary",
+        NotificationSetting.is_enabled == True
+    ).first()
+    
+    if not setting:
+        logger.info("Weekly manager summary feature is disabled or not configured")
+        return {"success": False, "message": "Feature disabled"}
+    
+    # Calculate last week's date range (Monday to Sunday)
+    import pytz
+    et_timezone = pytz.timezone("America/New_York")
+    today = datetime.now(et_timezone).date()
+    
+    # Find last Monday (start of last week)
+    days_since_monday = today.weekday()  # Monday = 0, Sunday = 6
+    days_to_last_monday = days_since_monday + 7  # Go back to last Monday
+    last_monday = today - timedelta(days=days_to_last_monday)
+    
+    # Find last Sunday (end of last week) 
+    last_sunday = last_monday + timedelta(days=6)
+    
+    week_start = datetime.combine(last_monday, datetime.min.time())
+    week_end = datetime.combine(last_sunday, datetime.max.time())
+    
+    workspace_settings = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "teams",
+        NotificationSetting.type == "weekly_manager_summary",
+        NotificationSetting.is_enabled == True
+    ).all()
+    
+    results = {
+        "success": True,
+        "total_managers": 0,
+        "summaries_sent": 0,
+        "errors": []
+    }
+    
+    for workspace_setting in workspace_settings:
+        workspace_id = workspace_setting.workspace_id
+        
+        try:
+            # Get mailbox connection for sending emails
+            mailbox_info = db.query(MailboxConnection, MicrosoftToken)\
+                .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                .filter(
+                    MailboxConnection.workspace_id == workspace_id,
+                    MailboxConnection.is_active == True
+                ).first()
+            
+            if not mailbox_info:
+                logger.warning(f"No active mailbox found for workspace {workspace_id}")
+                continue
+            
+            connection, token = mailbox_info
+            
+            # Refresh token if needed
+            if token.expires_at <= datetime.utcnow():
+                try:
+                    from app.services.microsoft_service import MicrosoftGraphService
+                    ms_service = MicrosoftGraphService(db)
+                    await ms_service.refresh_token_async(token)
+                    db.refresh(token)
+                except Exception as e:
+                    logger.error(f"Error refreshing token for workspace {workspace_id}: {str(e)}")
+                    continue
+            
+            # Get all teams with managers in the workspace
+            teams_with_managers = db.query(Team).join(Agent, Team.manager_id == Agent.id).filter(
+                Team.workspace_id == workspace_id,
+                Team.manager_id.isnot(None),
+                Agent.is_active == True,
+                Agent.email.isnot(None)
+            ).all()
+            
+            results["total_managers"] += len(teams_with_managers)
+            
+            for team in teams_with_managers:
+                try:
+                    # Get closed tickets for this team from last week
+                    closed_tickets = get_team_closed_tickets_last_week(db, team.id)
+                    
+                    # Send email to team manager
+                    success = await send_weekly_manager_summary_email(
+                        db=db,
+                        manager_email=team.manager.email,
+                        manager_name=team.manager.name,
+                        team_name=team.name,
+                        tickets=closed_tickets,
+                        week_start=week_start,
+                        week_end=week_end,
+                        access_token=token.access_token,
+                        sender_email=connection.email
+                    )
+                    
+                    if success:
+                        results["summaries_sent"] += 1
+                        ticket_count = len(closed_tickets)
+                        logger.info(f"✅ Weekly manager summary sent to {team.manager.name} ({team.manager.email}) for team '{team.name}' - {ticket_count} tickets")
+                    else:
+                        results["errors"].append(f"Failed to send summary to {team.manager.name} ({team.manager.email}) for team '{team.name}'")
+                        
+                except Exception as e:
+                    error_msg = f"Error processing team {team.name} (manager: {team.manager.name if team.manager else 'None'}): {str(e)}"
+                    results["errors"].append(error_msg)
+                    logger.error(error_msg)
+                    continue
+                    
+        except Exception as e:
+            error_msg = f"Error processing workspace {workspace_id}: {str(e)}"
+            results["errors"].append(error_msg)
+            logger.error(error_msg)
+            continue
+    
+    logger.info(f"Weekly manager summaries processed: {results['summaries_sent']}/{results['total_managers']} sent")
+    return results

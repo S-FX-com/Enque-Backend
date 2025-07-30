@@ -1,6 +1,5 @@
 import time
 import threading
-# 🔧 ADDED: Circuit breaker to prevent email sync from overwhelming DB
 from datetime import datetime, timedelta
 try:
     import schedule
@@ -70,10 +69,7 @@ email_sync_circuit_breaker = EmailSyncCircuitBreaker()
 
 
 def sync_emails_job():
-    """
-    ⚡ Optimized email sync job with connection pool management and circuit breaker
-    """
-    # 🔧 CIRCUIT BREAKER: Check if we should skip due to recent failures
+
     if not email_sync_circuit_breaker.can_execute():
         logger.debug("🚨 Email sync skipped due to circuit breaker (DB issues detected)")
         return
@@ -88,10 +84,9 @@ def sync_emails_job():
         ).all()
         
         if not configs:
-            email_sync_circuit_breaker.record_success()  # No configs is not a failure
+            email_sync_circuit_breaker.record_success()  
             return
-        
-        # 🔧 OPTIMIZED: Better batching to prevent connection pool exhaustion
+
         batch_size = settings.EMAIL_SYNC_BATCH_SIZE if hasattr(settings, 'EMAIL_SYNC_BATCH_SIZE') else 5  # Reduced default
         max_concurrent = getattr(settings, 'EMAIL_SYNC_CONCURRENT_CONNECTIONS', 3)
         
@@ -101,12 +96,9 @@ def sync_emails_job():
         total_comments = 0
         
         logger.info(f"📧 Starting email sync for {len(configs)} configs (batch_size={batch_size}, max_concurrent={max_concurrent})")
-        
-        # 🔧 IMPROVEMENT: Process in smaller batches with delay to avoid overwhelming DB
+
         for i in range(0, len(configs), batch_size):
             batch = configs[i:i + batch_size]
-            
-            # Process each config in the batch
             for config in batch:
                 try:
                     result = sync_single_config(config)
@@ -119,21 +111,15 @@ def sync_emails_job():
                 except Exception as e:
                     logger.error(f"❌ Error syncing config #{config.id}: {e}")
                     failed_syncs += 1
-                    
-                    # 🔧 CRITICAL: Check for DB connection errors
                     if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
                         logger.error(f"🚨 Database connection issue detected in email sync: {e}")
                         email_sync_circuit_breaker.record_failure()
                         raise  # Break out early to prevent further damage
-            
-            # 🔧 CRITICAL: Add delay between batches to reduce DB load
-            if i + batch_size < len(configs):  # Don't sleep after the last batch
-                time.sleep(0.5)  # 500ms delay between batches
-        
-        # 🔧 SUCCESS: Record successful completion
+            if i + batch_size < len(configs): 
+                time.sleep(0.5) 
+
         email_sync_circuit_breaker.record_success()
-        
-        # Only show logs if there's real activity or errors
+
         if total_tickets > 0 or total_comments > 0:
             logger.info(f"📧 Email sync completed: {total_tickets} tickets created, {total_comments} comments added")
         
@@ -144,8 +130,6 @@ def sync_emails_job():
                     
     except Exception as e:
         logger.error(f"❌ Critical error in email sync job: {e}")
-        
-        # 🔧 CIRCUIT BREAKER: Record failure for critical DB errors
         if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
             email_sync_circuit_breaker.record_failure()
     finally:
@@ -160,10 +144,7 @@ def sync_single_config(config: EmailSyncConfig) -> int:
     config_db = None
     try:
         config_db = SessionLocal()
-        
-        # 🔧 ADDED: Quick check if DB connection is available
         try:
-            # Test the connection with a simple query
             config_db.execute(text("SELECT 1"))
             config_db.commit()
         except Exception as db_test_error:
@@ -189,26 +170,18 @@ def sync_single_config(config: EmailSyncConfig) -> int:
             return -1
             
         service = MicrosoftGraphService(config_db)
-        
-        # Initialize cache if available (safe sync call)
         service._init_cache_if_needed()
-        
-        # 🔧 IMPROVED: Add timeout protection for email sync
         start_time = time.time()
         max_sync_time = 60  # 60 seconds max per config
         
         try:
-            # Use the existing sync_emails method (it's already optimized with cache)
             created_tasks = service.sync_emails(config)
-            
-            # Check if we're taking too long
             if time.time() - start_time > max_sync_time:
                 logger.warning(f"⚠️ Email sync for config #{config.id} took longer than {max_sync_time}s")
         except Exception as sync_error:
-            # 🔧 CRITICAL: Handle specific database errors
             if "QueuePool limit" in str(sync_error) or "connection timed out" in str(sync_error):
                 logger.error(f"🚨 Database pool issue in sync_single_config #{config.id}: {sync_error}")
-                raise  # Re-raise to be caught by the caller
+                raise  
             else:
                 logger.error(f"❌ Email sync error for config #{config.id}: {sync_error}")
                 return -1
@@ -220,10 +193,9 @@ def sync_single_config(config: EmailSyncConfig) -> int:
         return tickets_created
         
     except Exception as e:
-        # 🔧 IMPROVED: Better error categorization
         if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
             logger.error(f"🚨 Database connection issue in config #{config.id}: {e}")
-            raise  # Re-raise critical DB errors
+            raise  
         else:
             logger.error(f"❌ Error syncing emails for config #{config.id}: {e}")
             return -1
@@ -235,9 +207,6 @@ def sync_single_config(config: EmailSyncConfig) -> int:
                 logger.error(f"❌ Error closing config DB connection: {close_error}")
 
 def sync_emails_job_legacy():
-    """
-    Legacy sync job as fallback
-    """
     logger.info("Starting legacy email sync job")
     db = None
     
@@ -288,9 +257,6 @@ def sync_emails_job_legacy():
 
 
 def refresh_tokens_job():
-    """
-    Background job to check and renew Microsoft tokens before they expire
-    """
     import asyncio
     
     logger.info("Starting token refresh job")
@@ -299,8 +265,6 @@ def refresh_tokens_job():
     try:
         db = SessionLocal()
         service = MicrosoftGraphService(db)
-    
-        # Create event loop for async function
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -428,18 +392,14 @@ def cleanup_orphaned_connections():
     db = None
     try:
         from app.database.session import log_pool_status, get_pool_status
-        
-        # Log pool status before cleanup
+
         logger.info("🧹 Starting orphaned connections cleanup...")
         log_pool_status()
         
         db = SessionLocal()
-        
-        # Clean up orphaned email mappings (as mentioned in the original error)
         from app.models.microsoft import EmailTicketMapping
         from app.models.task import Task
-        
-        # Find email mappings without corresponding tickets
+
         orphaned_mappings = db.query(EmailTicketMapping).outerjoin(
             Task, EmailTicketMapping.ticket_id == Task.id
         ).filter(Task.id.is_(None)).all()
@@ -450,8 +410,7 @@ def cleanup_orphaned_connections():
                 db.delete(mapping)
             db.commit()
             logger.info(f"✅ Cleaned up {len(orphaned_mappings)} orphaned email mappings")
-        
-        # Log pool status after cleanup
+
         log_pool_status()
         
     except Exception as e:
@@ -466,17 +425,14 @@ def cleanup_orphaned_connections():
                 logger.error(f"❌ Error closing cleanup DB connection: {close_error}")
 
 def monitor_database_health():
-    """
-    📊 Monitor database health and log warnings if needed
-    """
+
     try:
         from app.database.session import get_pool_status, is_pool_healthy, log_pool_status
         
         if not is_pool_healthy():
             logger.warning("🚨 Database pool health check FAILED - high utilization detected")
             log_pool_status()
-            
-            # If pool utilization is very high, trigger cleanup
+
             status = get_pool_status()
             if not ("error" in status) and status.get('pool_utilization', 0) > 90:
                 logger.warning("🧹 Pool utilization > 90%, triggering cleanup...")
@@ -485,29 +441,19 @@ def monitor_database_health():
         logger.error(f"❌ Error monitoring database health: {e}")
 
 def start_scheduler():
-    """
-    ⚡ Start the optimized background scheduler for email sync
-    """
     
     if not scheduler_available:
         logger.warning("❌ Schedule library is not available. Email synchronization scheduler will not run.")
         logger.warning("💡 Install with: pip install schedule")
         return
-    
-    # 🔧 OPTIMIZED: Reduced frequency to prevent connection pool exhaustion
     sync_frequency = getattr(settings, 'EMAIL_SYNC_FREQUENCY_SECONDS', 120)
-    schedule.every(sync_frequency).seconds.do(sync_emails_job)  # Changed from 30 to 120 seconds
-    schedule.every(3).hours.do(refresh_tokens_job)  # More frequent token refresh
-    
-    # 🔧 ADDED: Cleanup and monitoring jobs
-    schedule.every(30).minutes.do(cleanup_orphaned_connections)  # Clean up every 30 minutes
-    schedule.every(5).minutes.do(monitor_database_health)  # Monitor every 5 minutes
-    
-    # Weekly agent summary - check every hour on Fridays for the 3pm window
+    schedule.every(sync_frequency).seconds.do(sync_emails_job)  
+    schedule.every(3).hours.do(refresh_tokens_job)  
+    schedule.every(30).minutes.do(cleanup_orphaned_connections)
+    schedule.every(5).minutes.do(monitor_database_health)
     schedule.every().hour.do(weekly_agent_summary_job)
-    
-    # 🔧 ADDED: Daily outstanding tasks - check every hour for the 7am ET window
     schedule.every().hour.do(daily_outstanding_tasks_job)
+    schedule.every().hour.do(weekly_manager_summaries_job)
     
     # Run in a separate thread with better error handling
     def run_scheduler():
@@ -530,6 +476,47 @@ def start_scheduler():
     logger.info("  - Database health monitoring: every 5 minutes")
     logger.info("  - Weekly agent summaries: every hour (executes only on Fridays at 3pm)")
     logger.info("  - Daily outstanding tasks: every hour (executes daily at 7am ET)")  # 🔧 ADDED
+    logger.info("  - Weekly manager summaries: every hour (executes only on Fridays at 4pm ET)")  # 🔧 ADDED
     
 
+def weekly_manager_summaries_job():
+    import asyncio
+    from app.services.email_service import process_weekly_manager_summaries
+    
+    logger.info("Starting weekly manager summaries job")
+    db = None
+    
+    try:
+        db = SessionLocal()
 
+        import pytz
+        et_timezone = pytz.timezone("America/New_York")
+        current_time = datetime.now(et_timezone)
+
+        if current_time.weekday() == 4 and 16 <= current_time.hour < 17:
+            logger.info("✅ Running weekly manager summaries (Friday 4pm ET)")
+            
+            # Create new event loop for async processing
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            result = loop.run_until_complete(process_weekly_manager_summaries(db))
+            
+            if result.get("success"):
+                total_managers = result.get("total_managers", 0)
+                sent_count = result.get("summaries_sent", 0)
+                logger.info(f"✅ Weekly manager summaries completed: {sent_count}/{total_managers} sent")
+                if result.get("errors"):
+                    logger.warning(f"⚠️ Some errors occurred: {result['errors']}")
+            else:
+                logger.info(f"Weekly manager summaries skipped: {result.get('message', 'Unknown reason')}")
+                
+            loop.close()
+        else:
+            logger.debug(f"Not time for weekly manager summaries. Current: {current_time.strftime('%A %I:%M %p ET')} (need Friday 4-5pm ET)")
+            
+    except Exception as e:
+        logger.error(f"❌ Error in weekly manager summaries job: {str(e)}", exc_info=True)
+    finally:
+        if db:
+            db.close()
