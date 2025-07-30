@@ -1479,11 +1479,23 @@ async def send_daily_outstanding_email(
     tickets: List[Dict[str, Any]],
     report_date: datetime,
     access_token: str,
-    sender_email: str
+    sender_email: str,
+    workspace_id: int
 ) -> bool:
     """
     Envía email de reporte diario de tickets pendientes a un agente.
     """
+    
+    # Get workspace subdomain to build correct URL
+    from app.models.workspace import Workspace
+    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    
+    if workspace and workspace.subdomain:
+        frontend_base_url = f"https://{workspace.subdomain}.enque.cc"
+    else:
+        # Fallback to default if workspace not found
+        frontend_base_url = "https://app.enque.cc"
+        logger.warning(f"Workspace {workspace_id} not found, using default URL")
     
     formatted_date = report_date.strftime("%B %d, %Y")
     subject = f"Enque 🎟️ Outstanding Tasks for {formatted_date}"
@@ -1492,6 +1504,7 @@ async def send_daily_outstanding_email(
         agent_name=agent_name,
         tickets=tickets,
         report_date=report_date,
+        frontend_base_url=frontend_base_url,
         sender_name=None
     )
     
@@ -1630,7 +1643,8 @@ async def process_daily_outstanding_reports(db: Session) -> Dict[str, Any]:
                         tickets=outstanding_tickets,
                         report_date=today,
                         access_token=token.access_token,
-                        sender_email=connection.email
+                        sender_email=connection.email,
+                        workspace_id=workspace_id
                     )
                     
                     if success:
