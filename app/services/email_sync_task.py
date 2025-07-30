@@ -373,10 +373,58 @@ def weekly_agent_summary_job():
         if db is not None:
             db.close()
 
+def daily_outstanding_tasks_job():
+    """
+    Background job to send daily outstanding tasks reports to agents at 7am ET
+    """
+    import asyncio
+    from app.services.email_service import process_daily_outstanding_reports
+    
+    logger.info("Starting daily outstanding tasks job")
+    db = None
+    
+    try:
+        # Check if it's 7am ET (07:00)
+        import pytz
+        et_timezone = pytz.timezone("America/New_York")
+        now_et = datetime.now(et_timezone)
+        
+        current_hour_et = now_et.hour
+        current_minute_et = now_et.minute
+
+        if current_hour_et != 7:
+            logger.debug(f"Current time {current_hour_et}:{current_minute_et:02d} ET is not 7am hour, skipping daily outstanding tasks")
+            return
+            
+        logger.info(f"Current time {current_hour_et}:{current_minute_et:02d} ET is in the 7am range, proceeding with daily outstanding tasks report")
+        
+        db = SessionLocal()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            result = loop.run_until_complete(process_daily_outstanding_reports(db))
+            
+            if result["success"]:
+                logger.info(f"✅ Daily outstanding tasks reports completed: {result['reports_sent']}/{result['total_agents']} sent")
+                if result["errors"]:
+                    logger.warning(f"⚠️ Some errors occurred: {result['errors']}")
+            else:
+                logger.info(f"Daily outstanding tasks reports skipped: {result.get('message', 'Unknown reason')}")
+                
+        finally:
+            loop.close()
+        
+    except Exception as e:
+        logger.error(f"❌ Error in daily outstanding tasks job: {str(e)}", exc_info=True)
+    finally:
+        if db is not None:
+            db.close()
+
+
 def cleanup_orphaned_connections():
-    """
-    🧹 Clean up orphaned database connections and email mappings
-    """
+
     db = None
     try:
         from app.database.session import log_pool_status, get_pool_status
@@ -458,6 +506,9 @@ def start_scheduler():
     # Weekly agent summary - check every hour on Fridays for the 3pm window
     schedule.every().hour.do(weekly_agent_summary_job)
     
+    # 🔧 ADDED: Daily outstanding tasks - check every hour for the 7am ET window
+    schedule.every().hour.do(daily_outstanding_tasks_job)
+    
     # Run in a separate thread with better error handling
     def run_scheduler():
         while True:
@@ -478,6 +529,7 @@ def start_scheduler():
     logger.info("  - Cleanup orphaned connections: every 30 minutes")
     logger.info("  - Database health monitoring: every 5 minutes")
     logger.info("  - Weekly agent summaries: every hour (executes only on Fridays at 3pm)")
+    logger.info("  - Daily outstanding tasks: every hour (executes daily at 7am ET)")  # 🔧 ADDED
     
 
 

@@ -213,8 +213,9 @@ async def read_team_tasks_optimized(
     )
 
     from app.models.agent import Agent
-    query = query.join(Agent, Task.assignee_id == Agent.id).filter(
-        Agent.team_id == team_id
+    from app.models.team import TeamMember
+    query = query.join(Agent, Task.assignee_id == Agent.id).join(TeamMember, Agent.id == TeamMember.agent_id).filter(
+        TeamMember.team_id == team_id
     )
     
     query = query.offset(skip).limit(limit)

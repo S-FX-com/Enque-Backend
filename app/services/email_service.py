@@ -1300,3 +1300,371 @@ async def process_weekly_agent_summaries(db: Session) -> Dict[str, Any]:
     
     logger.info(f"Weekly agent summaries processed: {results['summaries_sent']}/{results['total_agents']} sent")
     return results
+
+
+def get_agent_outstanding_tickets(db: Session, agent_id: int) -> List[Dict[str, Any]]:
+    """
+    Obtiene todos los tickets pendientes asignados a un agente específico.
+    """
+    from datetime import datetime
+    from app.models.task import Task
+    
+    tickets = db.query(Task).filter(
+        Task.assignee_id == agent_id,
+        Task.status.in_(['Open', 'In Progress', 'On Hold', 'Pending']),  # Outstanding statuses
+        Task.is_deleted == False
+    ).order_by(Task.created_at.asc()).all()  # Oldest first to show priority
+    
+    result = []
+    for ticket in tickets:
+        # Calculate last activity (could be last comment, update, etc.)
+        last_activity = ticket.updated_at if ticket.updated_at else ticket.created_at
+        
+        result.append({
+            'id': ticket.id,
+            'title': ticket.title,
+            'status': ticket.status,
+            'priority': ticket.priority,
+            'created_at': ticket.created_at,
+            'updated_at': ticket.updated_at,
+            'last_activity': last_activity
+        })
+    
+    return result
+
+
+def create_daily_outstanding_email_html(
+    agent_name: str,
+    tickets: List[Dict[str, Any]],
+    report_date: datetime,
+    frontend_base_url: str = "https://app.enque.cc",
+    sender_name: Optional[str] = None
+) -> str:
+    """
+    Genera HTML para el email de reporte diario de tickets pendientes.
+    """
+    if sender_name:
+        footer_sender = f"The {sender_name} Team"
+    else:
+        footer_sender = "The Enque Team"
+    
+    formatted_date = report_date.strftime('%B %d, %Y')
+    
+    tickets_html = ""
+    if tickets:
+        for ticket in tickets:
+            created_date = ticket['created_at'].strftime('%m/%d/%Y')
+            last_activity_date = ticket['last_activity'].strftime('%m/%d/%Y')
+            ticket_url = f"{frontend_base_url}/tickets/{ticket['id']}"
+            
+            # Priority indicator
+            priority_color = {
+                'Critical': '#ef4444',  # red
+                'High': '#f97316',      # orange  
+                'Medium': '#eab308',    # yellow
+                'Low': '#22c55e'        # green
+            }.get(ticket.get('priority', 'Medium'), '#6b7280')  # default gray
+            
+            tickets_html += f"""
+            <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {created_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #374151;">
+                    {last_activity_date}
+                </td>
+                <td style="padding: 12px 8px; text-align: left; font-size: 14px; color: #1f2937;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="width: 8px; height: 8px; border-radius: 50%; background-color: {priority_color}; display: inline-block;"></span>
+                        <a href="{ticket_url}" style="color: #2563eb; text-decoration: none; font-weight: 500;">
+                            <strong>#{ticket['id']}</strong> - {ticket['title']}
+                        </a>
+                    </div>
+                    <div style="margin-top: 4px; font-size: 12px; color: #6b7280;">
+                        Status: {ticket['status']} • Priority: {ticket.get('priority', 'Medium')}
+                    </div>
+                </td>
+            </tr>
+            """
+    else:
+        tickets_html = """
+        <tr>
+            <td colspan="3" style="padding: 20px; text-align: center; font-size: 14px; color: #6b7280; font-style: italic;">
+                🎉 Great job! You have no outstanding tasks today.
+            </td>
+        </tr>
+        """
+    
+    tickets_count = len(tickets)
+    summary_text = f"You have {tickets_count} outstanding task{'s' if tickets_count != 1 else ''} assigned to you."
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Daily Outstanding Tasks</title>
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f8fafc;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            
+            <!-- Header -->
+            <div style="background-color: #f8fafc; border-bottom: 3px solid #f59e0b; padding: 30px; text-align: center;">
+                <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: #1f2937;">🎟️ Outstanding Tasks</h1>
+                <p style="margin: 10px 0 0 0; font-size: 16px; color: #6b7280;">
+                    {agent_name} • {formatted_date}
+                </p>
+            </div>
+            
+            <!-- Content -->
+            <div style="padding: 30px;">
+                <p style="font-size: 16px; color: #374151; margin-bottom: 25px;">
+                    Hello {agent_name},
+                </p>
+                
+                <p style="font-size: 16px; color: #374151; margin-bottom: 25px;">
+                    The following tasks have been assigned to you and are still currently outstanding.
+                </p>
+                
+                <!-- Tickets Table -->
+                <table style="width: 100%; border-collapse: collapse; margin: 25px 0; background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
+                    <thead>
+                        <tr style="background-color: #f9fafb;">
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Ticket Created
+                            </th>
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Last Activity
+                            </th>
+                            <th style="padding: 15px 8px; text-align: left; font-weight: 600; font-size: 14px; color: #374151; border-bottom: 2px solid #e5e7eb;">
+                                Subject
+                            </th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tickets_html}
+                    </tbody>
+                </table>
+                
+                <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border-left: 4px solid #f59e0b;">
+                    <p style="margin: 0; font-size: 14px; color: #6b7280;">
+                        <strong>Summary:</strong> {summary_text}
+                    </p>
+                </div>
+            </div>
+            
+            <!-- Footer -->
+            <div style="background-color: #f8fafc; padding: 25px; text-align: center; border-top: 1px solid #e5e7eb;">
+                <p style="margin: 0; font-size: 14px; color: #6b7280;">
+                    Best regards,<br>
+                    {footer_sender}
+                </p>
+                <p style="margin: 15px 0 0 0; font-size: 12px; color: #9ca3af;">
+                    This is an automated daily report from Enque.
+                </p>
+            </div>
+            
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+async def send_daily_outstanding_email(
+    db: Session,
+    agent_email: str,
+    agent_name: str,
+    tickets: List[Dict[str, Any]],
+    report_date: datetime,
+    access_token: str,
+    sender_email: str,
+    workspace_id: int
+) -> bool:
+    """
+    Envía email de reporte diario de tickets pendientes a un agente.
+    """
+    
+    # Get workspace subdomain to build correct URL
+    from app.models.workspace import Workspace
+    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    
+    if workspace and workspace.subdomain:
+        frontend_base_url = f"https://{workspace.subdomain}.enque.cc"
+    else:
+        # Fallback to default if workspace not found
+        frontend_base_url = "https://app.enque.cc"
+        logger.warning(f"Workspace {workspace_id} not found, using default URL")
+    
+    formatted_date = report_date.strftime("%B %d, %Y")
+    subject = f"Enque 🎟️ Outstanding Tasks for {formatted_date}"
+    
+    html_body = create_daily_outstanding_email_html(
+        agent_name=agent_name,
+        tickets=tickets,
+        report_date=report_date,
+        frontend_base_url=frontend_base_url,
+        sender_name=None
+    )
+    
+    message = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": agent_email,
+                        "name": agent_name
+                    }
+                }
+            ]
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
+                json=message,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            if response.status_code == 202:
+                logger.info(f"✅ Daily outstanding tasks email sent successfully to {agent_email}")
+                return True
+            else:
+                logger.error(f"❌ Failed to send daily outstanding tasks email to {agent_email}. Status: {response.status_code}, Response: {response.text}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"❌ Error sending daily outstanding tasks email to {agent_email}: {str(e)}")
+        return False
+
+
+async def process_daily_outstanding_reports(db: Session) -> Dict[str, Any]:
+    """
+    Procesa y envía reportes diarios de tickets pendientes a todos los agentes.
+    """
+    from datetime import datetime
+    from app.models.agent import Agent
+    from app.models.microsoft import MailboxConnection, MicrosoftToken
+    from app.models.notification import NotificationSetting
+    import json
+    
+    # Check if daily outstanding tasks feature is enabled
+    setting = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "agents",
+        NotificationSetting.type == "daily_outstanding_tasks",
+        NotificationSetting.is_enabled == True
+    ).first()
+    
+    if not setting:
+        logger.info("Daily outstanding tasks feature is disabled or not configured")
+        return {"success": False, "message": "Feature disabled"}
+    
+    # Current date for the report
+    import pytz
+    et_timezone = pytz.timezone("America/New_York")
+    today = datetime.now(et_timezone)
+    
+    workspace_settings = db.query(NotificationSetting).filter(
+        NotificationSetting.category == "agents",
+        NotificationSetting.type == "daily_outstanding_tasks",
+        NotificationSetting.is_enabled == True
+    ).all()
+    
+    results = {
+        "success": True,
+        "total_agents": 0,
+        "reports_sent": 0,
+        "errors": []
+    }
+    
+    for workspace_setting in workspace_settings:
+        workspace_id = workspace_setting.workspace_id
+        
+        try:
+            # Get mailbox connection for sending emails
+            mailbox_info = db.query(MailboxConnection, MicrosoftToken)\
+                .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                .filter(
+                    MailboxConnection.workspace_id == workspace_id,
+                    MailboxConnection.is_active == True
+                ).first()
+            
+            if not mailbox_info:
+                logger.warning(f"No active mailbox found for workspace {workspace_id}")
+                continue
+            
+            connection, token = mailbox_info
+            
+            # Refresh token if needed
+            if token.expires_at <= datetime.utcnow():
+                try:
+                    from app.services.microsoft_service import MicrosoftGraphService
+                    ms_service = MicrosoftGraphService(db)
+                    await ms_service.refresh_token_async(token)
+                    db.refresh(token)
+                except Exception as e:
+                    logger.error(f"Error refreshing token for workspace {workspace_id}: {str(e)}")
+                    continue
+            
+            # Get all active agents in the workspace
+            agents = db.query(Agent).filter(
+                Agent.workspace_id == workspace_id,
+                Agent.is_active == True,
+                Agent.email.isnot(None)
+            ).all()
+            
+            results["total_agents"] += len(agents)
+            
+            for agent in agents:
+                try:
+                    # Get outstanding tickets for this agent
+                    outstanding_tickets = get_agent_outstanding_tickets(db, agent.id)
+                    
+                    # Send email even if no tickets (shows "Great job!" message)
+                    success = await send_daily_outstanding_email(
+                        db=db,
+                        agent_email=agent.email,
+                        agent_name=agent.name,
+                        tickets=outstanding_tickets,
+                        report_date=today,
+                        access_token=token.access_token,
+                        sender_email=connection.email,
+                        workspace_id=workspace_id
+                    )
+                    
+                    if success:
+                        results["reports_sent"] += 1
+                        ticket_count = len(outstanding_tickets)
+                        logger.info(f"✅ Daily outstanding tasks report sent to {agent.name} ({agent.email}) - {ticket_count} tasks")
+                    else:
+                        results["errors"].append(f"Failed to send report to {agent.name} ({agent.email})")
+                        
+                except Exception as e:
+                    error_msg = f"Error processing agent {agent.name}: {str(e)}"
+                    results["errors"].append(error_msg)
+                    logger.error(error_msg)
+                    continue
+                    
+        except Exception as e:
+            error_msg = f"Error processing workspace {workspace_id}: {str(e)}"
+            results["errors"].append(error_msg)
+            logger.error(error_msg)
+            continue
+    
+    logger.info(f"Daily outstanding tasks reports processed: {results['reports_sent']}/{results['total_agents']} sent")
+    return results

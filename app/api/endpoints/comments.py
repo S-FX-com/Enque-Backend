@@ -872,7 +872,7 @@ def send_email_in_background(
         if task_with_user.mailbox_connection_id:
             # Task originated from email, send a reply
             microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients)
+            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients)
         else:
             # Task was created manually, send a new email notification
             if not task_with_user.user or not task_with_user.user.email:
@@ -899,7 +899,9 @@ def send_email_in_background(
                 subject=subject,
                 html_body=html_body,
                 attachment_ids=processed_attachment_ids,
-                task_id=task_id  # Pass the task ID to include in the subject
+                task_id=task_id,  # Pass the task ID to include in the subject
+                cc_recipients=cc_recipients,
+                bcc_recipients=bcc_recipients
             )
             if not email_sent:
                 pass
