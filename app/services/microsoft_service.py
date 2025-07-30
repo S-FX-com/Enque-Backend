@@ -2302,7 +2302,7 @@ class MicrosoftGraphService:
             logger.error(f"Error al procesar HTML para correo electrónico: {str(e)}", exc_info=True)
             return html_content
 
-    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None, cc_recipients: List[str] = None) -> bool:
+    def send_reply_email(self, task_id: int, reply_content: str, agent: Agent, attachment_ids: List[int] = None, cc_recipients: List[str] = None, bcc_recipients: List[str] = None) -> bool:
         """
         Send a reply email for a ticket that originated from an email.
         If the ticket has original CC recipients, they will be included in the reply.
@@ -2715,6 +2715,9 @@ class MicrosoftGraphService:
                 if cc_recipients:
                     update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
                 
+                if bcc_recipients:
+                    update_payload["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
+                
                 update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
                 response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
                 if response.status_code not in [200, 201, 202]:
@@ -2818,6 +2821,9 @@ class MicrosoftGraphService:
                     if cc_recipients:
                         update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
                     
+                    if bcc_recipients:
+                        update_payload["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
+                    
                     update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
                     response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
                     response.raise_for_status()
@@ -2851,7 +2857,7 @@ class MicrosoftGraphService:
                 logger.error(f"An unexpected error occurred while sending email reply for task_id: {task_id}. Error: {str(e)}", exc_info=True)
                 return False
 
-    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None, cc_recipients: List[str] = None) -> bool:
+    def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None, cc_recipients: List[str] = None, bcc_recipients: List[str] = None) -> bool:
         logger.info(f"Attempting to send new email from: {mailbox_email} to: {recipient_email} with subject: {subject}")
         
         # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
@@ -2972,6 +2978,11 @@ class MicrosoftGraphService:
         if cc_recipients:
             email_payload["message"]["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
             logger.info(f"Including {len(cc_recipients)} CC recipients in new email: {cc_recipients}")
+        
+        # Add BCC recipients if provided
+        if bcc_recipients:
+            email_payload["message"]["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
+            logger.info(f"Including {len(bcc_recipients)} BCC recipients in new email: {bcc_recipients}")
         
         # Add attachments to payload if any were found
         if attachments_data:
