@@ -5,7 +5,9 @@ import logging
 import time
 import socketio
 from typing import Optional
-
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pytz import utc
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -28,18 +30,27 @@ logger = logging.getLogger(__name__)
 
 class HealthMiddleware(BaseHTTPMiddleware):
     """Simple health check middleware"""
-    
+
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/health":
             return Response("OK", status_code=200)
         return await call_next(request)
+
+scheduler = AsyncIOScheduler(timezone=utc)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start()
+    yield
+    scheduler.shutdown()
 
 # Create FastAPI app
 app = FastAPI(
     title="Enque API",
     description="Customer service platform API",
     version="1.0.0",
-    openapi_url=f"{settings.API_V1_STR}/openapi.json" if settings.API_V1_STR else "/openapi.json"
+    openapi_url=f"{settings.API_V1_STR}/openapi.json" if settings.API_V1_STR else "/openapi.json",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -61,13 +72,13 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 # Socket.IO integration
 socket_app = socketio.ASGIApp(sio, app)
 
-# 🔧 SIMPLIFIED: Basic health check endpoint 
+# 🔧 SIMPLIFIED: Basic health check endpoint
 @app.get("/health-detailed")
 async def health_check_detailed():
     """Detailed health check including database pool status"""
     try:
         from app.database.session import get_pool_status, is_pool_healthy
-        
+
         health_status = {
             "status": "healthy",
             "timestamp": time.time(),
@@ -76,7 +87,7 @@ async def health_check_detailed():
                 "socketio": "connected" if sio else "unavailable"
             }
         }
-        
+
         # Check database pool health (safely)
         try:
             pool_status = get_pool_status()
@@ -84,7 +95,7 @@ async def health_check_detailed():
                 "pool_healthy": is_pool_healthy(),
                 "pool_status": pool_status
             }
-            
+
             # Determine overall health
             if not is_pool_healthy():
                 health_status["status"] = "degraded"
@@ -96,7 +107,7 @@ async def health_check_detailed():
             }
             health_status["status"] = "degraded"
             health_status["warnings"] = ["Database pool monitoring failed"]
-            
+
         return health_status
     except Exception as e:
         return {
