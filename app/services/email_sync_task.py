@@ -37,8 +37,8 @@ class EmailSyncCircuitBreaker:
     def __init__(self):
         self.failure_count = 0
         self.last_failure_time = None
-        self.failure_threshold = 3  # After 3 failures, stop for a while
-        self.recovery_timeout = 120  # 🔧 REDUCED: 2 minutes instead of 5 minutes
+        self.failure_threshold = 5  
+        self.recovery_timeout = 60  
     
     def can_execute(self) -> bool:
         if self.failure_count < self.failure_threshold:
@@ -64,8 +64,15 @@ class EmailSyncCircuitBreaker:
         if self.failure_count >= self.failure_threshold:
             logger.warning(f"🚨 Email sync circuit breaker: OPENED after {self.failure_count} failures. Will retry in {self.recovery_timeout} seconds")
 
-# Global circuit breaker instance
 email_sync_circuit_breaker = EmailSyncCircuitBreaker()
+
+def reset_email_sync_circuit_breaker():
+    """🚑 EMERGENCY: Reset circuit breaker to allow email processing"""
+    global email_sync_circuit_breaker
+    email_sync_circuit_breaker.failure_count = 0
+    email_sync_circuit_breaker.last_failure_time = None
+    logger.info("🚑 EMERGENCY RESET: Email sync circuit breaker has been manually reset")
+    return {"status": "success", "message": "Circuit breaker reset successfully"}
 
 
 def sync_emails_job():
@@ -292,20 +299,18 @@ def weekly_agent_summary_job():
     db = None
     
     try:
-        # Check if it's Friday (weekday 4 = Friday, 0 = Monday) in ET timezone
+
         import pytz
         et_timezone = pytz.timezone("America/New_York")
         now_et = datetime.now(et_timezone)
         
-        if now_et.weekday() != 4:  # Not Friday
+        if now_et.weekday() != 4:  
             logger.info(f"Today is not Friday (weekday: {now_et.weekday()}) in ET, skipping weekly summary")
             return
-        
-        # Check if it's approximately 3pm ET (15:00)
+
         current_hour_et = now_et.hour
         current_minute_et = now_et.minute
-        
-        # Allow 3-4pm ET range for flexibility (15:00-15:59)
+
         if current_hour_et != 15:
             logger.info(f"Current time {current_hour_et}:{current_minute_et:02d} ET is not 3pm hour, skipping weekly summary")
             return
@@ -446,7 +451,7 @@ def start_scheduler():
         logger.warning("❌ Schedule library is not available. Email synchronization scheduler will not run.")
         logger.warning("💡 Install with: pip install schedule")
         return
-    sync_frequency = getattr(settings, 'EMAIL_SYNC_FREQUENCY_SECONDS', 120)
+    sync_frequency = getattr(settings, 'EMAIL_SYNC_FREQUENCY_SECONDS', 180)  # 🚑 UPDATED: Default to 3 minutes
     schedule.every(sync_frequency).seconds.do(sync_emails_job)  
     schedule.every(3).hours.do(refresh_tokens_job)  
     schedule.every(30).minutes.do(cleanup_orphaned_connections)
@@ -454,8 +459,7 @@ def start_scheduler():
     schedule.every().hour.do(weekly_agent_summary_job)
     schedule.every().hour.do(daily_outstanding_tasks_job)
     schedule.every().hour.do(weekly_manager_summaries_job)
-    
-    # Run in a separate thread with better error handling
+
     def run_scheduler():
         while True:
             try:
@@ -495,8 +499,6 @@ def weekly_manager_summaries_job():
 
         if current_time.weekday() == 4 and 16 <= current_time.hour < 17:
             logger.info("✅ Running weekly manager summaries (Friday 4pm ET)")
-            
-            # Create new event loop for async processing
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
