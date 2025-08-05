@@ -10,7 +10,7 @@ WorkspaceRef = ForwardRef("Workspace")
 class UserBase(BaseModel):
     name: str
     email: EmailStr
-    avatar_url: Optional[str] = None  # URL del avatar del usuario
+    avatar_url: Optional[str] = None 
     phone: Optional[str] = None
 
 
@@ -22,15 +22,14 @@ class UserCreate(UserBase):
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    avatar_url: Optional[str] = None  # Permitir actualizar avatar del usuario
+    avatar_url: Optional[str] = None  
     phone: Optional[str] = None
-    company_id: Optional[int] = None # Allow updating company_id (set to None to unassign)
+    company_id: Optional[int] = None 
 
 
 class UserInDBBase(UserBase):
     id: int
     company_id: Optional[int] = None
-    # Allow workspace_id to be None to match potential DB values
     workspace_id: Optional[int] = None 
     created_at: datetime
     updated_at: datetime
@@ -50,8 +49,6 @@ class UserWithDetails(User):
     class Config:
         from_attributes = True
 
-
-# UnassignedUser schemas
 class UnassignedUserBase(BaseModel):
     name: str
     email: EmailStr
@@ -74,8 +71,6 @@ class UnassignedUserInDBBase(UnassignedUserBase):
 class UnassignedUser(UnassignedUserInDBBase):
     pass
 
-
-# Update forward references
 from app.schemas.company import Company
 from app.schemas.workspace import Workspace
 
