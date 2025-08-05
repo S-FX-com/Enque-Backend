@@ -3,6 +3,7 @@ import orjson
 import asyncio
 import requests
 import urllib.parse
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Union
 from sqlalchemy.orm import Session, joinedload
@@ -2382,14 +2383,7 @@ class MicrosoftGraphService:
         # If contact hasn't changed, proceed with normal reply logic
         logger.info(f"[REPLY EMAIL] 📧 Contact unchanged, sending normal reply to {original_sender_email}")
         
-        # NUEVO: Si no se proporcionan CC recipients específicos, usar los CC del ticket original
-        if not cc_recipients and task.cc_recipients:
-            cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
-            logger.info(f"Using original ticket CC recipients: {cc_recipients}")
-        elif cc_recipients:
-            logger.info(f"Using provided CC recipients: {cc_recipients}")
-        else:
-            logger.info("No CC recipients for this reply")
+        # 🔧 NOTA: CC recipients se procesarán después de obtener original_message_id
         
         # Verificar que el token de aplicación (client credentials) no tiene permisos para acceder a mailboxes específicos
         # Necesitamos usar el token delegado del usuario que configuró este mailbox
@@ -2434,6 +2428,86 @@ class MicrosoftGraphService:
         # Usar el primer mapping como referencia principal
         email_mapping = email_mappings[0]
         original_message_id = email_mapping.email_id
+        
+        # 🔧 MEJORADO: Preservar CC recipients del email original en la cadena
+        if not cc_recipients:
+            # Primero intentar obtener CC recipients del email original
+            original_cc_recipients = []
+            try:
+                # Obtener el mensaje original para extraer CC recipients
+                message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}"
+                headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
+                
+                response = requests.get(message_endpoint, headers=headers)
+                if response.status_code == 200:
+                    message_data = response.json()
+                    cc_recipients_data = message_data.get("ccRecipients", [])
+                    
+                    # Extraer direcciones de email de los CC recipients originales
+                    for cc_recipient in cc_recipients_data:
+                        email_address = cc_recipient.get("emailAddress", {}).get("address")
+                        if email_address:
+                            original_cc_recipients.append(email_address)
+                    
+                    if original_cc_recipients:
+                        logger.info(f"Found {len(original_cc_recipients)} CC recipients from original email: {original_cc_recipients}")
+                else:
+                    logger.warning(f"Could not fetch original message for CC recipients. Status: {response.status_code}")
+            except Exception as cc_error:
+                logger.error(f"Error fetching original CC recipients: {str(cc_error)}")
+            
+            # Combinar CC recipients originales con los del ticket
+            cc_recipients = original_cc_recipients.copy()
+            if task.cc_recipients:
+                ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
+                # Agregar CC recipients del ticket que no estén ya en la lista
+                for ticket_cc in ticket_cc_recipients:
+                    if ticket_cc not in cc_recipients:
+                        cc_recipients.append(ticket_cc)
+                logger.info(f"Added {len(ticket_cc_recipients)} CC recipients from ticket: {ticket_cc_recipients}")
+            
+            if cc_recipients:
+                logger.info(f"Final CC recipients list ({len(cc_recipients)}): {cc_recipients}")
+            else:
+                logger.info("No CC recipients found for this reply")
+        else:
+            logger.info(f"Using provided CC recipients: {cc_recipients}")
+        
+        # 🧹 LIMPIAR formato de CC recipients antes de enviar a Microsoft Graph
+        if cc_recipients:
+            cleaned_cc_recipients = []
+            for cc_email in cc_recipients:
+                # Extraer solo la dirección de email, manejando varios formatos:
+                # - "email@domain.com"
+                # - "Name <email@domain.com>"  
+                # - "email@domain.com <email@domain.com>" (formato duplicado)
+                
+                cleaned_email = cc_email.strip()
+                
+                # Si contiene <>, extraer el contenido
+                email_match = re.search(r'<([^>]+)>', cleaned_email)
+                if email_match:
+                    cleaned_email = email_match.group(1).strip()
+                
+                # Si aún contiene espacios, tomar solo la primera parte que parece email
+                if ' ' in cleaned_email:
+                    # Buscar la primera dirección de email válida en la cadena
+                    email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+                    email_matches = re.findall(email_pattern, cleaned_email)
+                    if email_matches:
+                        cleaned_email = email_matches[0]
+                
+                # Validar que sea un email válido y no esté duplicado
+                if cleaned_email and '@' in cleaned_email and '.' in cleaned_email and cleaned_email not in cleaned_cc_recipients:
+                    # Validación adicional con regex
+                    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+                    if re.match(email_pattern, cleaned_email):
+                        cleaned_cc_recipients.append(cleaned_email)
+                    else:
+                        logger.warning(f"Invalid email format after cleaning: {cleaned_email} (original: {cc_email})")
+            
+            cc_recipients = cleaned_cc_recipients
+            logger.info(f"Cleaned CC recipients for Microsoft Graph: {cc_recipients}")
         
         # Validar que el ticket esté asociado correctamente con el mailbox
         if not self._validate_ticket_mailbox_association(task, mailbox_connection, email_mapping):
@@ -2976,8 +3050,43 @@ class MicrosoftGraphService:
         
         # Add CC recipients if provided
         if cc_recipients:
-            email_payload["message"]["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
-            logger.info(f"Including {len(cc_recipients)} CC recipients in new email: {cc_recipients}")
+            # 🧹 LIMPIAR formato de CC recipients antes de enviar a Microsoft Graph
+            cleaned_cc_recipients = []
+            for cc_email in cc_recipients:
+                # Extraer solo la dirección de email, manejando varios formatos:
+                # - "email@domain.com"
+                # - "Name <email@domain.com>"  
+                # - "S-FX.com Devs <dev@s-fx.com>" (formato con espacios)
+                
+                cleaned_email = cc_email.strip()
+                
+                # Si contiene <>, extraer el contenido
+                email_match = re.search(r'<([^>]+)>', cleaned_email)
+                if email_match:
+                    cleaned_email = email_match.group(1).strip()
+                
+                # Si aún contiene espacios, tomar solo la primera parte que parece email
+                if ' ' in cleaned_email:
+                    # Buscar la primera dirección de email válida en la cadena
+                    email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+                    email_matches = re.findall(email_pattern, cleaned_email)
+                    if email_matches:
+                        cleaned_email = email_matches[0]
+                
+                # Validar que sea un email válido y no esté duplicado
+                if cleaned_email and '@' in cleaned_email and '.' in cleaned_email and cleaned_email not in cleaned_cc_recipients:
+                    # Validación adicional con regex
+                    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+                    if re.match(email_pattern, cleaned_email):
+                        cleaned_cc_recipients.append(cleaned_email)
+                    else:
+                        logger.warning(f"Invalid email format after cleaning: {cleaned_email} (original: {cc_email})")
+            
+            if cleaned_cc_recipients:
+                email_payload["message"]["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cleaned_cc_recipients]
+                logger.info(f"Including {len(cleaned_cc_recipients)} cleaned CC recipients in new email: {cleaned_cc_recipients}")
+            else:
+                logger.warning("No valid CC recipients after cleaning")
         
         # Add BCC recipients if provided
         if bcc_recipients:

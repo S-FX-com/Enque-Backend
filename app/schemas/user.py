@@ -10,6 +10,7 @@ WorkspaceRef = ForwardRef("Workspace")
 class UserBase(BaseModel):
     name: str
     email: EmailStr
+    avatar_url: Optional[str] = None  # URL del avatar del usuario
     phone: Optional[str] = None
 
 
@@ -21,6 +22,7 @@ class UserCreate(UserBase):
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
+    avatar_url: Optional[str] = None  # Permitir actualizar avatar del usuario
     phone: Optional[str] = None
     company_id: Optional[int] = None # Allow updating company_id (set to None to unassign)
 
