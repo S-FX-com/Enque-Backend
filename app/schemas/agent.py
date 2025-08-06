@@ -12,7 +12,7 @@ class AgentBase(BaseModel):
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
-    avatar_url: Optional[str] = None  # URL del avatar del agente
+    avatar_url: Optional[str] = None  
 
     @validator("role")
     def validate_role(cls, v):

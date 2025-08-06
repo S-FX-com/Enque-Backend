@@ -2,6 +2,7 @@ from typing import Any, List, Dict
 from datetime import datetime 
 import asyncio
 import base64
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload 
@@ -612,29 +613,47 @@ async def create_comment(
         joinedload(TaskModel.user)
     ).filter(TaskModel.id == task_id).first()
 
-    # Load the comment with agent details
     comment_with_agent = db.query(CommentModel).options(
         joinedload(CommentModel.agent),
         joinedload(CommentModel.attachments)
     ).filter(CommentModel.id == comment.id).first()
 
-    # Prepare response with workflow information
     response_data = CommentResponseModel(
         comment=comment_with_agent,
         task=task_with_details,
         assignee_changed=assignee_changed
     )
+
+    def get_avatar_url(sender_type: str, agent=None, user=None):
+
+        if sender_type == "agent" and agent and agent.avatar_url:
+            return agent.avatar_url
+        elif sender_type == "user":
+            if user and user.avatar_url:
+                return user.avatar_url
+            elif user and user.company and user.company.logo_url:
+                return user.company.logo_url
+        return None
     
     try:
+        task_user = db.query(User).options(
+            joinedload(User.company)
+        ).filter(User.id == task.user_id).first()
+        
         comment_data = {
             'id': comment.id,
             'ticket_id': task_id,
             'agent_id': current_user.id,
             'agent_name': current_user.name,
             'agent_email': current_user.email,
-            'content': comment_in.content,  # ✅ Enviar contenido completo para reemplazo perfecto
-            'other_destinaries': comment_in.other_destinaries,  # Include CC info
-            'bcc_recipients': comment_in.bcc_recipients,        # Include BCC info
+            'agent_avatar': get_avatar_url("agent", agent=current_user),  
+            'user_id': task.user_id,
+            'user_name': task_user.name if task_user else None,
+            'user_email': task_user.email if task_user else None,
+            'user_avatar': get_avatar_url("user", user=task_user),  
+            'content': comment_in.content, 
+            'other_destinaries': comment_in.other_destinaries, 
+            'bcc_recipients': comment_in.bcc_recipients,
             'is_private': comment_in.is_private,
             'created_at': comment.created_at.isoformat() if comment.created_at else None,
             'attachments': [

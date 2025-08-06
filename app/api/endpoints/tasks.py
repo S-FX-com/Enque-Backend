@@ -704,12 +704,9 @@ def get_task_initial_content(
         ).order_by(CommentModel.created_at.asc()).first()
 
         if not initial_comment:
-            # No comments found, return empty or fallback content
             fallback_content = task.description or task.body.email_body if task.body else ""
             if fallback_content and fallback_content.startswith('[MIGRATED_TO_S3]'):
-                # Clean the migrated message
                 clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
-                # Remove the URL part
                 import re
                 clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
                 fallback_content = clean_content or "Content not available"
@@ -719,8 +716,6 @@ def get_task_initial_content(
                 "content": fallback_content or "No initial content found",
                 "message": "No initial comment found for this ticket"
             }
-
-        # Check if initial comment has S3 content
         if not initial_comment.s3_html_url:
             return {
                 "status": "content_in_database",
@@ -749,17 +744,13 @@ def get_task_initial_content(
                 "content": fallback_content,
                 "message": "Failed to retrieve from S3, showing database content"
             }
-
-        # Process S3 content for images and attachments
         try:
-            # Process images if needed (similar to comment S3 processing)
             from app.services.microsoft_service import MicrosoftGraphService
             from app.utils.image_processor import extract_base64_images
             
             ms_service = MicrosoftGraphService(db)
             processed_content = s3_content
-            
-            # Process base64 images that might be in the content
+
             final_content, extracted_images = extract_base64_images(processed_content, task.id)
             
             if extracted_images:
@@ -788,13 +779,12 @@ def get_ticket_html_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get complete ticket HTML content directly from S3 URLs stored in comments.
-    This is MUCH simpler - just reads the s3_html_url field and fetches from S3.
-    """
+
     try:
         # Verify the task exists and user has access
-        task = db.query(Task).filter(
+        task = db.query(Task).options(
+            joinedload(Task.user).joinedload(User.company)
+        ).filter(
             Task.id == task_id,
             Task.workspace_id == current_user.workspace_id,
             Task.is_deleted == False
@@ -808,10 +798,20 @@ def get_ticket_html_content(
 
         from app.models.comment import Comment as CommentModel
         from app.services.s3_service import get_s3_service
+
+        
+        def get_avatar_url(sender_type: str, agent=None, user=None):
+            if sender_type == "agent" and agent and agent.avatar_url:
+                return agent.avatar_url
+            elif sender_type == "user":
+                if user and user.avatar_url:
+                    return user.avatar_url
+                elif user and user.company and user.company.logo_url:
+                    return user.company.logo_url
+            return None
         
         s3_service = get_s3_service()
-        
-        # Get all comments with their S3 URLs, ordered by creation date
+
         comments = db.query(CommentModel).options(
             joinedload(CommentModel.agent),
             joinedload(CommentModel.attachments)
@@ -821,30 +821,35 @@ def get_ticket_html_content(
 
         # Prepare results
         html_contents = []
-        
-        # 1. Handle initial ticket content (first comment or ticket description)
+
         initial_content = None
         initial_sender = None
-        
-        # Check if we have comments first - initial content is usually the first comment
+
         if comments and comments[0].s3_html_url:
-            # First comment has S3 content - this is the initial message
             try:
                 s3_content = s3_service.get_comment_html(comments[0].s3_html_url)
                 if s3_content:
                     initial_content = s3_content
-                    
-                    # ✅ EXTRACT ORIGINAL-SENDER INFORMATION (like frontend used to do)
                     import re
                     original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', s3_content)
                     
                     if original_sender_match:
-                        # Es un mensaje de usuario con información extraída
+                        user_name = original_sender_match.group(1).strip()
+                        user_email = original_sender_match.group(2).strip()
+
+                        user = db.query(User).options(
+                            joinedload(User.company)
+                        ).filter(
+                            User.email == user_email,
+                            User.workspace_id == current_user.workspace_id
+                        ).first()
+                        
                         initial_sender = {
                             "type": "user", 
-                            "name": original_sender_match.group(1).strip(),
-                            "email": original_sender_match.group(2).strip(),
-                            "created_at": comments[0].created_at
+                            "name": user_name,
+                            "email": user_email,
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("user", user=user)
                         }
                     elif comments[0].agent:
                         # Es un mensaje de agente real
@@ -852,7 +857,8 @@ def get_ticket_html_content(
                             "type": "agent", 
                             "name": comments[0].agent.name,
                             "email": comments[0].agent.email,
-                            "created_at": comments[0].created_at
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("agent", agent=comments[0].agent)
                         }
             except Exception as e:
                 logger.warning(f"Failed to get initial S3 content: {e}")
@@ -869,7 +875,8 @@ def get_ticket_html_content(
                     "type": "user",
                     "name": task.user.name if task.user else "Unknown User",
                     "email": task.user.email if task.user else "unknown",
-                    "created_at": task.created_at
+                    "created_at": task.created_at,
+                    "avatar_url": get_avatar_url("user", user=task.user)
                 }
 
         if initial_content:
@@ -958,25 +965,39 @@ def get_ticket_html_content(
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             
             if original_sender_match:
+                user_name = original_sender_match.group(1).strip()
+                user_email = original_sender_match.group(2).strip()
+                
+                # Try to find the user by email to get avatar_url
+                user = db.query(User).options(
+                    joinedload(User.company)
+                ).filter(
+                    User.email == user_email,
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+                
                 sender = {
                     "type": "user",
-                    "name": original_sender_match.group(1).strip(),
-                    "email": original_sender_match.group(2).strip(),
-                    "created_at": comment.created_at
+                    "name": user_name,
+                    "email": user_email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("user", user=user)
                 }
             elif comment.agent:
                 sender = {
                     "type": "agent",
                     "name": comment.agent.name,
                     "email": comment.agent.email,
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("agent", agent=comment.agent)
                 }
             else:
                 sender = {
                     "type": "unknown",
                     "name": "Unknown",
                     "email": "unknown",
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": None
                 }
 
             attachments = []
