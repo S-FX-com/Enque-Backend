@@ -8,6 +8,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     name = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, unique=True, index=True)
+    avatar_url = Column(String(500), nullable=True)  # URL del avatar del usuario
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
     phone = Column(String(50), nullable=True)

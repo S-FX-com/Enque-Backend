@@ -549,7 +549,9 @@ def get_ticket_html_content(
 ):
 
     try:
-        task = db.query(Task).filter(
+        task = db.query(Task).options(
+            joinedload(Task.user).joinedload(User.company)
+        ).filter(
             Task.id == task_id,
             Task.workspace_id == current_user.workspace_id,
             Task.is_deleted == False
@@ -561,6 +563,18 @@ def get_ticket_html_content(
             )
         from app.models.comment import Comment as CommentModel
         from app.services.s3_service import get_s3_service
+
+        
+        def get_avatar_url(sender_type: str, agent=None, user=None):
+            if sender_type == "agent" and agent and agent.avatar_url:
+                return agent.avatar_url
+            elif sender_type == "user":
+                if user and user.avatar_url:
+                    return user.avatar_url
+                elif user and user.company and user.company.logo_url:
+                    return user.company.logo_url
+            return None
+        
         s3_service = get_s3_service()
         comments = db.query(CommentModel).options(
             selectinload(CommentModel.agent),
@@ -673,25 +687,37 @@ def get_ticket_html_content(
             import re
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             if original_sender_match:
+                user_name = original_sender_match.group(1).strip()
+                user_email = original_sender_match.group(2).strip()
+                user = db.query(User).options(
+                    joinedload(User.company)
+                ).filter(
+                    User.email == user_email,
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+                
                 sender = {
                     "type": "user",
-                    "name": original_sender_match.group(1).strip(),
-                    "email": original_sender_match.group(2).strip(),
-                    "created_at": comment.created_at
+                    "name": user_name,
+                    "email": user_email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("user", user=user)
                 }
             elif comment.agent:
                 sender = {
                     "type": "agent",
                     "name": comment.agent.name,
                     "email": comment.agent.email,
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("agent", agent=comment.agent)
                 }
             else:
                 sender = {
                     "type": "unknown",
                     "name": "Unknown",
                     "email": "unknown",
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": None
                 }
             attachments = []
             if comment.attachments:
