@@ -2400,7 +2400,7 @@ class MicrosoftGraphService:
             else:
                 logger.info("No CC recipients found for this reply")
         else:
-            logger.info(f"Using provided CC recipients: {cc_recipients}")
+            logger.info(f"✅ Using provided CC recipients: {cc_recipients}")
         if cc_recipients:
             cleaned_cc_recipients = []
             for cc_email in cc_recipients:
@@ -2422,7 +2422,7 @@ class MicrosoftGraphService:
                         logger.warning(f"Invalid email format after cleaning: {cleaned_email} (original: {cc_email})")
             
             cc_recipients = cleaned_cc_recipients
-            logger.info(f"Cleaned CC recipients for Microsoft Graph: {cc_recipients}")
+            logger.info(f"✅ Cleaned CC recipients for Microsoft Graph: {cc_recipients}")
         if not self._validate_ticket_mailbox_association(task, mailbox_connection, email_mapping):
             return False
         
@@ -2714,26 +2714,52 @@ class MicrosoftGraphService:
                 }
                 
                 # Add In-Reply-To and References headers if we have the internet message ID
-                if task.email_internet_message_id:
-                    update_payload["internetMessageHeaders"] = [
-                        {
-                            "name": "In-Reply-To",
-                            "value": task.email_internet_message_id
-                        },
-                        {
-                            "name": "References",
-                            "value": task.email_internet_message_id
-                        }
-                    ]
+                # Note: Some Microsoft Graph configurations don't support custom headers in drafts
+                try:
+                    if task.email_internet_message_id:
+                        update_payload["internetMessageHeaders"] = [
+                            {
+                                "name": "In-Reply-To",
+                                "value": task.email_internet_message_id
+                            },
+                            {
+                                "name": "References",
+                                "value": task.email_internet_message_id
+                            }
+                        ]
+                        logger.debug(f"Added email history headers for task {task_id}")
+                except Exception as header_error:
+                    logger.warning(f"Could not add email history headers: {header_error}")
 
                 if cc_recipients:
-                    update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
+                    # Clean CC recipients before adding to payload
+                    cleaned_cc_recipients = []
+                    for cc_email in cc_recipients:
+                        cleaned_email = self._clean_email_address(cc_email)
+                        if cleaned_email and "@" in cleaned_email and "." in cleaned_email:
+                            cleaned_cc_recipients.append(cleaned_email)
+                        else:
+                            logger.warning(f"Invalid CC email format after cleaning: {cleaned_email} (original: {cc_email})")
+                    
+                    if cleaned_cc_recipients:
+                        update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cleaned_cc_recipients]
+                        logger.info(f"Added {len(cleaned_cc_recipients)} cleaned CC recipients to draft: {cleaned_cc_recipients}")
+                    else:
+                        logger.warning("No valid CC recipients after cleaning for draft update")
                 
                 if bcc_recipients:
                     update_payload["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
                 
                 update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
+                logger.debug(f"📧 Updating draft {draft_id} with payload: {update_payload}")
                 response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
+                
+                # If the update fails with 400, try without internetMessageHeaders
+                if response.status_code == 400 and "internetMessageHeaders" in update_payload:
+                    logger.warning(f"⚠️ Draft update failed with 400, retrying without internetMessageHeaders for task {task_id}")
+                    update_payload_fallback = update_payload.copy()
+                    del update_payload_fallback["internetMessageHeaders"]
+                    response = requests.patch(update_message_endpoint, headers=headers, json=update_payload_fallback)
                 if response.status_code not in [200, 201, 202]:
                     error_details = "No details available"
                     try: error_details = response.json()
@@ -2833,26 +2859,53 @@ class MicrosoftGraphService:
                     }
                     
                     # Add In-Reply-To and References headers if we have the internet message ID
-                    if task.email_internet_message_id:
-                        update_payload["internetMessageHeaders"] = [
-                            {
-                                "name": "In-Reply-To",
-                                "value": task.email_internet_message_id
-                            },
-                            {
-                                "name": "References",
-                                "value": task.email_internet_message_id
-                            }
-                        ]
+                    # Note: Some Microsoft Graph configurations don't support custom headers in drafts
+                    try:
+                        if task.email_internet_message_id:
+                            update_payload["internetMessageHeaders"] = [
+                                {
+                                    "name": "In-Reply-To",
+                                    "value": task.email_internet_message_id
+                                },
+                                {
+                                    "name": "References",
+                                    "value": task.email_internet_message_id
+                                }
+                            ]
+                            logger.debug(f"Added email history headers for task {task_id}")
+                    except Exception as header_error:
+                        logger.warning(f"Could not add email history headers: {header_error}")
 
                     if cc_recipients:
-                        update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
+                        # Clean CC recipients before adding to payload
+                        cleaned_cc_recipients = []
+                        for cc_email in cc_recipients:
+                            cleaned_email = self._clean_email_address(cc_email)
+                            if cleaned_email and "@" in cleaned_email and "." in cleaned_email:
+                                cleaned_cc_recipients.append(cleaned_email)
+                            else:
+                                logger.warning(f"Invalid CC email format after cleaning: {cleaned_email} (original: {cc_email})")
+                        
+                        if cleaned_cc_recipients:
+                            update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cleaned_cc_recipients]
+                            logger.info(f"Added {len(cleaned_cc_recipients)} cleaned CC recipients to draft: {cleaned_cc_recipients}")
+                        else:
+                            logger.warning("No valid CC recipients after cleaning for draft update")
                     
                     if bcc_recipients:
                         update_payload["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
                     
                     update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
+                    logger.debug(f"📧 Updating draft {draft_id} with payload: {update_payload}")
                     response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
+                    
+                    # If the update fails with 400, try without internetMessageHeaders
+                    if response.status_code == 400 and "internetMessageHeaders" in update_payload:
+                        logger.warning(f"⚠️ Draft update failed with 400, retrying without internetMessageHeaders for task {task_id}")
+                        update_payload_fallback = update_payload.copy()
+                        del update_payload_fallback["internetMessageHeaders"]
+                        response = requests.patch(update_message_endpoint, headers=headers, json=update_payload_fallback)
+                    
                     response.raise_for_status()
                     
                     # Send the modified message
@@ -2869,7 +2922,8 @@ class MicrosoftGraphService:
                     except ValueError: error_details = e.response.text
                 
                 # If something fails with our approach, fall back to simple reply
-                logger.warning(f"Failed custom reply approach for task {task_id}. Status Code: {status_code}. Falling back to simple reply.")
+                logger.error(f"❌ Failed custom reply approach for task {task_id}. Status Code: {status_code}. Error Details: {error_details}")
+                logger.warning(f"🔄 Falling back to simple reply (without CC recipients) for task {task_id}.")
                 try:
                     reply_payload = {"comment": html_body}
                     reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
