@@ -19,13 +19,11 @@ class ScheduledComment(Base):
     ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False, index=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
-    
-    # Content fields
     content = Column(Text, nullable=False)
     is_private = Column(Boolean, default=False, nullable=False)
-    other_destinaries = Column(Text, nullable=True)  # CC recipients
-    bcc_recipients = Column(Text, nullable=True)     # BCC recipients
-    attachment_ids = Column(JSON, nullable=True)     # Array of attachment IDs
+    other_destinaries = Column(Text, nullable=True)  
+    bcc_recipients = Column(Text, nullable=True)     
+    attachment_ids = Column(JSON, nullable=True)     
     
     # Scheduling fields
     scheduled_send_at = Column(DateTime(timezone=False), nullable=False, index=True)

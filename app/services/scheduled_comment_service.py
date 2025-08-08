@@ -34,10 +34,8 @@ async def get_content_from_s3_if_needed(content: str, scheduled_comment_id: int)
         return content
     
     logger.info(f"🔍 Content for scheduled comment {scheduled_comment_id} is migrated to S3, extracting...")
-    
-    # Extract S3 URL and fetch content
+
     import re
-    # Look for S3 URLs ending in .html
     s3_url_match = re.search(r'https://[^\s]+\.html', content)
     if not s3_url_match:
         logger.warning(f"⚠️ No S3 URL found in migrated content for scheduled comment {scheduled_comment_id}")
@@ -61,18 +59,7 @@ async def get_content_from_s3_if_needed(content: str, scheduled_comment_id: int)
 
 
 async def send_scheduled_comment(scheduled_comment_id: int, db: Session) -> Dict[str, Any]:
-    """
-    Convert a scheduled comment to a regular comment and send it.
-    
-    Args:
-        scheduled_comment_id: ID of the scheduled comment to send
-        db: Database session
-    
-    Returns:
-        Dict with success status and comment_id or error message
-    """
     try:
-        # Get the scheduled comment with all relationships
         scheduled_comment = db.query(ScheduledComment).options(
             joinedload(ScheduledComment.ticket),
             joinedload(ScheduledComment.agent)
@@ -83,18 +70,12 @@ async def send_scheduled_comment(scheduled_comment_id: int, db: Session) -> Dict
         
         if not scheduled_comment:
             return {"success": False, "error": "Scheduled comment not found or already processed"}
-        
-        # Get task details
         task = scheduled_comment.ticket
         agent = scheduled_comment.agent
         
         if not task or not agent:
             return {"success": False, "error": "Associated task or agent not found"}
-        
-        # Get the actual content from S3 if needed for the comment
         content_for_comment = await get_content_from_s3_if_needed(scheduled_comment.content, scheduled_comment.id)
-        
-        # Create the regular comment
         comment = CommentModel(
             ticket_id=scheduled_comment.ticket_id,
             agent_id=scheduled_comment.agent_id,
@@ -106,17 +87,10 @@ async def send_scheduled_comment(scheduled_comment_id: int, db: Session) -> Dict
         )
         
         db.add(comment)
-        
-        # Process attachments if any
         if scheduled_comment.attachment_ids:
-            # Import here to avoid circular imports
             from app.models.ticket_attachment import TicketAttachment
-            
-            # First commit to get the comment ID
             db.commit()
             db.refresh(comment)
-            
-            # Associate attachments
             for attachment_id in scheduled_comment.attachment_ids:
                 attachment = db.query(TicketAttachment).filter(
                     TicketAttachment.id == attachment_id
@@ -125,30 +99,19 @@ async def send_scheduled_comment(scheduled_comment_id: int, db: Session) -> Dict
                 if attachment:
                     attachment.comment_id = comment.id
                     db.add(attachment)
-        
-        # Update scheduled comment status
         scheduled_comment.status = ScheduledCommentStatus.SENT.value
         scheduled_comment.sent_at = datetime.now(timezone.utc)
         scheduled_comment.updated_at = datetime.now(timezone.utc)
         db.add(scheduled_comment)
-        
-        # Update task's last_update timestamp
         task.last_update = datetime.now(timezone.utc)
         db.add(task)
-        
-        # Commit all changes
         db.commit()
         db.refresh(comment)
-        
-        # Send email if not private
         if not scheduled_comment.is_private:
             try:
                 await send_scheduled_comment_email(scheduled_comment, comment, db)
             except Exception as e:
                 logger.error(f"❌ Failed to send email for scheduled comment {scheduled_comment_id}: {str(e)}")
-                # Don't fail the entire operation if email fails
-        
-        # Emit Socket.IO event for real-time updates
         try:
             await emit_scheduled_comment_sent_event(scheduled_comment, comment, db)
         except Exception as e:
@@ -185,11 +148,7 @@ async def send_scheduled_comment_email(
     comment: CommentModel, 
     db: Session
 ) -> None:
-    """
-    Send email for a scheduled comment that was just converted to a regular comment.
-    """
     try:
-        # Get task and user details
         task = db.query(TaskModel).options(
             joinedload(TaskModel.user)
         ).filter(TaskModel.id == scheduled_comment.ticket_id).first()
@@ -203,14 +162,8 @@ async def send_scheduled_comment_email(
         if not ms_service:
             logger.warning(f"⚠️ Microsoft service not available for scheduled comment {scheduled_comment.id}")
             return
-        
-        # Send the email using the same logic as regular comments
-        # Get the actual content from S3 if needed
         content_to_send = await get_content_from_s3_if_needed(scheduled_comment.content, scheduled_comment.id)
-        
-        # Check if task has mailbox connection (originated from email)
         if task.mailbox_connection_id:
-            # Task originated from email, send a reply
             logger.info(f"📧 Sending reply email for scheduled comment {scheduled_comment.id}")
             ms_service.send_reply_email(
                 task_id=scheduled_comment.ticket_id,
@@ -227,8 +180,6 @@ async def send_scheduled_comment_email(
                 return
             
             recipient_email = task.user.email
-            
-            # Find an active mailbox for the workspace to send from
             from app.models.microsoft import MailboxConnection
             sender_mailbox_conn = db.query(MailboxConnection).filter(
                 MailboxConnection.workspace_id == scheduled_comment.workspace_id,
@@ -273,9 +224,6 @@ async def emit_scheduled_comment_sent_event(
     comment: CommentModel, 
     db: Session
 ) -> None:
-    """
-    Emit Socket.IO event for a scheduled comment that was just sent.
-    """
     try:
         # Get task user with company relationship for avatar fallback
         task_user = db.query(User).options(
@@ -328,20 +276,8 @@ async def emit_scheduled_comment_sent_event(
 
 
 def get_pending_scheduled_comments(db: Session) -> List[ScheduledComment]:
-    """
-    Get all scheduled comments that are ready to be sent.
-    
-    Args:
-        db: Database session
-    
-    Returns:
-        List of ScheduledComment objects ready to be sent
-    """
-    # Use Eastern Time (Nueva Jersey timezone)
     eastern = pytz.timezone('US/Eastern')
     now_et = datetime.now(eastern)
-    
-    # Convert to UTC for database comparison since scheduled_send_at is stored as naive UTC
     now_utc = now_et.astimezone(timezone.utc)
     # Convert to naive datetime for comparison with database
     now_utc_naive = now_utc.replace(tzinfo=None)
@@ -363,16 +299,6 @@ def get_pending_scheduled_comments(db: Session) -> List[ScheduledComment]:
 
 
 async def process_pending_scheduled_comments(db: Session) -> Dict[str, Any]:
-    """
-    Process all pending scheduled comments that are ready to be sent.
-    This function is called by the background job.
-    
-    Args:
-        db: Database session
-    
-    Returns:
-        Dict with processing statistics
-    """
     try:
         pending_comments = get_pending_scheduled_comments(db)
         

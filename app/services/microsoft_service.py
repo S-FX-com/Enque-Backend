@@ -1,4 +1,3 @@
-# ⚡ Optimized imports for performance
 import orjson  
 import asyncio
 import requests
@@ -51,10 +50,7 @@ from app.services.token_service import TokenService
 import boto3  
 
 class MicrosoftGraphService:
-    """Service for interacting with Microsoft Graph API"""
-
     def __init__(self, db: Session):
-        """Initialize the service with database session"""
         self.db = db
         self.integration = self._get_active_integration()
         self.has_env_config = bool(settings.MICROSOFT_CLIENT_ID and settings.MICROSOFT_CLIENT_SECRET and settings.MICROSOFT_TENANT_ID)
@@ -66,8 +62,6 @@ class MicrosoftGraphService:
 
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
-        
-        # ⚡ Initialize performance services
         self.tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
 
         if self.integration:
@@ -78,10 +72,8 @@ class MicrosoftGraphService:
             logger.warning("Microsoft service initialized without integration or environment variables")
 
     def _init_cache_if_needed(self):
-        """Initialize cache service if needed"""
         if PERFORMANCE_SERVICES_AVAILABLE:
             try:
-                # Try to initialize cache in sync context
                 import asyncio
                 try:
                     loop = asyncio.get_event_loop()
@@ -89,37 +81,27 @@ class MicrosoftGraphService:
                         loop.run_until_complete(cache_service.connect())
                         logger.info("🚀 Cache service connected for Microsoft Graph")
                 except RuntimeError:
-                    # No event loop, will use memory cache only
                     pass
             except Exception as e:
                 logger.warning(f"Cache initialization failed: {e}")
 
     def _get_active_integration(self) -> Optional[MicrosoftIntegration]:
-        """Get the active Microsoft integration"""
         return self.db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
 
     def _download_file_from_s3(self, s3_url: str) -> Optional[bytes]:
-        """Download file content from S3 URL"""
         try:
-            # Initialize S3 client (using hardcoded credentials for now)
             s3_client = boto3.client(
                 's3',
                 aws_access_key_id="AKIAQ3EGRIILJHGBQJOZ",
                 aws_secret_access_key="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",
                 region_name="us-east-2"
             )
-            
-            # Extract bucket and key from S3 URL
-            # Format: https://enque.s3.us-east-2.amazonaws.com/path/to/file
             parts = s3_url.replace("https://", "").split("/", 1)
             if len(parts) < 2:
                 logger.error(f"Invalid S3 URL format: {s3_url}")
-                return None
-                
-            bucket_name = parts[0].split(".")[0]  # Extract bucket name from hostname
-            s3_key = parts[1]  # Everything after first slash is the key
-            
-            # Download file from S3
+                return None               
+            bucket_name = parts[0].split(".")[0] 
+            s3_key = parts[1]  
             response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
             file_content = response['Body'].read()
             
@@ -130,7 +112,6 @@ class MicrosoftGraphService:
             return None
 
     def get_application_token(self) -> str:
-        """Get an application token using client credentials flow"""
         if self._app_token and self._app_token_expires_at > datetime.utcnow():
             return self._app_token
 
@@ -140,8 +121,6 @@ class MicrosoftGraphService:
         tenant_id = self.integration.tenant_id if self.integration else settings.MICROSOFT_TENANT_ID
         client_id = self.integration.client_id if self.integration else settings.MICROSOFT_CLIENT_ID
         client_secret = self.integration.client_secret if self.integration else settings.MICROSOFT_CLIENT_SECRET
-
-        # For application tokens, we still need to use the specific tenant endpoint
         token_endpoint = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
         data = {
             "client_id": client_id,
@@ -166,7 +145,7 @@ class MicrosoftGraphService:
         redirect_uri: Optional[str] = None,
         scopes: Optional[List[str]] = None,
         state: Optional[str] = None,
-        prompt: Optional[str] = "consent" # Default prompt
+        prompt: Optional[str] = "consent" 
     ) -> str:
         """Get the URL for Microsoft OAuth authentication flow, allowing custom redirect URI, scopes, state and prompt."""
         if not self.integration and not self.has_env_config:
@@ -182,8 +161,6 @@ class MicrosoftGraphService:
         default_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
         final_scopes = scopes if scopes else default_scopes
         scope_string = " ".join(final_scopes)
-        
-        # Use the common endpoint directly for multitenant support
         auth_endpoint = self.auth_url  # This is now already set to /common in config
         
         params = {
@@ -214,9 +191,7 @@ class MicrosoftGraphService:
             "client_id": client_id, "client_secret": client_secret, "code": code,
             "redirect_uri": correct_redirect_uri, "grant_type": "authorization_code"
         }
-        
-        # Use the common endpoint directly for multitenant support
-        token_endpoint = self.token_url  # This is now already set to /common in config
+        token_endpoint = self.token_url  
         try:
             response = requests.post(token_endpoint, data=data)
             response.raise_for_status()
@@ -228,8 +203,8 @@ class MicrosoftGraphService:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not get email address from Microsoft user info")
             workspace_id: Optional[int] = None
             agent_id: Optional[int] = None
-            connection_id: Optional[int] = None  # Added for reconnection flow
-            is_reconnect: bool = False  # Flag to indicate reconnection
+            connection_id: Optional[int] = None  
+            is_reconnect: bool = False  
             
             if state:
                 try:
@@ -239,8 +214,8 @@ class MicrosoftGraphService:
                     state_data = json.loads(decoded_state_json)
                     ws_id_str = state_data.get('workspace_id')
                     ag_id_str = state_data.get('agent_id')
-                    conn_id_str = state_data.get('connection_id')  # Extract connection_id from state
-                    is_reconnect_str = state_data.get('is_reconnect')  # Extract reconnect flag
+                    conn_id_str = state_data.get('connection_id')  
+                    is_reconnect_str = state_data.get('is_reconnect')  
                     
                     if ws_id_str: workspace_id = int(ws_id_str)
                     if ag_id_str: agent_id = int(ag_id_str)
@@ -268,11 +243,8 @@ class MicrosoftGraphService:
                     tenant_id=tenant_id, client_id=client_id, client_secret=client_secret,
                     redirect_uri=settings.MICROSOFT_REDIRECT_URI, scope=scope, is_active=True)
                 self.db.add(self.integration); self.db.commit(); self.db.refresh(self.integration)
-            
-            # For reconnections, find the existing mailbox connection by ID
             mailbox_connection = None
             if is_reconnect and connection_id:
-                # Find the existing mailbox connection
                 mailbox_connection = self.db.query(MailboxConnection).filter(
                     MailboxConnection.id == connection_id,
                     MailboxConnection.workspace_id == workspace_id
@@ -281,14 +253,10 @@ class MicrosoftGraphService:
                 if not mailbox_connection:
                     logger.error(f"Could not find mailbox connection with ID {connection_id} for workspace {workspace_id}")
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Mailbox connection with ID {connection_id} not found")
-                
-                # Update the connection with new email address if it changed
                 if mailbox_connection.email != mailbox_email:
                     logger.info(f"Updating email address for connection {connection_id} from {mailbox_connection.email} to {mailbox_email}")
                     mailbox_connection.email = mailbox_email
                     mailbox_connection.display_name = user_info.get("displayName", "Microsoft User")
-                
-                # Delete old token(s) associated with this connection
                 old_tokens = self.db.query(MicrosoftToken).filter(
                     MicrosoftToken.mailbox_connection_id == mailbox_connection.id
                 ).all()
@@ -300,7 +268,6 @@ class MicrosoftGraphService:
                 
                 self.db.commit()
             else:
-                # Normal flow - look for existing connection by email or create new one
                 mailbox_connection = self.db.query(MailboxConnection).filter(
                     MailboxConnection.email == mailbox_email, 
                     MailboxConnection.workspace_id == workspace.id
@@ -311,15 +278,11 @@ class MicrosoftGraphService:
                     email=mailbox_email, display_name=user_info.get("displayName", "Microsoft User"),
                     workspace_id=workspace.id, created_by_agent_id=current_agent.id, is_active=True)
                 self.db.add(mailbox_connection); self.db.commit(); self.db.refresh(mailbox_connection)
-            
-            # Create new token for the connection
             token = MicrosoftToken(
                 integration_id=self.integration.id, agent_id=current_agent.id, mailbox_connection_id=mailbox_connection.id,
                 access_token=token_data["access_token"], refresh_token=refresh_token_val, token_type=token_data["token_type"],
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"]))
             self.db.add(token); self.db.commit(); self.db.refresh(token)
-            
-            # Ensure there's a sync config for the connection
             existing_config = self.db.query(EmailSyncConfig).filter(
                 EmailSyncConfig.mailbox_connection_id == mailbox_connection.id, 
                 EmailSyncConfig.workspace_id == workspace.id
@@ -331,7 +294,6 @@ class MicrosoftGraphService:
                     sync_interval=1, default_priority="Medium", auto_assign=False, workspace_id=workspace.id, is_active=True)
                 self.db.add(new_config); self.db.commit()
             elif not existing_config.is_active:
-                # If reconnecting a connection with an inactive config, reactivate it
                 existing_config.is_active = True
                 self.db.add(existing_config); self.db.commit()
                 
@@ -359,9 +321,7 @@ class MicrosoftGraphService:
             "grant_type": "refresh_token",
             "scope": "offline_access Mail.Read Mail.ReadWrite Mail.Send User.Read" 
         }
-        
-        # Use the common endpoint directly for multitenant support
-        token_endpoint = self.token_url  # This is now already set to /common in config
+        token_endpoint = self.token_url  
         try:
             response = requests.post(token_endpoint, data=data)
             response.raise_for_status() 
@@ -412,9 +372,7 @@ class MicrosoftGraphService:
             "grant_type": "refresh_token",
             "scope": "offline_access Mail.Read Mail.ReadWrite Mail.Send User.Read"
         }
-        
-        # Use the common endpoint directly for multitenant support
-        token_endpoint = self.token_url  # This is now already set to /common in config
+        token_endpoint = self.token_url  
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(token_endpoint, data=data)
@@ -469,21 +427,16 @@ class MicrosoftGraphService:
     def _get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Legacy sync version - tries cache first, then calls API"""
         try:
-            # Try to use cached version in sync context
             if PERFORMANCE_SERVICES_AVAILABLE:
                 try:
-                    # Run async method in sync context
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
-                        # Create new task if loop is already running
                         task = asyncio.create_task(self._get_user_info_cached(access_token))
                         return asyncio.run_coroutine_threadsafe(task, loop).result(timeout=10)
                     else:
                         return loop.run_until_complete(self._get_user_info_cached(access_token))
                 except Exception as cache_error:
                     logger.warning(f"Cache failed, falling back to direct API: {cache_error}")
-            
-            # Fallback to direct API call
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
             response = requests.get(f"{self.graph_url}/me", headers=headers)
             response.raise_for_status()
@@ -501,7 +454,6 @@ class MicrosoftGraphService:
         processed_html = html_content
         
         try:
-            # 1. Primero, manejamos las imágenes CID (inline attachments)
             soup = BeautifulSoup(processed_html, 'html.parser')
             cid_map = {str(att.contentId): att for att in attachments if att.is_inline and att.contentId and att.contentBytes}
             
@@ -522,17 +474,12 @@ class MicrosoftGraphService:
                 if image_tags_updated > 0:
                     processed_html = str(soup)
                     logger.info(f"Processed HTML for {context}, updated {image_tags_updated} CID image tags.")
-        
-            # 2. Extraer el ID del ticket del contexto
             ticket_id = None
             if 'ticket' in context:
                 match = re.search(r'ticket\s+(\d+)', context)
                 if match:
                     ticket_id = int(match.group(1))
-            
-            # Si tenemos un ticket_id, procesamos las imágenes base64
             if ticket_id:
-                # Procesar y extraer todas las imágenes base64 incrustadas
                 processed_html, extracted_images = extract_base64_images(processed_html, ticket_id)
                 if extracted_images:
                     logger.info(f"Extracted {len(extracted_images)} base64 images from {context} for ticket {ticket_id}")
@@ -549,24 +496,17 @@ class MicrosoftGraphService:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
             return []
         try:
-            # Use user token instead of application token for multitenant support
             user_access_token = token.access_token
-            # Using user access token
-            
             emails = self.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, top=50, filter_unread=True)
             
             if not emails:
-                # No unread emails
                 sync_config.last_sync_time = datetime.utcnow(); self.db.commit(); return []
-            # Found unread emails
             created_tasks_count = 0; added_comments_count = 0
-            
-            # 🔧 REACTIVADO: Movimiento de emails con búsqueda mejorada para manejar cambios de Message ID
             processed_folder_id = self._get_or_create_processed_folder(user_access_token, user_email, "Enque Processed")
             if not processed_folder_id: 
                 logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
             else:
-                pass  # Folder ready for email processing
+                pass  
             system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
             
@@ -794,8 +734,6 @@ class MicrosoftGraphService:
                              logger.info(f"[MAIL SYNC] Ticket {existing_mapping_by_conv.ticket_id} status changed from CLOSED to IN_PROGRESS after user reply")
                         elif ticket_to_update: pass  
                         else: logger.warning(f"[MAIL SYNC] Could not find Ticket ID {existing_mapping_by_conv.ticket_id} to potentially update status after user reply.")
-                        
-                        # Update last_update when user replies via email
                         if ticket_to_update:
                             ticket_to_update.last_update = datetime.utcnow()
                             self.db.add(ticket_to_update)
@@ -2504,11 +2442,11 @@ class MicrosoftGraphService:
                 ).order_by(EmailTicketMapping.updated_at.desc()).all()
                 
                 found_valid_mapping = False
-                tried_message_ids = {original_message_id}  # Track attempted IDs to avoid duplicates
+                tried_message_ids = {original_message_id} 
                 
                 for mapping in all_mappings:
                     if mapping.email_id != original_message_id and mapping.email_id not in tried_message_ids:
-                        tried_message_ids.add(mapping.email_id)  # Mark as tried
+                        tried_message_ids.add(mapping.email_id)  
                         test_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{mapping.email_id}"
                         test_response = requests.get(test_endpoint, headers=headers)
                         
@@ -3145,10 +3083,6 @@ class MicrosoftGraphService:
         if not user_access_token:
             logger.error("Token is None or empty. Cannot send email.")
             return False
-            
-
-        
-        # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
         
         # Format HTML content if needed
@@ -3222,8 +3156,6 @@ class MicrosoftGraphService:
                 MailboxConnection.workspace_id == workspace_id,
                 MailboxConnection.is_active == True
             ).all()
-            
-            # Extraer dominios únicos de los buzones
             workspace_domains = set()
             for mailbox in mailbox_connections:
                 if mailbox.email and '@' in mailbox.email:
@@ -3239,7 +3171,6 @@ class MicrosoftGraphService:
             
         except Exception as e:
             logger.error(f"Error detecting system domains for workspace {workspace_id}: {str(e)}")
-            # Fallback a dominios core si hay error
             return ["enque.cc", "microsoftexchange"]
 
 def get_microsoft_service(db: Session) -> MicrosoftGraphService:
