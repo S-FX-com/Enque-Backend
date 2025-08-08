@@ -1,5 +1,5 @@
-from typing import Any, List, Dict
-from datetime import datetime 
+from typing import Any, List, Dict, Optional
+from datetime import datetime, timezone
 import asyncio
 import base64
 import time
@@ -12,9 +12,11 @@ from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
 from app.models.agent import Agent as AgentModel
 from app.models.comment import Comment as CommentModel
+from app.models.scheduled_comment import ScheduledComment
 from app.models.task import Task as TaskModel 
 from app.models.activity import Activity 
-from app.models.microsoft import MailboxConnection 
+from app.models.microsoft import MailboxConnection
+from app.models.user import User 
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
 from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails 
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
@@ -30,9 +32,12 @@ from app.models.ticket_attachment import TicketAttachment
 router = APIRouter()
 
 class CommentResponseModel(BaseModel):
-    comment: CommentSchema
+    comment: Optional[CommentSchema] = None
     task: TicketWithDetails
     assignee_changed: bool
+    # Scheduled comment fields
+    is_scheduled: Optional[bool] = False
+    scheduled_comment: Optional[Dict[str, Any]] = None
 
     model_config = {
         "from_attributes": True
@@ -315,7 +320,80 @@ async def create_comment(
         content_to_store = comment_in.content
         s3_html_url = None
 
-    # Create the comment
+    # ✅ SCHEDULED COMMENT LOGIC
+    if comment_in.scheduled_send_at:
+        # The frontend sends local time (Eastern Time) as ISO string
+        # We need to interpret this as Eastern Time and validate against Eastern Time
+        import pytz
+        
+        eastern = pytz.timezone('US/Eastern')
+        now_et = datetime.now(eastern)
+        
+        # The frontend sends the time as if it were UTC, but it's actually Eastern Time
+        # We need to interpret the naive datetime as Eastern Time
+        
+        # Remove timezone info to get naive datetime
+        naive_scheduled = comment_in.scheduled_send_at.replace(tzinfo=None)
+        
+        # Localize as Eastern Time (this correctly handles DST)
+        scheduled_et = eastern.localize(naive_scheduled)
+        
+        logger.info(f"🕐 Received from frontend: {comment_in.scheduled_send_at}")
+        logger.info(f"🕐 Interpreted as ET: {scheduled_et}")
+        logger.info(f"🕐 Current ET: {now_et}")
+        
+        if scheduled_et <= now_et:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Scheduled send time must be in the future"
+            )
+        
+        # Convert to UTC for database storage as naive datetime
+        scheduled_utc = scheduled_et.astimezone(timezone.utc)
+        # Store as naive datetime (without timezone info)
+        scheduled_utc_naive = scheduled_utc.replace(tzinfo=None)
+        
+        logger.info(f"🕐 DEBUG - Before DB storage:")
+        logger.info(f"   ET time: {scheduled_et}")
+        logger.info(f"   UTC time: {scheduled_utc}")
+        logger.info(f"   UTC naive: {scheduled_utc_naive}")
+        
+        # Create scheduled comment instead of regular comment
+        scheduled_comment = ScheduledComment(
+            ticket_id=task_id,
+            agent_id=current_user.id,
+            workspace_id=current_user.workspace_id,
+            content=content_to_store,
+            scheduled_send_at=scheduled_utc_naive,  # Use naive UTC time
+            is_private=comment_in.is_private,
+            other_destinaries=comment_in.other_destinaries,
+            bcc_recipients=comment_in.bcc_recipients,
+            attachment_ids=comment_in.attachment_ids or []
+        )
+        db.add(scheduled_comment)
+        db.commit()
+        
+        # Read back from DB to verify
+        db.refresh(scheduled_comment)
+        logger.info(f"🕐 DEBUG - After DB storage:")
+        logger.info(f"   DB stored: {scheduled_comment.scheduled_send_at}")
+        logger.info(f"   DB type: {type(scheduled_comment.scheduled_send_at)}")
+
+        
+        logger.info(f"✅ Created scheduled comment {scheduled_comment.id} for task {task_id}")
+        logger.info(f"   📅 Scheduled for ET: {scheduled_et}")
+        logger.info(f"   📅 Stored as UTC: {scheduled_utc}")
+
+        from app.schemas.scheduled_comment import ScheduledCommentResponse
+        return CommentResponseModel(
+            comment=None,  # No immediate comment for scheduled
+            task=task,
+            assignee_changed=False,
+            is_scheduled=True,
+            scheduled_comment=ScheduledCommentResponse.from_orm(scheduled_comment).dict()
+        )
+
+    # Create the regular comment (immediate send)
     comment = CommentModel(
         ticket_id=task_id,
         agent_id=current_user.id,

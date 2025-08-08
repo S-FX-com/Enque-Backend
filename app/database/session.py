@@ -23,6 +23,7 @@ if settings.DATABASE_URI:
             "connect_timeout": 30,  # Connection timeout
             "read_timeout": 60,     # Read timeout  
             "write_timeout": 60,    # Write timeout
+            "init_command": "SET time_zone = '+00:00'",  # Force UTC timezone
         } if "mysql" in settings.DATABASE_URI else {}
     )
     SessionLocal = sessionmaker(

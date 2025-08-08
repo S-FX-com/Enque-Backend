@@ -41,6 +41,7 @@ class Task(Base):
 
     # Email-related columns
     email_message_id = Column(String(255), nullable=True, index=True)
+    email_internet_message_id = Column(String(255), nullable=True, index=True)
     email_conversation_id = Column(String(255), nullable=True)
     email_sender = Column(String(1000), nullable=True)  # Increased for long forwarded email addresses
     to_recipients = Column(Text, nullable=True)
@@ -62,6 +63,7 @@ class Task(Base):
     user = relationship("User", back_populates="tasks")
     company = relationship("Company", back_populates="tasks")
     comments = relationship("Comment", back_populates="ticket", cascade="all, delete-orphan") 
+    scheduled_comments = relationship("ScheduledComment", back_populates="ticket", cascade="all, delete-orphan")
     email_mappings = relationship("EmailTicketMapping", back_populates="ticket", cascade="all, delete-orphan")
     body = relationship("TicketBody", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
     mailbox_connection = relationship("MailboxConnection", back_populates="tasks") 

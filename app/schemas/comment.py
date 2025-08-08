@@ -20,6 +20,8 @@ class CommentCreate(CommentBase):
     other_destinaries: Optional[str] = None  # CC recipients
     bcc_recipients: Optional[str] = None       # BCC recipients
     is_attachment_upload: bool = False  # Flag para indicar si es una carga de adjunto
+    # Schedule send field
+    scheduled_send_at: Optional[datetime] = None  # If provided, comment will be scheduled instead of sent immediately
 
 class CommentUpdate(BaseModel):
     content: Optional[str] = None

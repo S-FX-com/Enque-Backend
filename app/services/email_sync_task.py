@@ -448,6 +448,42 @@ def monitor_database_health():
     except Exception as e:
         logger.error(f"❌ Error monitoring database health: {e}")
 
+def process_scheduled_comments_job():
+    """
+    Background job to process scheduled comments that are ready to be sent.
+    Runs every minute to check for pending scheduled comments.
+    """
+    db = None
+    try:
+        logger.info("🔄 Checking for scheduled comments to process...")
+        
+        db = SessionLocal()
+        
+        # Import the service function
+        from app.services.scheduled_comment_service import process_pending_scheduled_comments
+        
+        # Process all pending scheduled comments
+        import asyncio
+        result = asyncio.run(process_pending_scheduled_comments(db))
+        
+        if result["processed"] > 0:
+            logger.info(f"📧 Processed {result['processed']} scheduled comments: {result['successful']} successful, {result['failed']} failed")
+            
+            if result["errors"]:
+                for error in result["errors"]:
+                    logger.error(f"❌ Scheduled comment error: {error}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in scheduled comments job: {e}")
+        if db:
+            db.rollback()
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception as close_error:
+                logger.error(f"❌ Error closing scheduled comments DB connection: {close_error}")
+
 def start_scheduler():
     
     if not scheduler_available:
@@ -459,6 +495,7 @@ def start_scheduler():
     schedule.every(3).hours.do(refresh_tokens_job)  
     schedule.every(30).minutes.do(cleanup_orphaned_connections)
     schedule.every(5).minutes.do(monitor_database_health)
+    schedule.every().minute.do(process_scheduled_comments_job)  # ✅ NEW: Process scheduled comments every minute
     schedule.every().hour.do(weekly_agent_summary_job)
     schedule.every().hour.do(daily_outstanding_tasks_job)
     schedule.every().hour.do(weekly_manager_summaries_job)
@@ -482,6 +519,7 @@ def start_scheduler():
     logger.info("  - Token refresh: every 3 hours") 
     logger.info("  - Cleanup orphaned connections: every 30 minutes")
     logger.info("  - Database health monitoring: every 5 minutes")
+    logger.info("  - Scheduled comments processing: every 1 minute")  # ✅ NEW
     logger.info("  - Weekly agent summaries: every hour (executes only on Fridays at 3pm)")
     logger.info("  - Daily outstanding tasks: every hour (executes daily at 7am ET)")  # 🔧 ADDED
     logger.info("  - Weekly manager summaries: every hour (executes only on Fridays at 4pm ET)")  # 🔧 ADDED

@@ -1174,8 +1174,10 @@ class MicrosoftGraphService:
                         contentId=att_data.get("contentId"), contentBytes=att_data.get("contentBytes")))
                 except KeyError as ke: logger.error(f"Missing key while parsing attachment {i+1} for email {email_content.get('id')}: {ke}"); continue
                 except Exception as att_err: logger.error(f"Error parsing attachment {i+1} for email {email_content.get('id')}: {att_err}"); continue
+            internet_message_id = email_content.get("internetMessageId")
+            
             return EmailData(
-                id=email_content["id"], conversation_id=email_content.get("conversationId", ""), subject=email_content.get("subject", "No Subject"),
+                id=email_content["id"], internet_message_id=internet_message_id, conversation_id=email_content.get("conversationId", ""), subject=email_content.get("subject", "No Subject"),
                 sender=sender, to_recipients=recipients, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients,
                 body_content=body_content, body_type=body_type, received_at=received_time,
                 attachments=attachments, importance=email_content.get("importance", "normal"))
@@ -1344,7 +1346,7 @@ class MicrosoftGraphService:
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
                 user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
-                email_message_id=email.id, email_conversation_id=email.conversation_id,
+                email_message_id=email.id, email_internet_message_id=email.internet_message_id, email_conversation_id=email.conversation_id,
                 email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str,
                 last_update=datetime.utcnow())
             self.db.add(task); self.db.flush()
@@ -2495,21 +2497,28 @@ class MicrosoftGraphService:
             
             response = requests.get(message_endpoint, headers=headers)
             if response.status_code == 404:
-                logger.warning(f"Message ID {original_message_id} not found (404) in mailbox {mailbox_connection.email}.")
+                logger.warning(f"⚠️ Original message ID {original_message_id} not found (404) in mailbox {mailbox_connection.email}")
+                logger.info(f"🔍 Searching for alternative message IDs for ticket {task_id}...")
                 all_mappings = self.db.query(EmailTicketMapping).filter(
                     EmailTicketMapping.ticket_id == task_id
                 ).order_by(EmailTicketMapping.updated_at.desc()).all()
                 
                 found_valid_mapping = False
+                tried_message_ids = {original_message_id}  # Track attempted IDs to avoid duplicates
+                
                 for mapping in all_mappings:
-                    if mapping.email_id != original_message_id:
+                    if mapping.email_id != original_message_id and mapping.email_id not in tried_message_ids:
+                        tried_message_ids.add(mapping.email_id)  # Mark as tried
                         test_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{mapping.email_id}"
                         test_response = requests.get(test_endpoint, headers=headers)
                         
                         if test_response.status_code == 200:
                             original_message_id = mapping.email_id
                             found_valid_mapping = True
+                            logger.info(f"✅ Found valid alternative message ID: {mapping.email_id}")
                             break
+                        else:
+                            logger.debug(f"❌ Alternative message ID {mapping.email_id} also not accessible (status: {test_response.status_code})")
                 
                 if not found_valid_mapping:
                     # Intentar buscar por conversation ID si está disponible
@@ -2546,13 +2555,9 @@ class MicrosoftGraphService:
                                         original_message_id = new_message_id
                                         found_valid_mapping = True
                                         
-                                        # Actualizar el mapping en la base de datos con el nuevo Message ID
-                                        try:
-                                            email_mapping.email_id = new_message_id
-                                            self.db.commit()
-                                        except Exception as update_error:
-                                            logger.error(f"Failed to update email mapping: {str(update_error)}")
-                                            self.db.rollback()
+                                        # No actualizar el mapping para evitar conflictos de duplicados
+                                        # El mensaje original sigue siendo válido para respuestas
+                                        logger.info(f"Found alternative message ID {new_message_id} but keeping original mapping")
                     
                     # Buscar en la carpeta "Enque Processed"
                     if not found_valid_mapping:
@@ -2598,21 +2603,42 @@ class MicrosoftGraphService:
                                                         original_message_id = processed_message_id
                                                         found_valid_mapping = True
                                                         
-                                                        # Actualizar el mapping con el ID de la carpeta procesada
-                                                        try:
-                                                            email_mapping.email_id = processed_message_id
-                                                            self.db.commit()
-                                                        except Exception as update_error:
-                                                            logger.error(f"Failed to update email mapping with processed ID: {str(update_error)}")
-                                                            self.db.rollback()
+                                                        # No actualizar el mapping para evitar conflictos de duplicados
+                                                        # El mensaje original sigue siendo válido para respuestas
+                                                        logger.info(f"Found processed message ID {processed_message_id} but keeping original mapping")
                         except Exception as processed_search_error:
                             logger.error(f"Error searching in 'Enque Processed' folder: {str(processed_search_error)}")
                     
                     if not found_valid_mapping:
-                        logger.error(f"❌ No valid message ID found for ticket {task_id} in mailbox {mailbox_connection.email}. Cannot send reply.")
-                        logger.error(f"💡 This ticket was created from mailbox {mailbox_connection.email} but the original email cannot be found.")
-                        logger.error(f"💡 This may indicate that the email was deleted, archived, or moved to a different folder.")
-                    return False
+                        logger.warning(f"⚠️ No valid message ID found for ticket {task_id} in mailbox {mailbox_connection.email}.")
+                        logger.warning(f"💡 Original email may have been deleted, archived, or moved.")
+                        logger.info(f"🔄 Falling back to sending new email instead of reply...")
+                        
+                        # Fallback: Send as a new email instead of reply
+                        if task.user and task.user.email:
+                            subject = f"Re: [ID:{task_id}] {task.title}"
+                            
+                            # Format the HTML content if needed
+                            if not reply_content.strip().lower().startswith('<html'):
+                                html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{reply_content}</body></html>"
+                            else:
+                                html_body = reply_content
+                            
+                            # Use send_new_email method as fallback
+                            logger.info(f"📧 Sending new email to {task.user.email} as fallback for ticket {task_id}")
+                            return self.send_new_email(
+                                mailbox_email=mailbox_connection.email,
+                                recipient_email=task.user.email,
+                                subject=subject,
+                                html_body=html_body,
+                                attachment_ids=attachment_ids,
+                                task_id=task_id,
+                                cc_recipients=cc_recipients,
+                                bcc_recipients=bcc_recipients
+                            )
+                        else:
+                            logger.error(f"❌ Cannot send fallback email: No user email found for ticket {task_id}")
+                            return False
                     
             elif response.status_code != 200:
                 logger.warning(f"⚠️ Unexpected response code {response.status_code} when verifying message ID in {mailbox_connection.email}")
@@ -2748,6 +2774,19 @@ class MicrosoftGraphService:
                         "content": html_body
                     }
                 }
+                
+                # Add In-Reply-To and References headers if we have the internet message ID
+                if task.email_internet_message_id:
+                    update_payload["internetMessageHeaders"] = [
+                        {
+                            "name": "In-Reply-To",
+                            "value": task.email_internet_message_id
+                        },
+                        {
+                            "name": "References",
+                            "value": task.email_internet_message_id
+                        }
+                    ]
 
                 if cc_recipients:
                     update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
@@ -2854,6 +2893,19 @@ class MicrosoftGraphService:
                             "content": html_body
                         }
                     }
+                    
+                    # Add In-Reply-To and References headers if we have the internet message ID
+                    if task.email_internet_message_id:
+                        update_payload["internetMessageHeaders"] = [
+                            {
+                                "name": "In-Reply-To",
+                                "value": task.email_internet_message_id
+                            },
+                            {
+                                "name": "References",
+                                "value": task.email_internet_message_id
+                            }
+                        ]
 
                     if cc_recipients:
                         update_payload["ccRecipients"] = [{"emailAddress": {"address": email}} for email in cc_recipients]
