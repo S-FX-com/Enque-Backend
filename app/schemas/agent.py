@@ -8,11 +8,16 @@ class AgentBase(BaseModel):
     name: str
     email: EmailStr
     role: str = "agent"
+    auth_method: str = "password"
     is_active: bool = True
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
-    avatar_url: Optional[str] = None  
+    avatar_url: Optional[str] = None
+    microsoft_id: Optional[str] = None
+    microsoft_email: Optional[str] = None
+    microsoft_tenant_id: Optional[str] = None
+    microsoft_profile_data: Optional[str] = None  
 
     @validator("role")
     def validate_role(cls, v):
@@ -21,6 +26,13 @@ class AgentBase(BaseModel):
             return "agent"
         if v not in allowed_roles:
             raise ValueError(f"Role must be one of {allowed_roles}")
+        return v
+
+    @validator("auth_method")
+    def validate_auth_method(cls, v):
+        allowed_auth_methods = ["password", "microsoft", "both"]
+        if v not in allowed_auth_methods:
+            raise ValueError(f"Auth method must be one of {allowed_auth_methods}")
         return v
 
 class AgentInviteCreate(BaseModel):
@@ -51,11 +63,16 @@ class AgentUpdate(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = None
     role: Optional[str] = None
+    auth_method: Optional[str] = None
     is_active: Optional[bool] = None
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
     avatar_url: Optional[str] = None  # URL del avatar del agente
+    microsoft_id: Optional[str] = None
+    microsoft_email: Optional[str] = None
+    microsoft_tenant_id: Optional[str] = None
+    microsoft_profile_data: Optional[str] = None
 
     @validator("role")
     def validate_role(cls, v):
@@ -65,6 +82,14 @@ class AgentUpdate(BaseModel):
                 return "agent"
             if v not in allowed_roles:
                 raise ValueError(f"Role must be one of {allowed_roles}")
+        return v
+
+    @validator("auth_method")
+    def validate_auth_method(cls, v):
+        if v is not None:
+            allowed_auth_methods = ["password", "microsoft", "both"]
+            if v not in allowed_auth_methods:
+                raise ValueError(f"Auth method must be one of {allowed_auth_methods}")
         return v
 
     @validator("password")
@@ -158,6 +183,22 @@ class AgentResetPassword(BaseModel):
     @validator("new_password")
     def validate_new_password(cls, v):
         return AgentUpdate._validate_password_strength(v)
+
+# Esquemas para autenticación de Microsoft
+class AgentMicrosoftLinkRequest(BaseModel):
+    microsoft_id: str
+    microsoft_email: str
+    microsoft_tenant_id: str
+    microsoft_profile_data: Optional[str] = None
+
+class AgentMicrosoftLogin(BaseModel):
+    microsoft_id: str
+    microsoft_email: str
+    microsoft_tenant_id: str
+    microsoft_profile_data: Optional[str] = None
+    access_token: str
+    expires_in: int
+    workspace_id: Optional[int] = None
 
 class AgentWithDetails(Agent):
     workspace: WorkspaceRef

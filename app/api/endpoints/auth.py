@@ -1,13 +1,11 @@
 from datetime import datetime, timedelta 
 from typing import Any, Optional, Dict, List 
-
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Header, Query 
 from fastapi.responses import RedirectResponse 
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session, joinedload 
 from jose import jwt, JWTError
 from app.models.workspace import Workspace
-
 from app.core.config import settings
 from app.core.security import create_access_token, verify_password, get_password_hash
 from app.database.session import get_db
@@ -16,7 +14,7 @@ from app.models.microsoft import MailboxConnection, MicrosoftToken
 from app.services.microsoft_service import MicrosoftGraphService 
 import secrets 
 from app.schemas.token import Token
-from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentPasswordResetRequest, AgentResetPassword 
+from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentPasswordResetRequest, AgentResetPassword, AgentMicrosoftLogin, AgentMicrosoftLinkRequest 
 from app.api.dependencies import get_current_active_user
 from app.services.email_service import send_password_reset_email 
 import logging 
@@ -26,7 +24,6 @@ import base64
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
 
 @router.post("/login", response_model=Token)
 async def login_access_token(
@@ -46,18 +43,14 @@ async def login_access_token(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid X-Workspace-ID header format.",
             )
-    
-    # Buscar usuario por email y workspace_id específico si se proporciona
     user = None
     if requested_workspace_id is not None:
-        # Buscar al usuario en el workspace específico
         user = db.query(Agent).filter(
             Agent.email == form_data.username,
             Agent.workspace_id == requested_workspace_id
         ).first()
         logger.info(f"Searching for user {form_data.username} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
     else:
-        # Si no se proporciona workspace_id, buscar solo por email (comportamiento original)
         user = db.query(Agent).filter(Agent.email == form_data.username).first()
         logger.info(f"Searching for user {form_data.username} without workspace restriction: {'Found' if user else 'Not found'}")
     
@@ -70,15 +63,6 @@ async def login_access_token(
         )
     
     logger.info(f"User {user.email} (ID: {user.id}) found with matching password. Belongs to workspace {user.workspace_id}.")
-    
-    # Ya no necesitamos verificar el mismatch porque buscamos específicamente en el workspace correcto
-    # if requested_workspace_id is not None and user.workspace_id != requested_workspace_id:
-    #     logger.error(f"ACCESS DENIED: User {user.email} (Workspace {user.workspace_id}) attempted login via Workspace {requested_workspace_id}. Header provided, but mismatch. Raising 403.")
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN, 
-    #         detail=f"User not authorized for workspace ID {requested_workspace_id}",
-    #     )
-    
     logger.info(f"User {user.email} successfully authenticated and authorized for workspace {user.workspace_id}.")
     
     user.last_login = datetime.utcnow()
@@ -127,7 +111,6 @@ async def get_current_user(current_user: Agent = Depends(get_current_active_user
 
 @router.post("/register/agent", response_model=AgentSchema)
 async def register_agent(user_in: AgentCreate, db: Session = Depends(get_db)) -> Any:
-    # Verificar si el agente ya existe en este workspace específico
     user = db.query(Agent).filter(
         Agent.email == user_in.email, 
         Agent.workspace_id == user_in.workspace_id
@@ -280,3 +263,224 @@ async def reset_password(reset_data: AgentResetPassword, db: Session = Depends(g
     token_payload = {"role": agent.role, "workspace_id": str(agent.workspace_id), "name": agent.name, "email": agent.email}
     access_token = create_access_token(subject=str(agent.id), extra_data=token_payload, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
+
+@router.post("/microsoft/login", response_model=Token)
+async def microsoft_login(
+    microsoft_data: AgentMicrosoftLogin, 
+    db: Session = Depends(get_db)
+) -> Any:
+    logger.info(f"Microsoft login attempt for user: {microsoft_data.microsoft_email}")
+    workspace_id = microsoft_data.workspace_id
+    if not workspace_id:
+        workspace = db.query(Workspace).first()
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No workspace available. Please contact support."
+            )
+        workspace_id = workspace.id
+    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    if not workspace:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Workspace with ID {workspace_id} not found"
+        )
+    logger.info(f"🔍 Searching for agent with microsoft_id: {microsoft_data.microsoft_id} in workspace: {workspace_id}")
+    agent = db.query(Agent).filter(
+        Agent.microsoft_id == microsoft_data.microsoft_id,
+        Agent.workspace_id == workspace_id
+    ).first()
+    agent_any_workspace = db.query(Agent).filter(
+        Agent.microsoft_id == microsoft_data.microsoft_id
+    ).first()
+    
+    if agent_any_workspace and agent_any_workspace.workspace_id != workspace_id:
+        logger.warning(f"⚠️ Found agent with microsoft_id in different workspace: {agent_any_workspace.workspace_id} (expected: {workspace_id})")
+    
+    if agent:
+        logger.info(f"Existing Microsoft agent found: {agent.email}")
+        agent.microsoft_email = microsoft_data.microsoft_email
+        agent.microsoft_tenant_id = microsoft_data.microsoft_tenant_id
+        agent.microsoft_profile_data = microsoft_data.microsoft_profile_data
+        agent.last_login = datetime.utcnow()
+        agent.last_login_origin = "Microsoft 365"
+        
+    else:
+        agent = db.query(Agent).filter(
+            Agent.email == microsoft_data.microsoft_email,
+            Agent.workspace_id == workspace_id
+        ).first()
+        
+        if agent:
+            logger.info(f"Linking Microsoft account to existing agent: {agent.email}")
+            agent.microsoft_id = microsoft_data.microsoft_id
+            agent.microsoft_email = microsoft_data.microsoft_email
+            agent.microsoft_tenant_id = microsoft_data.microsoft_tenant_id
+            agent.microsoft_profile_data = microsoft_data.microsoft_profile_data
+            agent.auth_method = "both"
+            agent.last_login = datetime.utcnow()
+            agent.last_login_origin = "Microsoft 365"
+            
+        else:
+            logger.info(f"Creating new Microsoft agent: {microsoft_data.microsoft_email}")
+            try:
+                profile_data = json.loads(microsoft_data.microsoft_profile_data) if microsoft_data.microsoft_profile_data else {}
+                display_name = profile_data.get("displayName", microsoft_data.microsoft_email.split("@")[0])
+            except:
+                display_name = microsoft_data.microsoft_email.split("@")[0]
+                
+            agent = Agent(
+                name=display_name,
+                email=microsoft_data.microsoft_email,
+                password=None, 
+                role="agent",
+                auth_method="microsoft",
+                microsoft_id=microsoft_data.microsoft_id,
+                microsoft_email=microsoft_data.microsoft_email,
+                microsoft_tenant_id=microsoft_data.microsoft_tenant_id,
+                microsoft_profile_data=microsoft_data.microsoft_profile_data,
+                workspace_id=workspace_id,
+                is_active=True,
+                last_login=datetime.utcnow(),
+                last_login_origin="Microsoft 365"
+            )
+            db.add(agent)
+    
+    try:
+        db.commit()
+        db.refresh(agent)
+        logger.info(f"Microsoft authentication successful for agent {agent.email} (ID: {agent.id})")
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        token_payload = {
+            "role": agent.role,
+            "workspace_id": str(agent.workspace_id),
+            "name": agent.name,
+            "email": agent.email,
+            "auth_method": agent.auth_method
+        }
+        access_token = create_access_token(
+            subject=str(agent.id),
+            extra_data=token_payload,
+            expires_delta=access_token_expires,
+        )
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error during Microsoft authentication: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing Microsoft authentication: {str(e)}"
+        )
+
+@router.post("/microsoft/link")
+async def link_microsoft_account(
+    microsoft_data: AgentMicrosoftLinkRequest,
+    current_agent: Agent = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+) -> Any:
+    logger.info(f"Linking Microsoft account {microsoft_data.microsoft_email} to agent {current_agent.email}")
+    existing_microsoft_agent = db.query(Agent).filter(
+        Agent.microsoft_id == microsoft_data.microsoft_id,
+        Agent.workspace_id == current_agent.workspace_id,
+        Agent.id != current_agent.id
+    ).first()
+    
+    if existing_microsoft_agent:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This Microsoft account is already linked to another agent in this workspace"
+        )
+    current_agent.microsoft_id = microsoft_data.microsoft_id
+    current_agent.microsoft_email = microsoft_data.microsoft_email
+    current_agent.microsoft_tenant_id = microsoft_data.microsoft_tenant_id
+    current_agent.microsoft_profile_data = microsoft_data.microsoft_profile_data
+    if current_agent.auth_method == "password":
+        current_agent.auth_method = "both"
+    elif current_agent.auth_method == "microsoft":
+        pass
+    
+    try:
+        db.commit()
+        db.refresh(current_agent)
+        logger.info(f"Successfully linked Microsoft account to agent {current_agent.email}")
+        
+        return {
+            "message": "Microsoft account linked successfully",
+            "auth_method": current_agent.auth_method,
+            "microsoft_email": current_agent.microsoft_email
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error linking Microsoft account: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error linking Microsoft account: {str(e)}"
+        )
+
+
+
+@router.get("/microsoft/auth/url")
+async def get_microsoft_auth_url(
+    workspace_id: Optional[int] = Query(None, description="Workspace ID for authentication"),
+    db: Session = Depends(get_db)
+):
+    try:
+        if not workspace_id:
+            workspace = db.query(Workspace).first()
+            if not workspace:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No workspace available"
+                )
+            workspace_id = workspace.id
+        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Workspace with ID {workspace_id} not found"
+            )
+        state_data = {
+            "workspace_id": str(workspace_id),
+            "flow": "auth"
+        }
+        state_json_string = json.dumps(state_data)
+        base64_state = base64.urlsafe_b64encode(state_json_string.encode()).decode('utf-8')
+        base64_state = base64_state.replace('+', '-').replace('/', '_').rstrip('=')
+        auth_url_params = {
+            "client_id": settings.MICROSOFT_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": settings.MICROSOFT_REDIRECT_URI,
+            "response_mode": "query",
+            "scope": "offline_access User.Read Mail.Read",
+            "state": base64_state,
+            "prompt": "select_account" 
+        }
+        
+        import urllib.parse
+        auth_url_params_encoded = urllib.parse.urlencode(auth_url_params)
+        auth_url = f"https://login.microsoftonline.com/{settings.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize?{auth_url_params_encoded}"
+        
+        logger.info(f"Generated Microsoft auth URL for workspace {workspace_id}")
+        
+        return {
+            "auth_url": auth_url,
+            "message": "Authorization URL generated successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating Microsoft auth URL: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating authorization URL: {str(e)}"
+        )
+
+
+
+
+

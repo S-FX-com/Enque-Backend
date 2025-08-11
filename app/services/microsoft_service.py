@@ -238,6 +238,21 @@ class MicrosoftGraphService:
             if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
             if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
             
+            # Check for profile linking flow after agent and workspace are defined
+            if state:
+                try:
+                    missing_padding = len(state) % 4
+                    if missing_padding: state += '=' * (4 - missing_padding)
+                    decoded_state_json = base64.urlsafe_b64decode(state).decode('utf-8')
+                    state_data = json.loads(decoded_state_json)
+                    flow_type = state_data.get('flow')
+                    if flow_type == 'profile_link':
+                        logger.info(f"Profile linking flow detected for agent {agent_id}")
+                        # Handle profile linking - update agent with Microsoft information
+                        return self._handle_profile_linking(token_data, user_info, current_agent, workspace)
+                except Exception as decode_err:
+                    logger.warning(f"Could not re-decode state for flow check: {decode_err}")
+            
             if needs_integration:
                 self.integration = MicrosoftIntegration(
                     tenant_id=tenant_id, client_id=client_id, client_secret=client_secret,
@@ -589,7 +604,7 @@ class MicrosoftGraphService:
                                 
                                 content_length = len(content_to_store)
                                 should_migrate_to_s3 = (
-                                    content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                                    content_length > 65000 or 
                                     s3_service.should_store_html_in_s3(content_to_store)
                                 )
                                 
@@ -862,9 +877,7 @@ class MicrosoftGraphService:
                     
                     continue
             sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
-            
-            # LIMPIEZA PERIÓDICA: Cada 10 sincronizaciones, limpiar mappings huérfanos
-            if sync_config.id % 10 == 0:  # Solo config IDs múltiplos de 10
+            if sync_config.id % 10 == 0:
                 self._cleanup_orphaned_mappings()
             
             if created_tasks_count > 0 or added_comments_count > 0:
@@ -873,26 +886,21 @@ class MicrosoftGraphService:
         except Exception as e: logger.error(f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {str(e)}", exc_info=True); return []
 
     def _cleanup_orphaned_mappings(self):
-        """Limpiar mappings huérfanos e inconsistentes"""
         try:
-            # 1. Buscar mappings huérfanos (que apuntan a tickets inexistentes)
             orphaned_mappings = self.db.query(EmailTicketMapping).filter(
                 ~EmailTicketMapping.ticket_id.in_(
                     self.db.query(Task.id).filter(Task.is_deleted == False)
                 )
             ).all()
-            
-            # 2. Buscar mappings inconsistentes (subject muy diferente al ticket)
             inconsistent_mappings = []
             recent_mappings = self.db.query(EmailTicketMapping).filter(
                 EmailTicketMapping.created_at > datetime.utcnow() - timedelta(hours=24)
-            ).limit(100).all()  # Solo revisar mappings recientes para performance
+            ).limit(100).all() 
             
             for mapping in recent_mappings:
                 if mapping.email_subject:
                     ticket = self.db.query(Task).filter(Task.id == mapping.ticket_id).first()
                     if ticket and ticket.title:
-                        # Comparar subjects - si son muy diferentes, probablemente inconsistente
                         if (mapping.email_subject.lower() != ticket.title.lower() and 
                             not any(word in ticket.title.lower() for word in mapping.email_subject.lower().split()[:3])):
                             inconsistent_mappings.append(mapping)
@@ -921,16 +929,8 @@ class MicrosoftGraphService:
             self.db.rollback()
 
     def _extract_original_sender_from_forwarded_email(self, email_content: str, subject: str = "") -> tuple[Optional[str], Optional[str]]:
-        """
-        Detecta si un email es reenviado y extrae el remitente original del contenido.
-        
-        Returns:
-            tuple[email, name] del remitente original, o (None, None) si no se detecta forward
-        """
         if not email_content:
             return None, None
-        
-        # Patrones para detectar emails reenviados
         forwarded_patterns = [
             r"---------- Forwarded message ---------",
             r"Begin forwarded message:",
@@ -941,12 +941,8 @@ class MicrosoftGraphService:
             r"Subject.*?FW:|Subject.*?Fwd:",
             r"Asunto.*?RV:|Asunto.*?Reenviado:"
         ]
-        
-        # Verificar si es un email reenviado
         is_forwarded = any(re.search(pattern, email_content, re.IGNORECASE | re.DOTALL) 
                           for pattern in forwarded_patterns)
-        
-        # También verificar el asunto
         if subject:
             subject_forwarded_patterns = [r"^FW:", r"^Fwd:", r"^RV:", r"^Reenviado:"]
             is_forwarded = is_forwarded or any(re.search(pattern, subject, re.IGNORECASE) 
@@ -956,26 +952,16 @@ class MicrosoftGraphService:
             return None, None
         
         logger.info(f"[FORWARD DETECTION] Email detected as forwarded. Extracting original sender...")
-        
-        # Patrones para extraer información del remitente original
-        # Formato típico: "From: Name <email@domain.com>"
         original_sender_patterns = [
-            # Formato HTML
             r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*&lt;([^&]+?)&gt;</p>",
             r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*<([^>]+?)></p>",
             r"<div[^>]*><strong>From:</strong>\s*([^<]+?)\s*&lt;([^&]+?)&gt;</div>",
-            
-            # Formato texto plano en HTML
             r"From:\s*([^<\n]+?)\s*&lt;([^&\n]+?)&gt;",
             r"From:\s*([^<\n]+?)\s*<([^>\n]+?)>",
             r"De:\s*([^<\n]+?)\s*&lt;([^&\n]+?)&gt;",
             r"De:\s*([^<\n]+?)\s*<([^>\n]+?)>",
-            
-            # Solo email sin nombre
             r"From:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
             r"De:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-            
-            # Otros formatos comunes
             r"From:\s*\"?([^\"<\n]+?)\"?\s*&lt;([^&\n]+?)&gt;",
             r"From:\s*\"?([^\"<\n]+?)\"?\s*<([^>\n]+?)>"
         ]
@@ -999,13 +985,9 @@ class MicrosoftGraphService:
                     logger.info(f"[FORWARD DETECTION] Original sender found: {name} <{email}>")
                     return email, name
         
-        # Si no encontramos con patrones específicos, buscar cualquier email en el contenido
-        # que no sea el remitente actual
         email_pattern = r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
-        emails_in_content = re.findall(email_pattern, email_content)
-        
+        emails_in_content = re.findall(email_pattern, email_content)       
         if emails_in_content:
-            # Tomar el primer email encontrado (probablemente el original)
             first_email = emails_in_content[0]
             logger.info(f"[FORWARD DETECTION] Fallback: Using first email found in content: {first_email}")
             return first_email, first_email.split('@')[0]
@@ -1014,29 +996,20 @@ class MicrosoftGraphService:
         return None, None
 
     def _clean_email_address(self, email_string: str) -> Optional[str]:
-        """
-        Limpia y extrae una dirección de email válida de un string que puede estar malformado.
-        Ej: 'support support@ies.org' -> 'support@ies.org'
-        """
         if not email_string:
-            return None
-        
+            return None      
         import re
-        # Buscar patrón de email válido en el string
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
         match = re.search(email_pattern, email_string)
         
         if match:
             return match.group(0)
-        
-        # Si no se encuentra un patrón válido, intentar limpiar espacios extra
         cleaned = email_string.strip()
         if '@' in cleaned:
-            # Remover espacios extra alrededor del @
             parts = cleaned.split('@')
             if len(parts) == 2:
-                local_part = parts[0].strip().split()[-1]  # Tomar la última palabra antes del @
-                domain_part = parts[1].strip().split()[0]  # Tomar la primera palabra después del @
+                local_part = parts[0].strip().split()[-1]  
+                domain_part = parts[1].strip().split()[0]  
                 return f"{local_part}@{domain_part}"
         
         return None
@@ -1049,19 +1022,13 @@ class MicrosoftGraphService:
                 logger.warning(f"Could not parse sender from email content: {email_content.get('id')}")
                 return None
             sender = EmailAddress(name=sender_data.get("name", ""), address=sender_address)
-            
-            # Verificar si el correo es una notificación del sistema o proviene del mismo dominio
             sender_email = sender.address.lower()
-            
-            # Usar detección automática de dominios si tenemos workspace_id, sino usar básicos
             if workspace_id:
                 system_domains = self._get_system_domains_for_workspace(workspace_id)
             else:
                 system_domains = ["enque.cc", "microsoftexchange"]  # Fallback básico
                 
             notification_subjects = ["new ticket #", "ticket #", "new response", "[id:"]
-            
-            # Si el remitente es de un dominio del sistema o es el mismo buzón
             if sender_email == user_email.lower() or any(domain in sender_email for domain in system_domains):
                 logger.warning(f"Email from system address or company domain: {sender_email}")
                 # No rechazar completamente, pero marcar para que luego se pueda filtrar
@@ -1071,9 +1038,6 @@ class MicrosoftGraphService:
                 subject_lower = email_content.get("subject", "").lower()
                 if any(phrase in subject_lower for phrase in notification_subjects):
                     logger.warning(f"Email subject appears to be a system notification: {email_content.get('subject')}")
-                    # No rechazar completamente, pero marcar para que luego se pueda filtrar
-            
-            # Procesar TO recipients con limpieza de emails
             recipients = []
             for r in email_content.get("toRecipients", []):
                 if r.get("emailAddress"):
@@ -1081,16 +1045,12 @@ class MicrosoftGraphService:
                     if cleaned_address:
                         recipients.append(EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=cleaned_address))
             if not recipients: recipients = [EmailAddress(name="", address=user_email)]
-            
-            # Procesar CC recipients con limpieza de emails
             cc_recipients = []
             for r in email_content.get("ccRecipients", []):
                 if r.get("emailAddress"):
                     cleaned_address = self._clean_email_address(r.get("emailAddress", {}).get("address", ""))
                     if cleaned_address:
                         cc_recipients.append(EmailAddress(name=r.get("emailAddress", {}).get("name", ""), address=cleaned_address))
-            
-            # Procesar BCC recipients con limpieza de emails
             bcc_recipients = []
             for r in email_content.get("bccRecipients", []):
                 if r.get("emailAddress"):
@@ -1123,54 +1083,34 @@ class MicrosoftGraphService:
 
     def _create_task_from_email(self, email: EmailData, config: EmailSyncConfig, system_agent: Agent) -> Optional[Task]:
         if not system_agent: logger.error("System agent is required for _create_task_from_email but was not provided."); return None
-        
-        # Verificación más inteligente para evitar bucles de notificación
         if email.subject:
             subject_lower = email.subject.lower()
-            
-            # 🔧 PERMITIR emails con FW/Fwd (forwards) independientemente del contenido
             if any(fw_pattern in subject_lower for fw_pattern in ["fw:", "fwd:", "rv:", "reenviado:"]):
                 logger.info(f"Permitiendo email con forward en asunto: '{email.subject}'")
             else:
-                # Lista completa de patrones de notificación (solo para emails que NO son forwards)
                 notification_patterns = [
                     "new ticket #", "ticket #", "new response", 
                     "assigned", "has been created", "notification:",
                     "automated message", "do not reply", "noreply"
                 ]
-                
-                # Si el asunto contiene patrones claros de notificación, rechazar
                 if any(pattern in subject_lower for pattern in notification_patterns):
                     logger.warning(f"Ignorando correo con asunto '{email.subject}' que parece ser una notificación del sistema")
                     return None
-                
-                # 🔧 PERMITIR respuestas legítimas: si contiene [ID:] pero viene de dominio externo, probablemente es respuesta de usuario
                 if "[id:" in subject_lower:
                     sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
                     system_domains = self._get_system_domains_for_workspace(config.workspace_id)
                     core_system_domains = ["enque.cc", "microsoftexchange"]
-                    
-                    # Si viene de dominio externo (no del sistema), probablemente es respuesta legítima
                     if sender_domain not in core_system_domains and sender_domain not in system_domains:
                         logger.info(f"Permitiendo respuesta de usuario externo con [ID:] en asunto: {email.sender.address} - '{email.subject}'")
                     else:
                         logger.warning(f"Ignorando correo con [ID:] de dominio del sistema: {email.sender.address} - '{email.subject}'")
                         return None
-                
-        # Verificación adicional por dominio solo para notificaciones obvias
         sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
-        
-        # Obtener dominios del sistema para este workspace automáticamente
         system_domains = self._get_system_domains_for_workspace(config.workspace_id)
-        
-        # Solo rechazar emails de dominios core del sistema (enque.cc, microsoftexchange)
         core_system_domains = ["enque.cc", "microsoftexchange"]
         if sender_domain in core_system_domains:
             logger.warning(f"Ignorando correo del dominio del sistema core: {sender_domain} - {email.sender.address}")
             return None
-        
-        # Para dominios del workspace (como s-fx.com, cliente1.com, etc.), 
-        # solo rechazar si es claramente una notificación (por asunto)
         workspace_domains = [d for d in system_domains if d not in core_system_domains]
         if sender_domain in workspace_domains and email.subject:
             subject_lower = email.subject.lower()
@@ -1186,23 +1126,16 @@ class MicrosoftGraphService:
             elif email.importance == "low": priority = "Low"
             workspace_id = config.workspace_id
             if not workspace_id: logger.error(f"Missing workspace_id in sync config {config.id}. Cannot create user/task."); return None
-            
-            # 🔧 NUEVA FUNCIONALIDAD: Detectar emails reenviados y extraer remitente original
             original_email, original_name = self._extract_original_sender_from_forwarded_email(
                 email.body_content, email.subject
-            )
-            
+            )        
             if original_email and original_name:
-                # Email reenviado: usar remitente original como contacto principal
                 logger.info(f"[FORWARD DETECTION] Creating ticket with original sender: {original_name} <{original_email}>")
                 user = get_or_create_user(self.db, original_email, original_name, workspace_id=workspace_id)
-                
-                # Guardar información del forward para referencias futuras
                 forwarded_by_email = email.sender.address
                 forwarded_by_name = email.sender.name or "Unknown"
                 logger.info(f"[FORWARD DETECTION] Email was forwarded by: {forwarded_by_name} <{forwarded_by_email}>")
             else:
-                # Email normal: usar remitente directo
                 user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
             
             if not user: logger.error(f"Could not get or create user for email: {email.sender.address} in workspace {workspace_id}"); return None
@@ -1212,11 +1145,8 @@ class MicrosoftGraphService:
             workspace = self.db.query(Workspace).filter(Workspace.id == config.workspace_id).first()
             if not workspace: logger.error(f"Workspace ID {config.workspace_id} not found. Skipping ticket creation."); return None
             due_date = datetime.utcnow() + timedelta(days=3)
-            
-            # Determinar team_id basado en la asignación del mailbox
             team_id = None
             if config.mailbox_connection_id:
-                # Buscar si el mailbox está asignado a algún team
                 from app.models.microsoft import mailbox_team_assignments
                 team_assignment = self.db.query(mailbox_team_assignments).filter(
                     mailbox_team_assignments.c.mailbox_connection_id == config.mailbox_connection_id
@@ -1224,9 +1154,6 @@ class MicrosoftGraphService:
                 
                 if team_assignment:
                     team_id = team_assignment.team_id
-                    logger.info(f"Auto-assigning ticket to team {team_id} based on mailbox assignment")
-            
-            # NUEVO: Procesar TO recipients para guardar en el ticket
             to_recipients_str = None
             if email.to_recipients:
                 to_emails = []
@@ -1239,8 +1166,6 @@ class MicrosoftGraphService:
                 if to_emails:
                     to_recipients_str = ", ".join(to_emails)
                     logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
-            
-            # NUEVO: Procesar CC recipients para guardar en el ticket
             cc_recipients_str = None
             if email.cc_recipients:
                 cc_emails = []
@@ -1253,14 +1178,9 @@ class MicrosoftGraphService:
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
-            
-            # 🔧 NUEVA FUNCIONALIDAD: Incluir quien hizo forward en CC si aplica
             if original_email and original_name:
-                # Si el email fue reenviado, agregar quien lo reenvió a los CCs
                 forwarded_by_email = email.sender.address
                 forwarded_by_name = email.sender.name
-                
-                # Usar formato "Nombre <email>" si hay nombre disponible
                 if forwarded_by_name and forwarded_by_name.strip():
                     forwarded_by_formatted = f"{forwarded_by_name} <{forwarded_by_email}>"
                 else:
@@ -1271,14 +1191,9 @@ class MicrosoftGraphService:
                 else:
                     cc_recipients_str = forwarded_by_formatted
                 logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_formatted}")
-                
-                # Usar remitente original en email_sender
                 email_sender_field = f"{original_name} <{original_email}>"
             else:
-                # Email normal
                 email_sender_field = f"{email.sender.name} <{email.sender.address}>"
-            
-            # Crear el ticket sin descripción inicial
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
@@ -1291,25 +1206,17 @@ class MicrosoftGraphService:
             
             activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
             self.db.add(activity)
-
-            # Procesar adjuntos si los hay
             attachments_for_comment = []
             if email.attachments:
                 non_inline_attachments = [att for att in email.attachments if not att.is_inline and att.contentBytes]
                 for att in non_inline_attachments:
                     try:
                         decoded_bytes = base64.b64decode(att.contentBytes)
-                        
-                        # ✅ FIX: Subir adjunto inicial a S3 (igual que para comentarios posteriores)
                         s3_url = None
                         try:
                             from app.services.s3_service import get_s3_service
                             s3_service = get_s3_service()
-                            
-                            # Determinar carpeta según tipo de archivo
                             folder = "images" if att.content_type.startswith("image/") else "documents"
-                            
-                            # Subir a S3
                             s3_url = s3_service.upload_file(
                                 file_content=decoded_bytes,
                                 filename=att.name,
@@ -1321,113 +1228,72 @@ class MicrosoftGraphService:
                             
                         except Exception as s3_error:
                             logger.error(f"❌ Error subiendo adjunto inicial '{att.name}' a S3: {str(s3_error)}")
-                            # Fallback: guardar en BD si S3 falla
                             pass
-                        
-                        # Crear adjunto en BD con S3 URL o bytes según disponibilidad
                         db_attachment = TicketAttachment(
                             file_name=att.name,
                             content_type=att.content_type,
                             file_size=att.size,
-                            s3_url=s3_url,  # ✅ FIX: Incluir URL de S3
-                            content_bytes=decoded_bytes if not s3_url else None  # Solo bytes si S3 falló
+                            s3_url=s3_url, 
+                            content_bytes=decoded_bytes if not s3_url else None 
                         )
                         attachments_for_comment.append(db_attachment)
                     except Exception as e:
                         logger.error(f"Error al procesar adjunto '{att.name}' para ticket {task.id}: {e}", exc_info=True)
-
-            # Procesar el HTML para las imágenes inline
             processed_html = self._process_html_body(email.body_content, email.attachments, f"new ticket {task.id}")
-            
-            # Eliminar cualquier línea "From:" que pueda estar en el contenido del correo para evitar duplicidad
             processed_html = re.sub(r'^<p><strong>From:</strong>.*?</p>', '', processed_html, flags=re.DOTALL | re.IGNORECASE)
-            
-            # MODIFICACIÓN CLAVE: En lugar de usar al system_agent como remitente añadimos metadata especial al principio
-            # del contenido del comentario con un formato específico que el frontend detectará para mostrar al usuario original.
-            # Esto evita aparecer como "Admin Demo" y muestra correctamente al usuario original.
-            
-            # 🔧 NUEVA FUNCIONALIDAD: Mostrar quien realmente envió el mensaje en la conversación
             if original_email and original_name:
-                # Email reenviado: mostrar quien hizo el forward en la conversación 
-                # (el contacto principal ya está correcto como Richard)
                 forward_sender_name = email.sender.name or "Unknown Forwarder"
                 forward_sender_email = email.sender.address
                 special_metadata = f'<original-sender>{forward_sender_name}|{forward_sender_email}</original-sender>'
                 logger.info(f"[FORWARD DETECTION] Conversation will show forwarder: {forward_sender_name} <{forward_sender_email}>")
             else:
-                # Email normal: usar usuario directo
                 special_metadata = f'<original-sender>{user.name}|{user.email}</original-sender>'
-            
-            # NUEVO: Revisar contenido ANTES de insertar en BD para evitar errores de tamaño
             content_to_store = special_metadata + processed_html
-            s3_html_url = None
-            
+            s3_html_url = None    
             try:
                 if content_to_store and content_to_store.strip():
                     from app.services.s3_service import get_s3_service
                     s3_service = get_s3_service()
-                    
-                    # Verificar si el contenido es muy grande o debe ir a S3
                     content_length = len(content_to_store)
                     should_migrate_to_s3 = (
-                        content_length > 65000 or  # Más de 65KB (límite aproximado de TEXT)
+                        content_length > 65000 or  
                         s3_service.should_store_html_in_s3(content_to_store)
-                                        )
-                    
+                                        )              
                     if should_migrate_to_s3:
-                        # Generar un ID temporal para el archivo S3
                         import uuid
                         temp_id = str(uuid.uuid4())
-                        
-                        # Almacenar en S3 con ID temporal
                         s3_url = s3_service.upload_html_content(
                             html_content=content_to_store,
                             filename=f"temp-initial-comment-{temp_id}.html",
                             folder="comments"
                         )
-                        
-                        # Actualizar variables para la BD
                         s3_html_url = s3_url
                         content_to_store = f"[MIGRATED_TO_S3] Content moved to S3: {s3_url}"
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error pre-migrating initial content to S3: {str(e)}")
-                # Continue with original content if S3 fails
                 content_to_store = special_metadata + processed_html
                 s3_html_url = None
-            
-            # El comentario principal con metadatos + contenido HTML + adjuntos
             initial_comment = Comment(
                 ticket_id=task.id,
-                agent_id=system_agent.id,  # Seguimos usando system_agent (requerido)
+                agent_id=system_agent.id, 
                 workspace_id=workspace.id,
-                content=content_to_store,  # Usar contenido procesado
-                s3_html_url=s3_html_url,  # Incluir URL de S3 si existe
+                content=content_to_store, 
+                s3_html_url=s3_html_url, 
                 is_private=False
             )
-            
-            # Añadir los adjuntos al comentario
             for attachment in attachments_for_comment:
                 initial_comment.attachments.append(attachment)
                 
             self.db.add(initial_comment)
-                
-            # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
             if s3_html_url and not s3_html_url.endswith(f"comment-{initial_comment.id}.html"):
                 try:
-                    # Hacer flush para obtener el ID real del comentario
                     self.db.flush()
-                    
-                    # Renombrar archivo en S3 con el ID real del comentario
                     from app.services.s3_service import get_s3_service
                     s3_service = get_s3_service()
-                    
-                    # Obtener el contenido original para almacenar con el nombre correcto
                     if '[MIGRATED_TO_S3] Content moved to S3: ' in content_to_store:
                         original_content = special_metadata + processed_html
                     else:
                         original_content = content_to_store
-                    
-                    # Crear nueva URL con ID real
                     final_s3_url = s3_service.store_comment_html(initial_comment.id, original_content)
                     
                     # Actualizar la URL en el comentario
@@ -1435,16 +1301,9 @@ class MicrosoftGraphService:
                     initial_comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
                 except Exception as e:
                     logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for initial comment {initial_comment.id}: {str(e)}")
-                    # Continue with temp filename - not critical
-            
-            # Crear un TicketBody vacío (requerido pero no lo usaremos para mostrar contenido)
             ticket_body = TicketBody(ticket_id=task.id, email_body="")
             self.db.add(ticket_body)
-            
-            # Commit para asegurar que el ticket esté guardado antes de enviar notificaciones
             self.db.commit()
-            
-            # ✅ EMIT SOCKET.IO EVENT para notificar nuevo ticket en tiempo real
             try:
                 from app.core.socketio import emit_new_ticket_sync
                 
@@ -1461,17 +1320,11 @@ class MicrosoftGraphService:
                     'user_name': user.name if user else 'Unknown',
                     'user_email': user.email if user else ''
                 }
-                
-                # Emitir evento de forma síncrona para email sync
                 emit_new_ticket_sync(workspace.id, task_data)
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for new ticket {task.id}: {str(e)}")
-            
-            # NUEVO: Ejecutar automations basadas en las condiciones del ticket
             try:
                 from app.services.automation_service import execute_automations_for_ticket
-                
-                # Cargar el ticket con todas las relaciones necesarias para las condiciones de automation
                 from sqlalchemy.orm import joinedload
                 task_with_relations = self.db.query(Task).options(
                     joinedload(Task.user),
@@ -1547,22 +1400,16 @@ class MicrosoftGraphService:
                     if any(domain in email.sender.address.lower() for domain in system_domains):
                         logger.info(f"Skipping notifications for ticket {task.id} as it appears to be a system notification")
                         should_send_notification = False
-            
-            # Enviar notificaciones de nuevo ticket solo si es apropiado
             if should_send_notification:
                 try:
                     import asyncio
                     from app.services.notification_service import send_notification
-                    
-                    # 1. Notificar al usuario que creó el ticket (remitente del email)
                     if user and user.email and not any(domain in user.email.lower() for domain in system_domains):
                         template_vars = {
                             "user_name": user.name,
                             "ticket_id": task.id,
                             "ticket_title": task.title
                         }
-                        
-                        # Crear un nuevo bucle de eventos y ejecutar la corrutina de forma sincrónica
                         loop = asyncio.new_event_loop()
                         try:
                             loop.run_until_complete(
@@ -2692,8 +2539,6 @@ class MicrosoftGraphService:
                 # Modify the draft subject to include ticket ID in format [ID:XXXXX]
                 original_subject = draft_message.get("subject", "").strip()
                 ticket_id_tag = f"[ID:{task_id}]"
-                
-                # Check if the ID tag is already in the subject
                 if ticket_id_tag not in original_subject:
                     # Add the ticket ID tag right after "Re:" if it exists, otherwise at the beginning
                     if original_subject.lower().startswith("re:"):
@@ -2701,10 +2546,7 @@ class MicrosoftGraphService:
                     else:
                         new_subject = f"{ticket_id_tag} {original_subject}"
                 else:
-                    # Subject already has the tag, use as is
                     new_subject = original_subject
-                
-                # Step 3: Update the draft with our content, subject, and attachments
                 update_payload = {
                     "subject": new_subject,
                     "body": {
@@ -2712,9 +2554,6 @@ class MicrosoftGraphService:
                         "content": html_body
                     }
                 }
-                
-                # Add In-Reply-To and References headers if we have the internet message ID
-                # Note: Some Microsoft Graph configurations don't support custom headers in drafts
                 try:
                     if task.email_internet_message_id:
                         update_payload["internetMessageHeaders"] = [
@@ -2732,7 +2571,6 @@ class MicrosoftGraphService:
                     logger.warning(f"Could not add email history headers: {header_error}")
 
                 if cc_recipients:
-                    # Clean CC recipients before adding to payload
                     cleaned_cc_recipients = []
                     for cc_email in cc_recipients:
                         cleaned_email = self._clean_email_address(cc_email)
@@ -2753,8 +2591,6 @@ class MicrosoftGraphService:
                 update_message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}"
                 logger.debug(f"📧 Updating draft {draft_id} with payload: {update_payload}")
                 response = requests.patch(update_message_endpoint, headers=headers, json=update_payload)
-                
-                # If the update fails with 400, try without internetMessageHeaders
                 if response.status_code == 400 and "internetMessageHeaders" in update_payload:
                     logger.warning(f"⚠️ Draft update failed with 400, retrying without internetMessageHeaders for task {task_id}")
                     update_payload_fallback = update_payload.copy()
@@ -2766,15 +2602,11 @@ class MicrosoftGraphService:
                     except ValueError: error_details = response.text
                     logger.error(f"Failed to update draft message for task_id: {task_id}. Status Code: {response.status_code}. Details: {error_details}")
                     response.raise_for_status()
-                
-                # Step 4: Add attachments one by one
                 for attachment_data in attachments_data:
                     attachments_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/attachments"
                     attachment_response = requests.post(attachments_endpoint, headers=headers, json=attachment_data)
                     if attachment_response.status_code not in [200, 201, 202]:
                         logger.warning(f"Failed to add attachment to draft message for task_id: {task_id}. Status Code: {attachment_response.status_code}")
-                
-                # Step 5: Send the message
                 send_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/send"
                 send_response = requests.post(send_endpoint, headers=headers)
                 if send_response.status_code not in [200, 201, 202, 204]:  # 204 No Content is success for this endpoint
@@ -2798,18 +2630,12 @@ class MicrosoftGraphService:
                 logger.error(f"An unexpected error occurred while sending email reply with attachments for task_id: {task_id}. Error: {str(e)}", exc_info=True)
                 return False
         else:
-            # For simple reply without attachments, we need to:
-            # 1. Get the original message to extract its subject
-            # 2. Create a message with modified subject and our content
-            # 3. Send it as a reply-all
             try:
-                # Get the original message to check its subject
                 message_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}"
                 headers = {"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"}
                 
                 response = requests.get(message_endpoint, headers=headers)
                 if response.status_code != 200:
-                    # If we can't get the original message, fall back to simple reply
                     logger.warning(f"Couldn't get original message details for task {task_id}. Falling back to simple reply.")
                     reply_payload = {"comment": html_body}
                     reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/reply"
@@ -2818,26 +2644,17 @@ class MicrosoftGraphService:
                     logger.info(f"📧 Reply sent for task {task_id}")
                     return True
                 else:
-                    # Si llegamos aquí, pudimos obtener el mensaje original, así que procedemos con el flujo normal
                     message_data = response.json()
                     original_subject = message_data.get("subject", "").strip()
                     ticket_id_tag = f"[ID:{task_id}]"
-                    
-                    # Check if the ID tag is already in the subject
                     if ticket_id_tag not in original_subject:
-                        # Add the ticket ID tag right after "Re:" if it exists, otherwise at the beginning
                         if original_subject.lower().startswith("re:"):
                             new_subject = f"Re: {ticket_id_tag} {original_subject[3:].strip()}"
                         else:
                             new_subject = f"{ticket_id_tag} {original_subject}"
-                        
-                        # Subject modified
                     else:
-                        # Subject already has the tag, use as is
                         new_subject = original_subject
                         logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
-                    
-                    # Create a proper reply message with our modified subject
                     create_reply_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{original_message_id}/createReply"
                     response = requests.post(create_reply_endpoint, headers=headers)
                     response.raise_for_status()
@@ -2848,8 +2665,6 @@ class MicrosoftGraphService:
                     if not draft_id:
                         logger.error(f"Failed to get draft ID from createReply response for task_id: {task_id}")
                         return False
-                    
-                    # Update the draft with our content and subject
                     update_payload = {
                         "subject": new_subject,
                         "body": {
@@ -2857,9 +2672,6 @@ class MicrosoftGraphService:
                             "content": html_body
                         }
                     }
-                    
-                    # Add In-Reply-To and References headers if we have the internet message ID
-                    # Note: Some Microsoft Graph configurations don't support custom headers in drafts
                     try:
                         if task.email_internet_message_id:
                             update_payload["internetMessageHeaders"] = [
@@ -2907,8 +2719,6 @@ class MicrosoftGraphService:
                         response = requests.patch(update_message_endpoint, headers=headers, json=update_payload_fallback)
                     
                     response.raise_for_status()
-                    
-                    # Send the modified message
                     send_endpoint = f"{self.graph_url}/users/{mailbox_connection.email}/messages/{draft_id}/send"
                     response = requests.post(send_endpoint, headers=headers)
                     response.raise_for_status()
@@ -2920,8 +2730,6 @@ class MicrosoftGraphService:
                     status_code = e.response.status_code
                     try: error_details = e.response.json()
                     except ValueError: error_details = e.response.text
-                
-                # If something fails with our approach, fall back to simple reply
                 logger.error(f"❌ Failed custom reply approach for task {task_id}. Status Code: {status_code}. Error Details: {error_details}")
                 logger.warning(f"🔄 Falling back to simple reply (without CC recipients) for task {task_id}.")
                 try:
@@ -2940,10 +2748,7 @@ class MicrosoftGraphService:
 
     def send_new_email(self, mailbox_email: str, recipient_email: str, subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None, cc_recipients: List[str] = None, bcc_recipients: List[str] = None) -> bool:
         logger.info(f"Attempting to send new email from: {mailbox_email} to: {recipient_email} with subject: {subject}")
-        
-        # 🔧 CORRECCIÓN CRÍTICA: Usar token de usuario específico del mailbox, no token de aplicación
         try:
-            # Buscar el mailbox connection por email
             mailbox_connection = self.db.query(MailboxConnection).filter(
                 MailboxConnection.email == mailbox_email,
                 MailboxConnection.is_active == True
@@ -2952,15 +2757,12 @@ class MicrosoftGraphService:
             if not mailbox_connection:
                 logger.error(f"Mailbox connection not found for email: {mailbox_email}")
                 return False
-            
-            # Obtener el token específico para este mailbox
             mailbox_token = self.db.query(MicrosoftToken).filter(
                 MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
                 MicrosoftToken.expires_at > datetime.utcnow()
             ).order_by(MicrosoftToken.created_at.desc()).first()
             
             if not mailbox_token:
-                # Intentar refrescar token expirado
                 logger.warning(f"No active token found for mailbox {mailbox_email}. Looking for refreshable token...")
                 expired_token = self.db.query(MicrosoftToken).filter(
                     MicrosoftToken.mailbox_connection_id == mailbox_connection.id,
@@ -2981,32 +2783,22 @@ class MicrosoftGraphService:
             if not mailbox_token:
                 logger.error(f"Could not obtain valid token for mailbox {mailbox_email}")
                 return False
-                
-            # Usar el token del usuario específico del mailbox
             app_token = mailbox_token.access_token
             
         except Exception as e: 
             logger.error(f"Failed to get user token for mailbox {mailbox_email}: {e}"); 
             return False
-        
-        # Procesar el contenido HTML para mejorar compatibilidad con Gmail
         html_body = self._process_html_for_email(html_body)
-        
-        # Check for attachments if IDs were provided
         attachments_data = []
         if attachment_ids and len(attachment_ids) > 0:
-            # Retrieve attachment data
             for attachment_id in attachment_ids:
                 attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
                 if attachment:
-                    # Get file content - either from content_bytes or download from S3
                     file_content = None
                     if attachment.content_bytes:
-                        # Use existing content_bytes (legacy)
                         file_content = attachment.content_bytes
                         logger.info(f"Using content_bytes for attachment {attachment.file_name} (ID: {attachment_id}) in new email")
                     elif attachment.s3_url:
-                        # Download from S3
                         logger.info(f"Downloading attachment {attachment.file_name} from S3: {attachment.s3_url} for new email")
                         file_content = self._download_file_from_s3(attachment.s3_url)
                         if not file_content:
@@ -3015,8 +2807,6 @@ class MicrosoftGraphService:
                     else:
                         logger.error(f"Attachment {attachment.file_name} (ID: {attachment_id}) has no content_bytes or s3_url for new email")
                         continue
-                    
-                    # Convert file content to base64 for MS Graph API
                     content_b64 = base64.b64encode(file_content).decode('utf-8')
                     attachments_data.append({
                         "@odata.type": "#microsoft.graph.fileAttachment",
@@ -3027,25 +2817,17 @@ class MicrosoftGraphService:
                     logger.info(f"Added attachment {attachment.file_name} ({attachment.id}) to new email")
                 else:
                     logger.warning(f"Attachment ID {attachment_id} not found when preparing email")
-        
-        # Format HTML content if needed
         if not html_body.strip().lower().startswith('<html'):
             html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{html_body}</body></html>"
-        
-        # If task_id is provided, add it to the subject line in format [ID:XXXXX]
         original_subject = subject.strip()
         if task_id:
             ticket_id_tag = f"[ID:{task_id}]"
-            
-            # Check if the ID tag is already in the subject
             if ticket_id_tag not in original_subject:
                 new_subject = f"{ticket_id_tag} {original_subject}"
                 logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
                 subject = new_subject
             else:
                 logger.info(f"Subject already contains ticket ID tag: '{original_subject}'")
-        
-        # Prepare basic email payload
         email_payload = {
             "message": {
                 "subject": subject,
@@ -3054,35 +2836,19 @@ class MicrosoftGraphService:
             },
             "saveToSentItems": "true"
         }
-        
-        # Add CC recipients if provided
         if cc_recipients:
-            # 🧹 LIMPIAR formato de CC recipients antes de enviar a Microsoft Graph
             cleaned_cc_recipients = []
             for cc_email in cc_recipients:
-                # Extraer solo la dirección de email, manejando varios formatos:
-                # - "email@domain.com"
-                # - "Name <email@domain.com>"  
-                # - "S-FX.com Devs <dev@s-fx.com>" (formato con espacios)
-                
                 cleaned_email = cc_email.strip()
-                
-                # Si contiene <>, extraer el contenido
                 email_match = re.search(r'<([^>]+)>', cleaned_email)
                 if email_match:
                     cleaned_email = email_match.group(1).strip()
-                
-                # Si aún contiene espacios, tomar solo la primera parte que parece email
                 if ' ' in cleaned_email:
-                    # Buscar la primera dirección de email válida en la cadena
                     email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
                     email_matches = re.findall(email_pattern, cleaned_email)
                     if email_matches:
                         cleaned_email = email_matches[0]
-                
-                # Validar que sea un email válido y no esté duplicado
                 if cleaned_email and '@' in cleaned_email and '.' in cleaned_email and cleaned_email not in cleaned_cc_recipients:
-                    # Validación adicional con regex
                     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
                     if re.match(email_pattern, cleaned_email):
                         cleaned_cc_recipients.append(cleaned_email)
@@ -3094,13 +2860,9 @@ class MicrosoftGraphService:
                 logger.info(f"Including {len(cleaned_cc_recipients)} cleaned CC recipients in new email: {cleaned_cc_recipients}")
             else:
                 logger.warning("No valid CC recipients after cleaning")
-        
-        # Add BCC recipients if provided
         if bcc_recipients:
             email_payload["message"]["bccRecipients"] = [{"emailAddress": {"address": email}} for email in bcc_recipients]
             logger.info(f"Including {len(bcc_recipients)} BCC recipients in new email: {bcc_recipients}")
-        
-        # Add attachments to payload if any were found
         if attachments_data:
             email_payload["message"]["attachments"] = attachments_data
             logger.info(f"Including {len(attachments_data)} attachments in new email")
@@ -3138,17 +2900,11 @@ class MicrosoftGraphService:
             logger.error("Token is None or empty. Cannot send email.")
             return False
         html_body = self._process_html_for_email(html_body)
-        
-        # Format HTML content if needed
         if not html_body.strip().lower().startswith('<html'):
             html_body = f"<html><head><style>body {{ font-family: sans-serif; font-size: 10pt; }} p {{ margin: 0 0 16px 0; padding: 4px 0; min-height: 16px; line-height: 1.5; }}</style></head><body>{html_body}</body></html>"
-        
-        # If task_id is provided, add it to the subject line in format [ID:XXXXX]
         original_subject = subject.strip()
         if task_id:
             ticket_id_tag = f"[ID:{task_id}]"
-            
-            # Check if the ID tag is already in the subject
             if ticket_id_tag not in original_subject:
                 new_subject = f"{ticket_id_tag} {original_subject}"
                 logger.info(f"Modified subject for task {task_id} from '{original_subject}' to '{new_subject}'")
@@ -3198,6 +2954,46 @@ class MicrosoftGraphService:
         except Exception as e:
             logger.error(f"Error sending email from {sender_mailbox_email} using user token: {e}", exc_info=True)
             return False
+
+    def _handle_profile_linking(self, token_data: dict, user_info: dict, current_agent, workspace) -> MicrosoftToken:
+        try:
+            current_agent.microsoft_id = user_info.get("id")
+            current_agent.microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+            current_agent.microsoft_tenant_id = settings.MICROSOFT_TENANT_ID
+            current_agent.microsoft_profile_data = json.dumps(user_info)
+            if current_agent.auth_method == "password":
+                current_agent.auth_method = "both"
+            elif current_agent.auth_method == "microsoft":
+                pass
+            
+            logger.info(f"Linked Microsoft account {current_agent.microsoft_email} to agent {current_agent.email}")
+            refresh_token_val = token_data.get("refresh_token", "")
+            token = MicrosoftToken(
+                integration_id=self.integration.id,
+                agent_id=current_agent.id,
+                mailbox_connection_id=None,
+                access_token=token_data["access_token"],
+                refresh_token=refresh_token_val,
+                token_type=token_data["token_type"],
+                expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
+            )
+            self.db.add(token)
+            self.db.commit()
+            self.db.refresh(token)
+            from app.core.cache import user_cache
+            user_cache.delete(current_agent.id)
+            logger.info(f"🗑️ Invalidated user cache for agent {current_agent.id} after Microsoft profile linking")
+            
+            logger.info(f"Successfully linked Microsoft profile for agent {current_agent.email}")
+            return token
+            
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Error handling profile linking: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to link Microsoft profile: {str(e)}"
+            )
 
     def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:
         
