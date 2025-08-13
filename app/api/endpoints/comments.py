@@ -1,5 +1,5 @@
-from typing import Any, List, Dict
-from datetime import datetime 
+from typing import Any, List, Dict, Optional
+from datetime import datetime, timezone
 import asyncio
 import base64
 import time
@@ -7,14 +7,15 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload 
 from pydantic import BaseModel
-
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
 from app.models.agent import Agent as AgentModel
 from app.models.comment import Comment as CommentModel
+from app.models.scheduled_comment import ScheduledComment
 from app.models.task import Task as TaskModel 
 from app.models.activity import Activity 
-from app.models.microsoft import MailboxConnection 
+from app.models.microsoft import MailboxConnection
+from app.models.user import User 
 from app.schemas.comment import Comment as CommentSchema, CommentCreate, CommentUpdate
 from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails 
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
@@ -30,9 +31,11 @@ from app.models.ticket_attachment import TicketAttachment
 router = APIRouter()
 
 class CommentResponseModel(BaseModel):
-    comment: CommentSchema
+    comment: Optional[CommentSchema] = None
     task: TicketWithDetails
     assignee_changed: bool
+    is_scheduled: Optional[bool] = False
+    scheduled_comment: Optional[Dict[str, Any]] = None
 
     model_config = {
         "from_attributes": True
@@ -47,19 +50,12 @@ async def read_comments(
     limit: int = 100,
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
-    """
-    Retrieve all comments for a task, ensuring the task belongs to the user's workspace.
-    Includes agent details for each comment.
-    PERFORMANCE: Con logs detallados para monitorear tiempo de carga
-    """
     start_time = time.time()
     pass
-    
-    # Verificación de permisos del ticket
     permissions_start = time.time()
     task = db.query(TaskModel).filter(
         TaskModel.id == task_id,
-        TaskModel.workspace_id == current_user.workspace_id, # Check workspace
+        TaskModel.workspace_id == current_user.workspace_id,
         TaskModel.is_deleted == False
     ).first()
     permissions_time = time.time() - permissions_start
@@ -71,27 +67,21 @@ async def read_comments(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found", 
         )
-
-    # Consulta de comentarios con relaciones
     query_start = time.time()
     comments_orm = db.query(CommentModel).options(
-        joinedload(CommentModel.agent), # Eager load agente
-        joinedload(CommentModel.attachments) # Eager load adjuntos
+        joinedload(CommentModel.agent), 
+        joinedload(CommentModel.attachments) 
     ).filter(
-        CommentModel.ticket_id == task_id # Use correct column name
+        CommentModel.ticket_id == task_id 
     )
 
     comments_orm = comments_orm.order_by(
-        CommentModel.created_at.asc()  # Order ascending for conversation flow
+        CommentModel.created_at.asc()  
     ).offset(skip).limit(limit).all()
     
     query_time = time.time() - query_start
-    
-    # Log detallado de performance
     total_time = time.time() - start_time
     pass
-
-    # Return the ORM objects directly. Pydantic's from_attributes=True
     return comments_orm
 
 
@@ -100,23 +90,10 @@ async def read_comments_optimized(
     task_id: int,
     db: Session = Depends(get_db),
     skip: int = 0,
-    limit: int = 50,  # Límite más bajo por defecto para mejor performance
+    limit: int = 50,  
     current_user: AgentModel = Depends(get_current_active_user),
 ) -> Any:
-    """
-    ENDPOINT OPTIMIZADO para carga rápida de comentarios
-    
-    Estrategia de optimización:
-    1. Paginación más pequeña por defecto (50 vs 100)
-    2. Verificación de permisos optimizada con cache
-    3. Query específico sin left joins pesados
-    4. Logs de performance detallados
-    
-    Mejora de rendimiento esperada: 3-5x más rápido
-    """
     start_time = time.time()
-    
-    # Verificación rápida de existencia del ticket (sin cargar relaciones)
     permissions_start = time.time()
     task_exists = db.query(TaskModel.id).filter(
         TaskModel.id == task_id,
@@ -131,16 +108,12 @@ async def read_comments_optimized(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found", 
         )
-
-    # Consulta optimizada de comentarios
     query_start = time.time()
-    
-    # Strategy: Use selectinload for better performance with large datasets
     from sqlalchemy.orm import selectinload
     
     comments_orm = db.query(CommentModel).options(
-        selectinload(CommentModel.agent),  # Optimized loading
-        selectinload(CommentModel.attachments)  # Optimized loading
+        selectinload(CommentModel.agent),  
+        selectinload(CommentModel.attachments)  
     ).filter(
         CommentModel.ticket_id == task_id
     ).order_by(
@@ -148,8 +121,6 @@ async def read_comments_optimized(
     ).offset(skip).limit(limit).all()
     
     query_time = time.time() - query_start
-    
-    # Log detallado de performance
     total_time = time.time() - start_time
 
     return comments_orm
@@ -164,13 +135,6 @@ async def create_comment(
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
-    """
-    Create a new comment on a task.
-    The comment can be private (visible only to agents) or public.
-    Now includes automatic workflow processing for content analysis.
-    """
-
-    # Validate other_destinaries (CC) if provided
     cc_recipients = []
     if comment_in.other_destinaries and not comment_in.is_private:
         try:
@@ -182,8 +146,6 @@ async def create_comment(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid email addresses in other_destinaries: {str(e)}"
             )
-    
-    # Validate bcc_recipients if provided
     bcc_recipients = []
     if comment_in.bcc_recipients and not comment_in.is_private:
         try:
@@ -195,8 +157,6 @@ async def create_comment(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid email addresses in bcc_recipients: {str(e)}"
             )
-    
-    # Fetch the task ensuring it belongs to the user's workspace
     task = db.query(TaskModel).filter(
         TaskModel.id == task_id,
         TaskModel.workspace_id == current_user.workspace_id,
@@ -215,8 +175,6 @@ async def create_comment(
     if not comment_in.is_private and task.status != "Closed":
         task.status = "With User"
         db.add(task)
-
-    # Reabrir tickets cerrados cuando agentes responden
     if task.status == "Closed":
         task.status = "In Progress"
         db.add(task)
@@ -314,8 +272,58 @@ async def create_comment(
         # Continue with original content if S3 fails
         content_to_store = comment_in.content
         s3_html_url = None
+    if comment_in.scheduled_send_at:
+        import pytz
+        
+        eastern = pytz.timezone('US/Eastern')
+        now_et = datetime.now(eastern)
+        naive_scheduled = comment_in.scheduled_send_at.replace(tzinfo=None)
+        scheduled_et = eastern.localize(naive_scheduled)
+        
+        logger.info(f"🕐 Received from frontend: {comment_in.scheduled_send_at}")
+        logger.info(f"🕐 Interpreted as ET: {scheduled_et}")
+        logger.info(f"🕐 Current ET: {now_et}")
+        
+        if scheduled_et <= now_et:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Scheduled send time must be in the future"
+            )
+        scheduled_utc = scheduled_et.astimezone(timezone.utc)
+        scheduled_utc_naive = scheduled_utc.replace(tzinfo=None)
+        scheduled_comment = ScheduledComment(
+            ticket_id=task_id,
+            agent_id=current_user.id,
+            workspace_id=current_user.workspace_id,
+            content=content_to_store,
+            scheduled_send_at=scheduled_utc_naive,  # Use naive UTC time
+            is_private=comment_in.is_private,
+            other_destinaries=comment_in.other_destinaries,
+            bcc_recipients=comment_in.bcc_recipients,
+            attachment_ids=comment_in.attachment_ids or []
+        )
+        db.add(scheduled_comment)
+        db.commit()
+        
+        # Read back from DB to verify
+        db.refresh(scheduled_comment)
+        logger.info(f"🕐 DEBUG - After DB storage:")
+        logger.info(f"   DB stored: {scheduled_comment.scheduled_send_at}")
+        logger.info(f"   DB type: {type(scheduled_comment.scheduled_send_at)}")
 
-    # Create the comment
+        
+        logger.info(f"✅ Created scheduled comment {scheduled_comment.id} for task {task_id}")
+        logger.info(f"   📅 Scheduled for ET: {scheduled_et}")
+        logger.info(f"   📅 Stored as UTC: {scheduled_utc}")
+
+        from app.schemas.scheduled_comment import ScheduledCommentResponse
+        return CommentResponseModel(
+            comment=None,  # No immediate comment for scheduled
+            task=task,
+            assignee_changed=False,
+            is_scheduled=True,
+            scheduled_comment=ScheduledCommentResponse.from_orm(scheduled_comment).dict()
+        )
     comment = CommentModel(
         ticket_id=task_id,
         agent_id=current_user.id,
@@ -327,26 +335,19 @@ async def create_comment(
         is_private=comment_in.is_private
     )
     db.add(comment)
-    
-    # Procesar attachment_ids si están presentes
     processed_attachment_ids = []
     if comment_in.attachment_ids:
         from app.models.ticket_attachment import TicketAttachment
-        
-        # Commit para asegurar que tengamos un comment ID válido antes de asociar adjuntos
         db.commit()
         db.refresh(comment)
         
         logger.info(f"Processing {len(comment_in.attachment_ids)} attachment IDs for comment ID {comment.id}: {comment_in.attachment_ids}")
-        
-        # Buscar y actualizar attachments
+
         for attachment_id in comment_in.attachment_ids:
             attachment = db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
             if attachment:
-                # Verificar si el adjunto está en un comentario temporal (placeholder)
                 prev_comment = db.query(CommentModel).filter(CommentModel.id == attachment.comment_id).first()
                 if prev_comment and prev_comment.content == "TEMP_ATTACHMENT_PLACEHOLDER":
-                    # Actualizar la relación del adjunto al nuevo comentario
                     attachment.comment_id = comment.id
                     db.add(attachment)
                     processed_attachment_ids.append(attachment_id)
@@ -356,23 +357,13 @@ async def create_comment(
             else:
                 logger.warning(f"Adjunto {attachment_id} no encontrado al crear el comentario {comment.id}")
     else:
-        # Si no hay adjuntos, hacemos commit para asegurar que el comentario tenga ID
         db.commit()
         db.refresh(comment)
-
-    # MEJORADO: Post-procesamiento solo si es necesario renombrar archivo S3
     if s3_html_url and comment.id:
         try:
-            # Renombrar archivo en S3 con el ID real del comentario
             s3_service = get_s3_service()
-            
-            # Obtener el contenido original para almacenar con el nombre correcto
             original_content = comment_in.content
-            
-            # Crear nueva URL con ID real
             final_s3_url = s3_service.store_comment_html(comment.id, original_content)
-            
-            # Actualizar la URL en el comentario
             comment.s3_html_url = final_s3_url
             comment.content = f"[MIGRATED_TO_S3] Content moved to S3: {final_s3_url}"
             db.add(comment)
@@ -380,16 +371,11 @@ async def create_comment(
             logger.info(f"✅ S3 file renamed for comment {comment.id}: {final_s3_url}")
         except Exception as e:
             logger.warning(f"⚠️ Could not rename S3 file for comment {comment.id}: {str(e)}")
-            # Continue with temp filename - not critical
 
-    # NUEVO: Procesar workflows automáticamente para análisis de contenido
     workflow_results = []
     try:
-        # Solo procesar workflows si el comentario tiene contenido significativo
         if comment_in.content and comment_in.content.strip() and not comment_in.is_attachment_upload:
             workflow_service = WorkflowService(db)
-            
-            # Preparar contexto para workflows
             workflow_context = {
                 'task_id': task_id,
                 'comment_id': comment.id,
@@ -402,8 +388,6 @@ async def create_comment(
                 'previous_assignee_id': previous_assignee_id,
                 'current_assignee_id': task.assignee_id
             }
-            
-            # Procesar workflows basados en contenido
             workflow_results = workflow_service.process_message_for_workflows(
                 comment_in.content,
                 current_user.workspace_id,
@@ -412,20 +396,14 @@ async def create_comment(
             
             if workflow_results:
                 logger.info(f"Executed {len(workflow_results)} workflows for comment {comment.id} on task {task_id}")
-                
-                # Aplicar resultados de workflows al ticket si es necesario
                 for result in workflow_results:
                     try:
                         execution_result = result.get('execution_result', {})
                         if execution_result.get('status') == 'completed':
-                            # Procesar resultados de acciones
                             for action_result in execution_result.get('results', []):
                                 if action_result.get('status') == 'success':
                                     action_data = action_result.get('result', {})
-                                    
-                                    # Auto-asignación
                                     if 'assigned_to' in action_data and not assignee_changed:
-                                        # Buscar el usuario por nombre/email
                                         assignee = db.query(AgentModel).filter(
                                             AgentModel.email == action_data['assigned_to'],
                                             AgentModel.workspace_id == current_user.workspace_id
@@ -434,13 +412,9 @@ async def create_comment(
                                             task.assignee_id = assignee.id
                                             assignee_changed = True
                                             logger.info(f"Auto-assigned task {task_id} to {assignee.email} via workflow")
-                                    
-                                    # Auto-priorización
                                     if 'priority' in action_data:
                                         task.priority = action_data['priority']
                                         logger.info(f"Auto-set priority of task {task_id} to {action_data['priority']} via workflow")
-                                    
-                                    # Auto-categorización
                                     if 'category' in action_data:
                                         task.category = action_data['category']
                                         logger.info(f"Auto-categorized task {task_id} as {action_data['category']} via workflow")
@@ -457,11 +431,10 @@ async def create_comment(
         logger.error(f"Error processing workflows for comment {comment.id}: {str(e)}")
 
     try:
-        # Crear  para el comentario con información del ticket
         activity = Activity(
             agent_id=current_user.id,
-            source_type="Comment",  # Cambiar a Comment para distinguir de creación de tickets
-            source_id=task_id,  # Usar task_id como source_id para mantener la referencia al ticket
+            source_type="Comment",  
+            source_id=task_id,  
             action=f"commented on ticket #{task_id}" if not comment_in.is_attachment_upload else f"uploaded attachment to ticket #{task_id}",
             workspace_id=current_user.workspace_id
         )
@@ -470,14 +443,11 @@ async def create_comment(
     except Exception as e:
         logger.error(f"Error creating activity for comment {comment.id}: {e}")
     db.commit()
-    db.refresh(task)  # Ensure the task is fresh
+    db.refresh(task) 
     db.refresh(comment)
     
-    # Ejecutar workflows para comentarios
     try:
         context = {'ticket': task, 'comment': comment, 'agent': current_user}
-        
-        # Workflow general para comentarios agregados
         executed_workflows = WorkflowService.execute_workflows(
             db=db,
             trigger='comment.added',
@@ -494,7 +464,6 @@ async def create_comment(
                     context=context
                 ))
             else:
-                # Si fuera un cliente (aunque actualmente solo agentes pueden comentar)
                 executed_workflows.extend(WorkflowService.execute_workflows(
                     db=db,
                     trigger='customer.replied',
@@ -507,22 +476,16 @@ async def create_comment(
             
     except Exception as e:
         logger.error(f"Error executing workflows for comment creation {comment.id}: {str(e)}")
-    
-    # Si el ticket se asignó a un nuevo agente y no es el que está comentando
     if assignee_changed and task.assignee_id != current_user.id:
         try:
-            # Obtener la URL de origen para usar el subdominio correcto
             origin_url = None
             if request:
                 origin_url = str(request.headers.get("origin", ""))
             if not origin_url:
                 origin_url = settings.FRONTEND_URL
             logger.info(f"Using {origin_url} for assignment notification")
-            
-            # Get the assigned agent
             assigned_agent = db.query(AgentModel).filter(AgentModel.id == task.assignee_id).first()
             if assigned_agent:
-                # Send notification in background
                 from app.services.task_service import send_assignment_notification
                 await send_assignment_notification(db, task, origin_url)
                 logger.info(f"Notification scheduled for new assignment from comment: task {task_id} to agent {task.assignee_id}")
@@ -756,10 +719,6 @@ async def update_comment(
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
-    """
-    Update a comment, ensuring it belongs to the user's workspace.
-    """
-    # Load agent relationship as the response model includes it
     comment = db.query(CommentModel).options(
         joinedload(CommentModel.agent)
     ).filter(
@@ -783,8 +742,6 @@ async def update_comment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Cannot update comment from another workspace",
         )
-
-    # Actualizar el comentario
     update_data = comment_in.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(comment, field, value)
@@ -801,10 +758,6 @@ async def delete_comment(
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
-    """
-    Delete a comment, ensuring it belongs to the user's workspace.
-    """
-    # No need to load agent for delete, just find the comment
     comment = db.query(CommentModel).filter(CommentModel.id == comment_id).first()
     if not comment:
         raise HTTPException(
@@ -818,8 +771,6 @@ async def delete_comment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not enough permissions to delete this comment",
         )
-
-    # Check if the comment belongs to the current user's workspace before deleting
     if comment.workspace_id != current_user.workspace_id:
          raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -830,8 +781,6 @@ async def delete_comment(
     db.commit()
     
     return comment
-
-# Función para manejar el envío de correos en segundo plano
 def send_email_in_background(
     task_id: int, 
     comment_id: int, 
@@ -845,10 +794,6 @@ def send_email_in_background(
     bcc_recipients: List[str],
     db_path: str
 ):
-    """
-    Función para enviar correos electrónicos en segundo plano.
-    Se ejecuta en un thread separado para no bloquear la respuesta API.
-    """
     import time
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker, joinedload
@@ -856,49 +801,36 @@ def send_email_in_background(
     from app.models.agent import Agent as AgentModel
     from app.models.microsoft import MailboxConnection
     from app.services.microsoft_service import get_microsoft_service
-    
-    # Crear una nueva sesión de base de datos
     engine = create_engine(db_path)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = SessionLocal()
     
     try:
-        # Re-crear el objeto Agent
         agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
         if not agent:
             return
-            
-        # Skip for private comments
         if is_private:
             return
-            
-        # Re-fetch task with user relationship loaded to get recipient email if needed
-        # IMPORTANTE: Forzar refresh desde la base de datos para obtener datos actualizados
-        db.expire_all()  # Expira todos los objetos en cache
+        db.expire_all()  
         task_with_user = db.query(TaskModel).options(
             joinedload(TaskModel.user)
         ).filter(TaskModel.id == task_id).first()
 
         if not task_with_user:
             return
-        
-        # Log para debugging - mostrar información del usuario actual del ticket
         if task_with_user.user:
             pass
         else:
             pass
             
         if task_with_user.mailbox_connection_id:
-            # Task originated from email, send a reply
             microsoft_service = get_microsoft_service(db)
             microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients)
         else:
-            # Task was created manually, send a new email notification
             if not task_with_user.user or not task_with_user.user.email:
                 return
             
             recipient_email = task_with_user.user.email
-            # Find an active mailbox for the workspace to send from
             sender_mailbox_conn = db.query(MailboxConnection).filter(
                 MailboxConnection.workspace_id == task_with_user.workspace_id,
                 MailboxConnection.is_active == True
@@ -918,7 +850,7 @@ def send_email_in_background(
                 subject=subject,
                 html_body=html_body,
                 attachment_ids=processed_attachment_ids,
-                task_id=task_id,  # Pass the task ID to include in the subject
+                task_id=task_id,  
                 cc_recipients=cc_recipients,
                 bcc_recipients=bcc_recipients
             )
@@ -936,10 +868,6 @@ def get_comment_s3_content(
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user)
 ):
-    """
-    Get comment content from S3 when it's stored there
-    Optimized for fast loading with caching headers
-    """
     try:
         # Get comment
         comment = db.query(CommentModel).filter(CommentModel.id == comment_id).first()
@@ -968,10 +896,8 @@ def get_comment_s3_content(
             }
         
         try:
-            # Buscar el ticket asociado para obtener el ID
             ticket = db.query(TaskModel).filter(TaskModel.id == comment.ticket_id).first()
             if ticket:
-                # Procesar el HTML para las imágenes CID
                 from app.services.microsoft_service import MicrosoftGraphService
                 ms_service = MicrosoftGraphService(db)
 

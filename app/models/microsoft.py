@@ -64,7 +64,7 @@ class MicrosoftToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     integration_id = Column(Integer, ForeignKey("microsoft_integration.id", ondelete="CASCADE"), nullable=False)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
-    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="CASCADE"), nullable=False)
+    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="CASCADE"), nullable=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=False)
     token_type = Column(String(50), nullable=False, default="Bearer")

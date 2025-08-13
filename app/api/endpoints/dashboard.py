@@ -150,4 +150,27 @@ async def emergency_reset_email_sync(
         raise HTTPException(
             status_code=500,
             detail=f"Error resetting circuit breaker: {str(e)}"
-        ) 
+        )
+
+
+@router.get("/timezone-info")
+async def get_timezone_info():
+    """Get current timezone information for debugging"""
+    import pytz
+    from datetime import datetime, timezone
+    
+    # UTC time
+    now_utc = datetime.now(timezone.utc)
+    
+    # Eastern time
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    
+    return {
+        "utc_time": now_utc.isoformat(),
+        "eastern_time": now_et.isoformat(),
+        "timezone_name": now_et.tzname(),
+        "utc_offset": str(now_et.utcoffset())
+    }
+
+ 

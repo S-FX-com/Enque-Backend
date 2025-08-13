@@ -4,7 +4,7 @@ from app.api.endpoints import (
     agents, auth, comments, microsoft, tasks, users, workspaces, teams, attachments, 
     workflows, canned_replies, automations, companies, profile, activities, uploads, 
     categories, reports, global_signatures, notifications, dashboard,
-    tasks_optimized, automation_settings
+    tasks_optimized, automation_settings, scheduled_comments
 )
 
 api_router = APIRouter()
@@ -31,6 +31,7 @@ api_router.include_router(automations.router, prefix="/automations", tags=["auto
 api_router.include_router(automation_settings.router, prefix="/automation-settings", tags=["automation-settings"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(tasks_optimized.router, prefix="/tasks-optimized", tags=["tasks-optimized"])
+api_router.include_router(scheduled_comments.router, tags=["scheduled-comments"])
 
 @api_router.get("/health", tags=["health"])
 async def health_check():

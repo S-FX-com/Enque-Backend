@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     
     # Base URL for API
     API_BASE_URL: str = "https://enque-backend-production.up.railway.app"
+    
+    @property
+    def clean_api_base_url(self) -> str:
+        """Return API_BASE_URL without trailing slash"""
+        return self.API_BASE_URL.rstrip('/')
 
     # System Email Sender
     SYSTEM_SENDER_EMAIL: str = "noreply@enque.cc" # Default system sender email, ensure this mailbox exists or app has send-as permission
