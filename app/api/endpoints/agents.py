@@ -250,7 +250,19 @@ async def invite_agent(
         invitation_token_expires_at=token_expires_at,
     )
     
-    db_agent = Agent(**new_agent_data.dict()) 
+    # Crear agente con campos explícitos para evitar problemas de compatibilidad
+    db_agent = Agent(
+        name=new_agent_data.name,
+        email=new_agent_data.email,
+        role=new_agent_data.role,
+        auth_method=new_agent_data.auth_method,
+        workspace_id=new_agent_data.workspace_id,
+        job_title=new_agent_data.job_title,
+        is_active=new_agent_data.is_active,
+        password=new_agent_data.password,
+        invitation_token=new_agent_data.invitation_token,
+        invitation_token_expires_at=new_agent_data.invitation_token_expires_at,
+    ) 
 
     try:
         db.add(db_agent)
