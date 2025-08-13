@@ -461,6 +461,63 @@ class MicrosoftGraphService:
             logger.error(f"Failed to get user info: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get user info: {str(e)}")
 
+    def _get_user_profile_photo(self, access_token: str) -> Optional[bytes]:
+        """
+        Obtiene la foto de perfil del usuario desde Microsoft Graph API.
+        Retorna los bytes de la imagen o None si no hay foto disponible.
+        """
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            # Intentar obtener la foto de perfil
+            photo_url = f"{self.graph_url}/me/photo/$value"
+            response = requests.get(photo_url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                logger.info("Successfully retrieved user profile photo from Microsoft Graph")
+                return response.content
+            elif response.status_code == 404:
+                logger.info("User has no profile photo in Microsoft 365")
+                return None
+            else:
+                logger.warning(f"Failed to get profile photo: HTTP {response.status_code}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout while fetching profile photo from Microsoft Graph")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching profile photo: {str(e)}")
+            return None
+
+    def _upload_avatar_to_s3(self, photo_bytes: bytes, agent_id: int) -> Optional[str]:
+        """
+        Sube la foto de perfil a S3 y retorna la URL pública.
+        """
+        try:
+            from app.services.s3_service import get_s3_service
+            
+            s3_service = get_s3_service()
+            
+            # Generar nombre único para el avatar
+            filename = f"agent_{agent_id}_avatar.jpg"
+            folder = "avatars"
+            
+            # Subir a S3
+            avatar_url = s3_service.upload_file(
+                file_content=photo_bytes,
+                filename=filename,
+                folder=folder,
+                content_type="image/jpeg"
+            )
+            
+            logger.info(f"✅ Avatar uploaded to S3 for agent {agent_id}: {avatar_url}")
+            return avatar_url
+            
+        except Exception as e:
+            logger.error(f"❌ Error uploading avatar to S3 for agent {agent_id}: {str(e)}")
+            return None
+
     def _process_html_body(self, html_content: str, attachments: List[EmailAttachment], context: str = "email") -> str:
         """Process HTML content to handle things like CID-referenced images."""
         if not html_content:
@@ -2969,6 +3026,29 @@ class MicrosoftGraphService:
                 pass
             
             logger.info(f"Linked Microsoft account {current_agent.microsoft_email} to agent {current_agent.email}")
+            
+            # 📸 OBTENER Y SUBIR AVATAR DE MICROSOFT 365
+            try:
+                logger.info(f"🔍 Attempting to download profile photo for agent {current_agent.id}")
+                photo_bytes = self._get_user_profile_photo(token_data["access_token"])
+                
+                if photo_bytes:
+                    logger.info(f"📸 Profile photo found ({len(photo_bytes)} bytes), uploading to S3...")
+                    avatar_url = self._upload_avatar_to_s3(photo_bytes, current_agent.id)
+                    
+                    if avatar_url:
+                        # Actualizar avatar_url del agente
+                        current_agent.avatar_url = avatar_url
+                        logger.info(f"✅ Updated agent {current_agent.id} avatar: {avatar_url}")
+                    else:
+                        logger.warning(f"❌ Failed to upload avatar to S3 for agent {current_agent.id}")
+                else:
+                    logger.info(f"📷 No profile photo available for agent {current_agent.id}")
+                    
+            except Exception as avatar_error:
+                # No fallar la vinculación por problemas con el avatar
+                logger.error(f"❌ Error processing avatar for agent {current_agent.id}: {str(avatar_error)}")
+            
             refresh_token_val = token_data.get("refresh_token", "")
             token = MicrosoftToken(
                 integration_id=self.integration.id,
