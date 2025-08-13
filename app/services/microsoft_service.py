@@ -90,25 +90,15 @@ class MicrosoftGraphService:
 
     def _download_file_from_s3(self, s3_url: str) -> Optional[bytes]:
         try:
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id="AKIAQ3EGRIILJHGBQJOZ",
-                aws_secret_access_key="9OgkOI0Lbs51vecOnUcvybrJXylgJY/t178Xfumf",
-                region_name="us-east-2"
-            )
-            parts = s3_url.replace("https://", "").split("/", 1)
-            if len(parts) < 2:
-                logger.error(f"Invalid S3 URL format: {s3_url}")
-                return None               
-            bucket_name = parts[0].split(".")[0] 
-            s3_key = parts[1]  
-            response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-            file_content = response['Body'].read()
+            from app.services.s3_service import get_s3_service
+            
+            s3_service = get_s3_service()
+            file_content = s3_service._download_file_from_s3(s3_url)
             
             return file_content
             
         except Exception as e:
-            logger.error(f"❌ Error downloading file from S3: {str(e)}")
+            logger.error(f"❌ Error downloading file from S3 via S3Service: {str(e)}")
             return None
 
     def get_application_token(self) -> str:
@@ -236,9 +226,7 @@ class MicrosoftGraphService:
             if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
             workspace = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
             if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
-            if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
-            
-            # Check for profile linking flow after agent and workspace are defined
+            if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")      
             if state:
                 try:
                     missing_padding = len(state) % 4
@@ -3026,8 +3014,7 @@ class MicrosoftGraphService:
                 pass
             
             logger.info(f"Linked Microsoft account {current_agent.microsoft_email} to agent {current_agent.email}")
-            
-            # 📸 OBTENER Y SUBIR AVATAR DE MICROSOFT 365
+
             try:
                 logger.info(f"🔍 Attempting to download profile photo for agent {current_agent.id}")
                 photo_bytes = self._get_user_profile_photo(token_data["access_token"])
@@ -3037,16 +3024,13 @@ class MicrosoftGraphService:
                     avatar_url = self._upload_avatar_to_s3(photo_bytes, current_agent.id)
                     
                     if avatar_url:
-                        # Actualizar avatar_url del agente
                         current_agent.avatar_url = avatar_url
                         logger.info(f"✅ Updated agent {current_agent.id} avatar: {avatar_url}")
                     else:
                         logger.warning(f"❌ Failed to upload avatar to S3 for agent {current_agent.id}")
                 else:
-                    logger.info(f"📷 No profile photo available for agent {current_agent.id}")
-                    
+                    logger.info(f"📷 No profile photo available for agent {current_agent.id}")              
             except Exception as avatar_error:
-                # No fallar la vinculación por problemas con el avatar
                 logger.error(f"❌ Error processing avatar for agent {current_agent.id}: {str(avatar_error)}")
             
             refresh_token_val = token_data.get("refresh_token", "")

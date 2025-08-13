@@ -53,8 +53,12 @@ class S3Service:
 
             config = Config(
                 retries={'max_attempts': 2, 'mode': 'adaptive'},  
-                max_pool_connections=10,  
-                region_name=self.aws_region
+                max_pool_connections=50,  # Aumentar pool de conexiones
+                region_name=self.aws_region,
+                # Configuraciones adicionales para optimizar conexiones
+                connect_timeout=5,
+                read_timeout=10,
+                tcp_keepalive=True
             )
             
             self.s3_client = boto3.client(
@@ -68,9 +72,17 @@ class S3Service:
         except Exception as e:
             logger.error(f"❌ Error creating S3 client: {e}")
             raise
-        
-        # Test connection
         self._test_connection()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if hasattr(self, 's3_client') and self.s3_client:
+                pass
+        except Exception as e:
+            logger.warning(f"Error during S3Service cleanup: {e}")
     
     def _test_connection(self):
         try:
