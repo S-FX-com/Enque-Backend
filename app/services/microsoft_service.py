@@ -728,7 +728,7 @@ class MicrosoftGraphService:
                         
                         user_activity = Activity(
                             agent_id=None,  
-                            action=f"{reply_user.name} replied via email",  
+                            action=f"{reply_user.name} commented on ticket",  
                             source_type="Comment",
                             source_id=existing_mapping_by_conv.ticket_id,  
                             workspace_id=workspace.id
@@ -1204,7 +1204,9 @@ class MicrosoftGraphService:
                 last_update=datetime.utcnow())
             self.db.add(task); self.db.flush()
             
-            activity = Activity(agent_id=system_agent.id, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"Created ticket from email from {email.sender.name}")
+            # Use original email sender name for forwarded emails, otherwise use direct sender
+            activity_sender_name = original_name if original_name else email.sender.name
+            activity = Activity(agent_id=None, source_type='Ticket', source_id=task.id, workspace_id=workspace.id, action=f"{activity_sender_name} logged a new ticket")
             self.db.add(activity)
             attachments_for_comment = []
             if email.attachments:

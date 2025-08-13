@@ -36,52 +36,62 @@ async def read_notifications(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Retrieve recent activities relevant for notifications (e.g., ticket creations, comments).
+    Retrieve recent activities relevant for notifications.
+    Only shows:
+    1. New tickets created by external users (not agents)
+    2. Comments from external users (replied via email)
     Filters by the current user's workspace.
     """
     notifications = db.query(Activity).options(
         joinedload(Activity.agent) 
     ).filter(
         Activity.workspace_id == current_user.workspace_id,
-        Activity.source_type.in_(['Ticket', 'Comment']),  # Incluir tanto tickets como comentarios
+        Activity.source_type.in_(['Ticket', 'Comment']),
     ).order_by(
         Activity.created_at.desc()
-    ).limit(limit).all()
+    ).limit(limit * 2).all()  # Get more to filter
 
     results = []
     for activity in notifications:
+        # Skip agent activities (only show user activities)
+        include_activity = False
         activity_detail = ActivityWithDetails.from_orm(activity)
         activity_detail.creator_user_name = None
         activity_detail.creator_user_email = None
         activity_detail.creator_user_id = None
         
-        # Para actividades de tickets, obtener información del usuario que creó el ticket
+        # Para actividades de tickets, solo incluir si fueron creados por usuarios externos
         if activity.source_type == 'Ticket':
             task = db.query(Task).options(
                 joinedload(Task.user) 
             ).filter(Task.id == activity.source_id).first()
             if task and task.user: 
-                activity_detail.creator_user_name = task.user.name
-                activity_detail.creator_user_email = task.user.email 
-                activity_detail.creator_user_id = task.user.id 
+                # Solo incluir tickets creados por email (usuarios externos)
+                # Verificar si el ticket tiene email_sender (indica que vino por email)
+                if task.email_sender:
+                    activity_detail.creator_user_name = task.user.name
+                    activity_detail.creator_user_email = task.user.email 
+                    activity_detail.creator_user_id = task.user.id
+                    include_activity = True
         
-        # Para actividades de comentarios, extraer el nombre del usuario desde el action
+        # Para actividades de comentarios, solo incluir respuestas de usuarios externos via email
         elif activity.source_type == 'Comment':
-            # El action contiene algo como "Juan Pérez replied via email"
-            # Extraer el nombre del usuario desde el texto del action
-            if activity.action and " replied via email" in activity.action:
-                # Extraer el nombre antes de " replied via email"
-                user_name_part = activity.action.replace(" replied via email", "")
+            if activity.action and (" replied via email" in activity.action or " commented on ticket" in activity.action):
+                # Extraer el nombre del usuario desde el action
+                if " replied via email" in activity.action:
+                    user_name_part = activity.action.replace(" replied via email", "")
+                elif " commented on ticket" in activity.action:
+                    user_name_part = activity.action.replace(" commented on ticket", "")
                 activity_detail.creator_user_name = user_name_part
-                # Para comentarios de email, no tenemos el email/ID directamente aquí
-                # pero al menos tenemos el nombre
-            else:
-                # Si es un comentario pero no tiene el formato esperado, 
-                # probablemente sea de un agente, usar el agente
-                if activity.agent:
-                    activity_detail.creator_user_name = activity.agent.name
+                include_activity = True
+            # Skip agent comments - don't include them in notifications
         
-        results.append(activity_detail)
+        if include_activity:
+            results.append(activity_detail)
+        
+        # Stop when we have enough results
+        if len(results) >= limit:
+            break
     
     background_tasks = BackgroundTasks()
     background_tasks.add_task(clean_old_notifications, db)
