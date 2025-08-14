@@ -183,6 +183,105 @@ async def unlink_microsoft_account(
             detail=f"Error unlinking Microsoft account: {str(e)}"
         )
 
+@router.post("/auth/sync-avatar")
+async def sync_microsoft_avatar(
+    current_agent: Agent = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Sincroniza manualmente el avatar desde Microsoft 365.
+    Útil para actualizar el avatar cuando el usuario lo haya cambiado en M365.
+    """
+    try:
+        # Verificar que el agente tenga cuenta Microsoft vinculada
+        fresh_agent = db.query(Agent).filter(Agent.id == current_agent.id).first()
+        if not fresh_agent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+        
+        if not fresh_agent.microsoft_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Agent does not have Microsoft account linked"
+            )
+        
+        # Obtener token válido para la sincronización
+        microsoft_token = db.query(MicrosoftToken).filter(
+            MicrosoftToken.agent_id == fresh_agent.id,
+            MicrosoftToken.mailbox_connection_id.is_(None)  # Token de perfil, no de mailbox
+        ).order_by(MicrosoftToken.created_at.desc()).first()
+        
+        if not microsoft_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No Microsoft profile token found. Please re-link your account."
+            )
+        
+        # Verificar si el token es válido
+        if microsoft_token.expires_at <= datetime.utcnow():
+            # TODO: Implementar refresh token logic si es necesario
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Microsoft token expired. Please re-link your account."
+            )
+        
+        # Sincronizar avatar
+        microsoft_service = MicrosoftGraphService(db)
+        
+        try:
+            logger.info(f"🔄 Manual avatar sync requested for agent {fresh_agent.id}")
+            photo_bytes = microsoft_service._get_user_profile_photo(microsoft_token.access_token)
+            
+            if photo_bytes:
+                logger.info(f"📸 Profile photo found ({len(photo_bytes)} bytes), uploading to S3...")
+                avatar_url = microsoft_service._upload_avatar_to_s3(photo_bytes, fresh_agent.id)
+                
+                if avatar_url:
+                    # Actualizar avatar_url del agente
+                    old_avatar_url = fresh_agent.avatar_url
+                    fresh_agent.avatar_url = avatar_url
+                    db.commit()
+                    
+                    # Invalidar caché
+                    from app.core.cache import user_cache
+                    user_cache.delete(fresh_agent.id)
+                    
+                    logger.info(f"✅ Successfully synced avatar for agent {fresh_agent.id}: {avatar_url}")
+                    
+                    return {
+                        "message": "Avatar synchronized successfully",
+                        "avatar_url": avatar_url,
+                        "previous_avatar_url": old_avatar_url,
+                        "agent_id": fresh_agent.id
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to upload avatar to S3"
+                    )
+            else:
+                return {
+                    "message": "No profile photo available in Microsoft 365",
+                    "avatar_url": None,
+                    "agent_id": fresh_agent.id
+                }
+                
+        except Exception as sync_error:
+            logger.error(f"❌ Error during avatar sync for agent {fresh_agent.id}: {str(sync_error)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error synchronizing avatar: {str(sync_error)}"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error in sync avatar endpoint: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error synchronizing avatar: {str(e)}"
+        )
+
 @router.get("/auth/profile")
 async def get_microsoft_profile(
     current_agent: Agent = Depends(get_current_active_user),
