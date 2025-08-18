@@ -327,13 +327,18 @@ async def get_microsoft_profile(
 @router.get("/microsoft/check-user/{email}")
 async def check_user(email: str,     db: Session = Depends(get_db)
 ):
+    return_auth_method = ''
     try:
         get_auth_method = db.query(Agent).filter(Agent.email == email).first()
         agent_auth_method = get_auth_method.auth_method
-        if agent_auth_method == 'microsoft' or agent_auth_method == 'both':
-            return True
+        if agent_auth_method == 'microsoft':
+            return_auth_method =  'microsoft'
+        elif agent_auth_method == 'both':
+            return_auth_method = 'both'
         else:
-            return False
+            return_auth_method = 'password'
+        return return_auth_method
+
 
     except Exception as e:
        raise HTTPException(status_code=500, detail=str(e))
