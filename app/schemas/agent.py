@@ -12,16 +12,16 @@ class AgentBase(BaseModel):
     is_active: bool = True
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
-    email_signature: Optional[str] = None 
+    email_signature: Optional[str] = None
     avatar_url: Optional[str] = None
     microsoft_id: Optional[str] = None
     microsoft_email: Optional[str] = None
     microsoft_tenant_id: Optional[str] = None
-    microsoft_profile_data: Optional[str] = None  
+    microsoft_profile_data: Optional[str] = None
 
     @validator("role")
     def validate_role(cls, v):
-        allowed_roles = ["admin", "agent", "manager"] 
+        allowed_roles = ["admin", "agent", "manager"]
         if v == "Agent":
             return "agent"
         if v not in allowed_roles:
@@ -38,8 +38,8 @@ class AgentBase(BaseModel):
 class AgentInviteCreate(BaseModel):
     name: str
     email: EmailStr
-    role: str = "agent" 
-    workspace_id: int 
+    role: str = "agent"
+    workspace_id: int
     job_title: Optional[str] = None
 
     @validator("role")
@@ -50,9 +50,9 @@ class AgentInviteCreate(BaseModel):
         return v
 
 class AgentCreate(AgentBase):
-    password: Optional[str] = None 
+    password: Optional[str] = None
     workspace_id: int
-    is_active: bool = False 
+    is_active: bool = False
     invitation_token: Optional[str] = None
     invitation_token_expires_at: Optional[datetime] = None
     password_reset_token: Optional[str] = None
@@ -67,7 +67,7 @@ class AgentUpdate(BaseModel):
     is_active: Optional[bool] = None
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
-    email_signature: Optional[str] = None 
+    email_signature: Optional[str] = None
     avatar_url: Optional[str] = None  # URL del avatar del agente
     microsoft_id: Optional[str] = None
     microsoft_email: Optional[str] = None
@@ -77,7 +77,7 @@ class AgentUpdate(BaseModel):
     @validator("role")
     def validate_role(cls, v):
         if v is not None:
-            allowed_roles = ["admin", "agent", "manager"] 
+            allowed_roles = ["admin", "agent", "manager"]
             if v == "Agent":
                 return "agent"
             if v not in allowed_roles:
@@ -105,39 +105,39 @@ class AgentUpdate(BaseModel):
         """
         if len(password) < 8:
             raise ValueError("Password must be at least 8 characters long")
-        
+
         if len(password) > 128:
             raise ValueError("Password cannot be more than 128 characters long")
-        
+
         if not re.search(r"[a-z]", password):
             raise ValueError("Password must contain at least one lowercase letter")
-        
+
         if not re.search(r"[A-Z]", password):
             raise ValueError("Password must contain at least one uppercase letter")
-        
+
         if not re.search(r"\d", password):
             raise ValueError("Password must contain at least one number")
-        
+
         if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?~`]", password):
             raise ValueError("Password must contain at least one special character (!@#$%^&*()_+-=[]{}|;':\"\\,.<>?/~`)")
-        
+
         # Check that it's not a common password
         common_passwords = [
-            "password", "123456", "password123", "admin", "qwerty", 
+            "password", "123456", "password123", "admin", "qwerty",
             "letmein", "welcome", "monkey", "dragon", "master",
             "hello", "freedom", "whatever", "qazwsx", "trustno1"
         ]
-        
+
         if password.lower() in common_passwords:
             raise ValueError("Password cannot be a common password")
-        
+
         return password
 
 class AgentInDBBase(AgentBase):
     id: int
     workspace_id: int
-    created_at: Optional[datetime] = None 
-    updated_at: Optional[datetime] = None 
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     invitation_token: Optional[str] = None
     invitation_token_expires_at: Optional[datetime] = None
     password_reset_token: Optional[str] = None
