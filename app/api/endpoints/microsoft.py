@@ -325,8 +325,22 @@ async def get_microsoft_profile(
         )
 
 @router.get("/microsoft/check-user/{email}")
-async def check_user(email: str = Query(...)):
-    # Initialize MSAL client
+async def check_user(email: str,     db: Session = Depends(get_db)
+):
+    try:
+        get_auth_method = db.query(Agent).filter(Agent.email == email).first()
+        agent_auth_method = get_auth_method.auth_method
+        if agent_auth_method == 'microsoft' or agent_auth_method == 'both':
+            return True
+        else:
+            return False
+
+    except Exception as e:
+       raise HTTPException(status_code=500, detail=str(e))
+
+
+
+    '''
     app = ConfidentialClientApplication(
         client_id='6e2e4d52-8f3c-49b2-9495-09845e5090fa',
         client_credential='1da91d3d-1225-4f90-89ca-4f20e0ada1fc',
@@ -358,6 +372,7 @@ async def check_user(email: str = Query(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        '''
 @router.get("/auth/status")
 async def get_microsoft_auth_status(
     current_agent: Agent = Depends(get_current_active_user),
