@@ -327,7 +327,7 @@ async def get_microsoft_profile(
 
 @router.get("/auth/check-user/{email}")
 async def check_user(email: str,db: Session = Depends(get_db)
-):
+):            # Decode URL-encoded email
     auth_method = ''
     microsoft_id = ''
     microsoft_email = ''
@@ -337,7 +337,13 @@ async def check_user(email: str,db: Session = Depends(get_db)
     invitation_token_expires_at:datetime = datetime.now()
     workspace_id = 0
     try:
-        getAgent = db.query(Agent).filter(Agent.email == email).first()
+        import urllib.parse
+        decoded_email = urllib.parse.unquote(email)
+
+        logger.info(f"Checking user: {decoded_email}")
+
+        getAgent = db.query(Agent).filter(Agent.email == decoded_email).first()
+        #getAgent = db.query(Agent).filter(Agent.email == email).first()
         agent_auth_method = getAgent.auth_method
         if agent_auth_method == 'both':
             auth_method =  'microsoft'
