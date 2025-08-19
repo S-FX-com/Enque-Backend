@@ -325,8 +325,8 @@ async def get_microsoft_profile(
             detail=f"Error getting Microsoft profile: {str(e)}"
         )
 
-@router.get("/microsoft/check-user/{email}")
-async def check_user(email: str,     db: Session = Depends(get_db)
+@router.get("/auth/check-user/{email}")
+async def check_user(email: str,db: Session = Depends(get_db)
 ):
     auth_method = ''
     microsoft_id = ''
@@ -339,7 +339,7 @@ async def check_user(email: str,     db: Session = Depends(get_db)
     try:
         getAgent = db.query(Agent).filter(Agent.email == email).first()
         agent_auth_method = getAgent.auth_method
-        if agent_auth_method == 'microsoft':
+        if agent_auth_method == 'both':
             auth_method =  'microsoft'
             microsoft_id = getAgent.microsoft_id
             microsoft_email = getAgent.microsoft_email
@@ -348,8 +348,6 @@ async def check_user(email: str,     db: Session = Depends(get_db)
             invitation_token = getAgent.invitation_token
             invitation_token_expires_at = getAgent.invitation_token_expires_at
             workspace_id = getAgent.workspace_id
-        elif agent_auth_method == 'both':
-            auth_method = 'both'
         else:
             auth_method = 'password'
         return {
@@ -366,41 +364,6 @@ async def check_user(email: str,     db: Session = Depends(get_db)
     except Exception as e:
        raise HTTPException(status_code=500, detail=str(e))
 
-
-
-    '''
-    app = ConfidentialClientApplication(
-        client_id='6e2e4d52-8f3c-49b2-9495-09845e5090fa',
-        client_credential='1da91d3d-1225-4f90-89ca-4f20e0ada1fc',
-        authority='https://login.microsoftonline.com/76d9eabb-931c-452b-9e08-058b058b6581'
-    )
-
-    try:
-        # Get access token
-        token_response = app.acquire_token_for_client(
-            scopes=["https://graph.microsoft.com/.default"]
-        )
-
-        if "access_token" not in token_response:
-            raise HTTPException(status_code=500, detail="Failed to acquire token")
-
-        # Check user existence
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"https://graph.microsoft.com/v1.0/users/{email}",
-                headers={"Authorization": f"Bearer {token_response['access_token']}"}
-            )
-
-            if response.status_code == 200:
-                return True
-            elif response.status_code == 404:
-                return {"exists": False}
-            else:
-                raise HTTPException(status_code=response.status_code, detail="Graph API error")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        '''
 @router.get("/auth/status")
 async def get_microsoft_auth_status(
     current_agent: Agent = Depends(get_current_active_user),
