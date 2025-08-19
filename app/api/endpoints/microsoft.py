@@ -1,5 +1,5 @@
 from typing import Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import date, datetime, datetime_CAPI, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session, joinedload
@@ -27,6 +27,7 @@ import urllib.parse
 import base64
 import json
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 router = APIRouter()
 
@@ -327,17 +328,39 @@ async def get_microsoft_profile(
 @router.get("/microsoft/check-user/{email}")
 async def check_user(email: str,     db: Session = Depends(get_db)
 ):
-    return_auth_method = ''
+    auth_method = ''
+    microsoft_id = ''
+    microsoft_email = ''
+    microsoft_tenant_id = ''
+    microsoft_profile_data = ''
+    invitation_token = ''
+    invitation_token_expires_at:datetime = datetime.now()
+    workspace_id = 0
     try:
-        get_auth_method = db.query(Agent).filter(Agent.email == email).first()
-        agent_auth_method = get_auth_method.auth_method
+        getAgent = db.query(Agent).filter(Agent.email == email).first()
+        agent_auth_method = getAgent.auth_method
         if agent_auth_method == 'microsoft':
-            return_auth_method =  'microsoft'
+            auth_method =  'microsoft'
+            microsoft_id = getAgent.microsoft_id
+            microsoft_email = getAgent.microsoft_email
+            microsoft_tenant_id = getAgent.microsoft_tenant_id
+            microsoft_profile_data = getAgent.microsoft_profile_data
+            invitation_token = getAgent.invitation_token
+            invitation_token_expires_at = getAgent.invitation_token_expires_at
+            workspace_id = getAgent.workspace_id
         elif agent_auth_method == 'both':
-            return_auth_method = 'both'
+            auth_method = 'both'
         else:
-            return_auth_method = 'password'
-        return return_auth_method
+            auth_method = 'password'
+        return {
+            "auth_method":auth_method,
+            "microsoft_id":microsoft_id ,
+            "microsoft_email": microsoft_email,
+            "microsoft_tenant_id": microsoft_tenant_id,
+            "microsoft_profile_data": microsoft_profile_data,
+            "access_token": invitation_token,
+            "expires_in": invitation_token_expires_at,
+            "workspace_id": workspace_id}
 
 
     except Exception as e:
