@@ -499,7 +499,6 @@ async def create_comment(
 
             task_user = None
             if task.user_id:
-                from app.models.user import User
                 task_user = db.query(User).filter(User.id == task.user_id).first()
 
             agents = db.query(AgentModel).filter(
