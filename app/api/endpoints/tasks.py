@@ -36,73 +36,8 @@ from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_d
 router = APIRouter()
 
 
-# OPTIMIZADO: Use TaskSchema en lugar de TaskWithDetails para evitar relaciones pesadas
-@router.get("/", response_model=List[TaskSchema])
-async def read_tasks(
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 50,
-    current_user: Agent = Depends(get_current_active_user),
-    subject: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    team_id: Optional[int] = Query(None),
-    assignee_id: Optional[int] = Query(None),
-    priority: Optional[str] = Query(None),
-    category_id: Optional[int] = Query(None),
-) -> Any:
-
-    start_time = time.time()
-    
-    query = db.query(Task).filter(
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).options(
-        noload(Task.workspace),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.assignee),
-        noload(Task.user),
-        noload(Task.team),
-        noload(Task.company),
-        noload(Task.category),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection)
-    )
-
-    if subject:
-        query = query.filter(Task.title.ilike(f"%{subject}%"))
-    if status:
-        query = query.filter(Task.status == status)
-    if team_id:
-        query = query.filter(
-            or_(
-                Task.team_id == team_id,
-                and_(
-                    Task.team_id.is_(None),
-                    Task.mailbox_connection_id.isnot(None),
-                    Task.mailbox_connection_id.in_(
-                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                            mailbox_team_assignments.c.team_id == team_id
-                        )
-                    )
-                )
-            )
-        )
-    if assignee_id:
-        query = query.filter(Task.assignee_id == assignee_id)
-    if priority:
-        query = query.filter(Task.priority == priority)
-    if category_id:
-        query = query.filter(Task.category_id == category_id)
-
-    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    
-    query_time = time.time() - start_time
-            # Optimized tasks list query completed
-    
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/
+# Este endpoint ya no se usa en el frontend
 
 
 # Endpoint for ticket search - MOVED BEFORE /{task_id} endpoint
@@ -325,191 +260,12 @@ async def create_task(
     return task
 
 
-# Update response model to TaskWithDetails to include body
-@router.get("/{task_id}", response_model=TaskWithDetails)
-async def read_task(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Get a specific task by ID with all related details
-    """
-    try:
-        # Intentar usar caché ultra-rápido
-        from app.services.cache_service import cached_ticket_exists_check
-        ticket_exists = await cached_ticket_exists_check(
-            db, task_id, current_user.workspace_id, current_user.id
-        )
-    except Exception as e:
-        # Fallback a verificación tradicional
-        from sqlalchemy import exists as sql_exists
-        
-        ticket_exists = db.query(
-            sql_exists().where(
-                Task.id == task_id,
-                Task.workspace_id == current_user.workspace_id,
-                Task.is_deleted == False
-            )
-        ).scalar()
-    
-    if not ticket_exists:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    query = db.query(Task).options(
-        joinedload(Task.workspace),
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category),
-        joinedload(Task.body),
-        joinedload(Task.merged_by_agent)
-    ).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    )
-    
-    # Usar execution_options para optimizar la query
-    optimized_query = query.execution_options(
-        compiled_cache={},
-        autoflush=False,
-        autocommit=False
-    )
-    
-    task = optimized_query.first()
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return task
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/{task_id}/fast o /cached
+# Este endpoint ya no se usa en el frontend
 
 
-@router.put("/{task_id}", response_model=TaskWithDetails)
-async def update_task_endpoint(
-    task_id: int,
-    task_in: TicketUpdate,
-    request: Request,
-    db: Session = Depends(get_db),
-    # Inject the basic active user dependency
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Update a task. All roles (admin, manager, agent) can update all fields including assignee and team.
-    PERFORMANCE: Con logs detallados para operaciones de refresh/update
-    """
-    # 🔍 REFRESH PERFORMANCE LOGS
-    refresh_start_time = time.time()
-    task_logger.info(f"🔄 REFRESH: Iniciando actualización de ticket {task_id} para usuario {current_user.id}")
-    
-    # Log datos de la actualización
-    update_fields = [field for field, value in task_in.dict(exclude_unset=True).items() if value is not None]
-    task_logger.info(f"📝 REFRESH: Campos a actualizar: {update_fields}")
-    # Fetch the task ensuring it belongs to the user's workspace
-    fetch_start = time.time()
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first()
-    fetch_time = time.time() - fetch_start
-    pass
-
-    if not task:
-        total_time = time.time() - refresh_start_time
-        task_logger.warning(f"❌ REFRESH: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found",
-        )
-
-    # Get origin URL for notification
-    origin = request.headers.get("origin") or settings.FRONTEND_URL
-    task_logger.info(f"🌐 REFRESH: Origin URL: {origin}")
-
-    # Use the service function which handles the actual update logic
-    service_start = time.time()
-    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
-    service_time = time.time() - service_start
-    task_logger.info(f"⚙️ REFRESH: Task service update completado en {service_time*1000:.2f}ms")
-
-    if not updated_task_dict: # Service function returns the updated dict or None
-        total_time = time.time() - refresh_start_time
-        task_logger.error(f"❌ REFRESH: Update falló para ticket {task_id} en {total_time*1000:.2f}ms")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
-            detail="Task update failed", # Or more specific error from service
-        )
-    
-    # Load the complete task object with all relationships required by TaskWithDetails
-    # ⚠️ POSIBLE CUELLO DE BOTELLA: Carga todas las relaciones después del update
-    reload_start = time.time()
-    task_logger.info(f"🔄 REFRESH: Iniciando recarga completa del ticket con todas las relaciones...")
-    
-    updated_task_obj = db.query(Task).options(
-        joinedload(Task.workspace),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.user),
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.category),
-        joinedload(Task.body)
-    ).filter(Task.id == task_id).first()
-    
-    reload_time = time.time() - reload_start
-    task_logger.info(f"🔄 REFRESH: Recarga de relaciones completada en {reload_time*1000:.2f}ms")
-    task_logger.info(f"📊 REFRESH: Relaciones cargadas: workspace, team, company, user, sent_from, sent_to, assignee, category, body")
-
-    if not updated_task_obj:
-        total_time = time.time() - refresh_start_time
-        task_logger.error(f"❌ REFRESH: Ticket {task_id} no encontrado después del update en {total_time*1000:.2f}ms")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found after update",
-        )
-
-    # --- Socket.IO Event ---
-    socketio_start = time.time()
-    try:
-        # ✅ OPTIMIZACIÓN: Usar función síncrona para respuesta más rápida
-        task_data = {
-            'id': updated_task_obj.id,
-            'title': updated_task_obj.title,
-            'status': updated_task_obj.status,
-            'priority': updated_task_obj.priority,
-            'workspace_id': updated_task_obj.workspace_id,
-            'assignee_id': updated_task_obj.assignee_id,
-            'team_id': updated_task_obj.team_id,
-            'user_id': updated_task_obj.user_id,
-            'updated_at': updated_task_obj.updated_at.isoformat() if updated_task_obj.updated_at else None
-        }
-        
-        # Usar función síncrona para no bloquear la respuesta
-        from app.core.socketio import emit_ticket_update_sync
-        emit_ticket_update_sync(updated_task_obj.workspace_id, task_data)
-        
-        socketio_time = time.time() - socketio_start
-        task_logger.info(f"📡 REFRESH: Socket.IO emit completado en {socketio_time*1000:.2f}ms")
-        
-    except Exception as e:
-        socketio_time = time.time() - socketio_start
-        task_logger.error(f"❌ REFRESH: Socket.IO falló en {socketio_time*1000:.2f}ms: {str(e)}")
-    # --- End Socket.IO Event ---
-
-    # 🎯 REFRESH PERFORMANCE SUMMARY
-    total_refresh_time = time.time() - refresh_start_time
-    
-    # ⚠️ ADVERTENCIA si la recarga de relaciones es lenta
-    if reload_time > 0.1:  # > 100ms
-        pass
-
-    # Return the updated ORM object with all relationships
-    return updated_task_obj
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/{task_id}/refresh
+# Este endpoint ya no se usa en el frontend
 
 
 
@@ -550,109 +306,16 @@ async def delete_task(
     return {"message": "Task deleted successfully"}
 
 
-@router.get("/user/{user_id}", response_model=List[TaskSchema])
-async def read_user_tasks(
-    user_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Retrieve tasks created by a specific user WITHIN the current user's workspace
-    """
-    # Add workspace filter
-    tasks = db.query(Task).filter(
-        Task.user_id == user_id,
-        Task.workspace_id == current_user.workspace_id, # Filter by current user's workspace
-        Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/assignee/{agent_id}
+# Este endpoint ya no se usa en el frontend
 
 
-@router.get("/assignee/{agent_id}", response_model=List[TaskSchema])
-async def read_assigned_tasks(
-    agent_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-    subject: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    priority: Optional[str] = Query(None),
-) -> Any:
-    """
-    OPTIMIZADO: Tasks assigned without heavy relationships for maximum performance
-    """
-    start_time = time.time()
-    
-    query = db.query(Task).filter(
-        Task.assignee_id == agent_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).options(
-        # EVITAR loading relationships for maximum performance
-        noload(Task.workspace),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.assignee),
-        noload(Task.user),
-        noload(Task.team),
-        noload(Task.company),
-        noload(Task.category),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection)
-    )
-
-    if subject:
-        query = query.filter(Task.title.ilike(f"%{subject}%"))
-    if status:
-        query = query.filter(Task.status == status)
-    if priority:
-        query = query.filter(Task.priority == priority)
-
-    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    
-    query_time = time.time() - start_time
-            # Optimized assignee tasks query completed
-    
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/assignee/{agent_id}/fast
+# Este endpoint ya no se usa en el frontend
 
 
-@router.get("/team/{team_id}", response_model=List[TaskSchema])
-async def read_team_tasks(
-    team_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Retrieve tasks assigned to a specific team WITHIN the current user's workspace.
-    Includes both direct team assignments and mailbox team assignments.
-    """
-    # Include both direct team assignments and mailbox team assignments (avoiding duplicates)
-    tasks = db.query(Task).filter(
-        or_(
-            Task.team_id == team_id,  # Direct team assignment
-            and_(  # Mailbox team assignment (only for tickets without direct team assignment)
-                Task.team_id.is_(None),  # Only include mailbox tickets that don't have team_id
-                Task.mailbox_connection_id.isnot(None),
-                Task.mailbox_connection_id.in_(
-                    db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                        mailbox_team_assignments.c.team_id == team_id
-                    )
-                )
-            )
-        ),
-        Task.workspace_id == current_user.workspace_id, # Filter by current user's workspace
-        Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/team/{team_id}
+# Este endpoint ya no se usa en el frontend
 
 
 @router.get("/{task_id}/initial-content")

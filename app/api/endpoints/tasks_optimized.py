@@ -499,7 +499,7 @@ async def read_single_task_with_cache(
     return TaskWithDetails.from_orm(task)
 
 
-@router.get("/{task_id}/essential")
+@router.get("/{task_id}/essential", response_model=TaskWithDetails)
 async def read_single_task_essential_relations(
     task_id: int,
     db: Session = Depends(get_db),
@@ -516,23 +516,14 @@ async def read_single_task_essential_relations(
     exists_time = time.time() - exists_start
     
     if not ticket_exists:
-        total_time = time.time() - start_time
-        logger.warning(f"❌ ESSENTIAL: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    logger.info(f"✅ ESSENTIAL: Existencia verificada en {exists_time*1000:.2f}ms")
 
     from sqlalchemy.orm import joinedload
     
-    query_start = time.time()
-    logger.info(f"🔀 ESSENTIAL: Ejecutando query híbrida (3 relaciones esenciales + 7 omitidas)...")
-    
     task = db.query(Task).options(
-
         joinedload(Task.assignee),  
         joinedload(Task.user),      
         joinedload(Task.category),  
-
         noload(Task.workspace),
         noload(Task.sent_from),
         noload(Task.sent_to),
@@ -549,37 +540,8 @@ async def read_single_task_essential_relations(
         Task.is_deleted == False
     ).first()
     
-    query_time = time.time() - query_start
-    logger.info(f"💾 ESSENTIAL: Query híbrida ejecutada en {query_time*1000:.2f}ms")
-    
     if not task:
-        total_time = time.time() - start_time
-        logger.error(f"❌ ESSENTIAL: Ticket {task_id} no encontrado después de verificación - ERROR INCONSISTENTE")
-        logger.error(f"❌ ESSENTIAL: Tiempo total perdido: {total_time*1000:.2f}ms")
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # 3. Análisis de relaciones esenciales cargadas
-    relations_analysis_start = time.time()
-    logger.info(f"🔍 ESSENTIAL: Analizando relaciones esenciales cargadas...")
-    
-    essential_relations = []
-    if hasattr(task, 'assignee') and task.assignee:
-        essential_relations.append(f"assignee(id:{task.assignee.id}, name:{task.assignee.name})")
-    if hasattr(task, 'user') and task.user:
-        essential_relations.append(f"user(id:{task.user.id}, email:{task.user.email})")
-    if hasattr(task, 'category') and task.category:
-        essential_relations.append(f"category(id:{task.category.id}, name:{task.category.name})")
-    
-    relations_analysis_time = time.time() - relations_analysis_start
-    
-    # 4. Análisis de contenido
-    content_analysis_start = time.time()
-    title_size = len(task.title) if task.title else 0
-    description_size = len(task.description) if task.description else 0
-    content_analysis_time = time.time() - content_analysis_start
-    
-    # 5. Performance summary híbrido
-    total_time = time.time() - start_time
 
     return TaskWithDetails.from_orm(task)
 
