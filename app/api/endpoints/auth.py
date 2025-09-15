@@ -350,6 +350,43 @@ async def microsoft_login(
         db.commit()
         db.refresh(agent)
         logger.info(f"Microsoft authentication successful for agent {agent.email} (ID: {agent.id})")
+        
+        # Extract and save Microsoft 365 avatar if available
+        try:
+            from app.services.microsoft_service import MicrosoftGraphService
+            
+            # Check if agent doesn't have an avatar or if it's a new Microsoft user
+            if not agent.avatar_url:
+                logger.info(f"🔍 Attempting to download Microsoft 365 avatar for agent {agent.id}")
+                microsoft_service = MicrosoftGraphService(db)
+                
+                # Get the user's profile photo from Microsoft Graph API
+                photo_bytes = microsoft_service._get_user_profile_photo(microsoft_data.access_token)
+                
+                if photo_bytes:
+                    logger.info(f"📸 Profile photo found ({len(photo_bytes)} bytes), uploading to S3...")
+                    avatar_url = microsoft_service._upload_avatar_to_s3(photo_bytes, agent.id)
+                    
+                    if avatar_url:
+                        # Update agent's avatar URL
+                        agent.avatar_url = avatar_url
+                        db.commit()
+                        
+                        # Invalidate cache
+                        from app.core.cache import user_cache
+                        user_cache.delete(agent.id)
+                        
+                        logger.info(f"✅ Successfully extracted and saved Microsoft 365 avatar for agent {agent.id}: {avatar_url}")
+                    else:
+                        logger.warning(f"❌ Failed to upload avatar to S3 for agent {agent.id}")
+                else:
+                    logger.info(f"📷 No profile photo available in Microsoft 365 for agent {agent.id}")
+                    
+        except Exception as avatar_error:
+            logger.error(f"❌ Error extracting Microsoft 365 avatar for agent {agent.id}: {str(avatar_error)}")
+            # Don't fail the login process if avatar extraction fails
+            pass
+        
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         token_payload = {
             "role": agent.role,

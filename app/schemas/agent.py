@@ -10,6 +10,7 @@ class AgentBase(BaseModel):
     role: str = "agent"
     auth_method: str = "password"
     is_active: bool = True
+    teams_notifications_enabled: bool = False
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 
@@ -65,6 +66,7 @@ class AgentUpdate(BaseModel):
     role: Optional[str] = None
     auth_method: Optional[str] = None
     is_active: Optional[bool] = None
+    teams_notifications_enabled: Optional[bool] = None
     job_title: Optional[str] = None
     phone_number: Optional[str] = None
     email_signature: Optional[str] = None 

@@ -20,6 +20,7 @@ from app.schemas.microsoft import (
     MailboxConnectionUpdate
 )
 from app.services.microsoft_service import MicrosoftGraphService
+from app.core.security import create_access_token # Importar la función para crear tokens
 from app.utils.logger import ms_logger as logger
 import urllib.parse
 import base64 
@@ -27,6 +28,92 @@ import json
 from pydantic import BaseModel, Field
 
 router = APIRouter()
+
+@router.get("/signin/auth/url")
+async def get_microsoft_signin_auth_url(
+    request: Request,
+    workspace_id: Optional[int] = Query(None, description="Workspace ID for signin authentication"),
+    origin_url: Optional[str] = Query(None, description="Frontend origin URL for redirect"),
+    db: Session = Depends(get_db)
+):
+    """
+    Generate Microsoft 365 auth URL for signin (unified login)
+    This endpoint is specifically for the signin flow and doesn't require authentication
+    """
+    try:
+        # Default workspace if not provided
+        if not workspace_id:
+            workspace = db.query(Workspace).first()
+            if not workspace:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No workspace available"
+                )
+            workspace_id = workspace.id
+            
+        # Validate workspace exists
+        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Workspace with ID {workspace_id} not found"
+            )
+        
+        # Get original hostname from origin_url parameter or referer
+        original_hostname = None
+        if origin_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(origin_url)
+            original_hostname = parsed.netloc
+            logger.info(f"Using original_hostname from origin_url parameter: {original_hostname}")
+        else:
+            referer = request.headers.get("referer", "")
+            if referer:
+                from urllib.parse import urlparse
+                parsed = urlparse(referer)
+                original_hostname = parsed.netloc
+                logger.info(f"Extracted original_hostname from referer: {original_hostname}")
+            else:
+                logger.warning("No origin_url or referer found, original_hostname will be None")
+        
+        # Create state data for signin flow
+        state_data = {
+            "workspace_id": str(workspace_id),
+            "flow": "auth",  # This identifies it as an authentication flow (signin)
+            "original_hostname": original_hostname
+        }
+        state_json_string = json.dumps(state_data)
+        base64_state = base64.urlsafe_b64encode(state_json_string.encode()).decode('utf-8')
+        base64_state = base64_state.replace('+', '-').replace('/', '_').rstrip('=')
+        
+        # Build Microsoft OAuth URL
+        auth_url_params = {
+            "client_id": settings.MICROSOFT_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": settings.MICROSOFT_REDIRECT_URI,
+            "response_mode": "query",
+            "scope": "offline_access User.Read Mail.Read",  # Added User.Read for profile info including avatar
+            "state": base64_state,
+            "prompt": "select_account"  # This allows users to select which account to use
+        }
+        
+        import urllib.parse
+        auth_url_params_encoded = urllib.parse.urlencode(auth_url_params)
+        auth_url = f"https://login.microsoftonline.com/{settings.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize?{auth_url_params_encoded}"
+        
+        logger.info(f"Generated Microsoft signin auth URL for workspace {workspace_id}")
+        
+        return {
+            "auth_url": auth_url,
+            "message": "Microsoft signin authorization URL generated successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating Microsoft signin auth URL: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating signin authorization URL: {str(e)}"
+        )
 
 @router.get("/profile/test")
 async def test_microsoft_profile_endpoint(
@@ -370,51 +457,6 @@ async def get_microsoft_auth_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error getting Microsoft auth status: {str(e)}"
         )
-async def handle_microsoft_signin_flow(db: Session, code: str, state_data: dict, original_hostname: Optional[str]) -> RedirectResponse:
-    try:
-        workspace_id = int(state_data.get('workspace_id', 1))
-        token_endpoint = f"https://login.microsoftonline.com/{settings.MICROSOFT_TENANT_ID}/oauth2/v2.0/token"
-        token_data = {
-            "client_id": settings.MICROSOFT_CLIENT_ID,
-            "client_secret": settings.MICROSOFT_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": settings.MICROSOFT_REDIRECT_URI,
-            "scope": "offline_access User.Read Mail.Read"
-        }
-        
-        import requests
-        token_response = requests.post(token_endpoint, data=token_data)
-        token_response.raise_for_status()
-        token_result = token_response.json()
-        user_info_response = requests.get(
-            "https://graph.microsoft.com/v1.0/me",
-            headers={"Authorization": f"Bearer {token_result['access_token']}"}
-        )
-        user_info_response.raise_for_status()
-        user_info = user_info_response.json()
-        from app.schemas.agent import AgentMicrosoftLogin
-        from app.api.endpoints.auth import microsoft_login
-        microsoft_login_data = AgentMicrosoftLogin(
-            microsoft_id=user_info["id"],
-            microsoft_email=user_info.get("mail") or user_info.get("userPrincipalName"),
-            microsoft_tenant_id=settings.MICROSOFT_TENANT_ID,
-            microsoft_profile_data=json.dumps(user_info),
-            access_token=token_result["access_token"],
-            expires_in=token_result["expires_in"],
-            workspace_id=workspace_id
-        )
-        login_result = await microsoft_login(microsoft_login_data, db)
-        token = login_result["access_token"]
-        logger.info(f"Microsoft login successful, generated token: {token[:20]}...")
-        redirect_url = get_frontend_redirect_url(f"/signin?microsoft_token={token}&success=true", original_hostname)
-        logger.info(f"Redirecting to: {redirect_url}")
-        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
-    except Exception as e:
-        logger.error(f"Error in Microsoft signin flow: {e}", exc_info=True)
-        error_message = urllib.parse.quote(f"Authentication failed: {str(e)}")
-        redirect_url = get_frontend_redirect_url(f"/signin?error=processing_failed&error_description={error_message}", original_hostname)
-        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
 
 def get_frontend_redirect_url(path: str, original_hostname: Optional[str] = None) -> str:
     if original_hostname:
@@ -686,12 +728,50 @@ async def microsoft_auth_callback_get(
     try:
         flow_type = state_data.get('flow') if state_data else None
         logger.info(f"🔍 Microsoft callback - Flow type: {flow_type}, State data: {state_data}")
-        if state_data and state_data.get('flow') == 'auth':
-            # Direct authentication flow - handle login and redirect to signin with token
-            logger.info("📝 Processing as authentication flow")
-            return await handle_microsoft_signin_flow(db, code, state_data, original_hostname)
-        elif state_data and state_data.get('flow') == 'profile_link':
-            logger.info("📝 Processing as profile linking flow")
+
+        # --- UNIFIED FLOW START ---
+        if flow_type in ['auth', 'profile_link']:
+            logger.info(f"📝 Processing as '{flow_type}' flow")
+            redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
+            
+            microsoft_service = MicrosoftGraphService(db)
+            # This now calls the service that correctly saves the refresh token
+            token_response = microsoft_service.exchange_code_for_token(
+                code=code,
+                redirect_uri=redirect_uri,
+                state=state
+            )
+
+            if flow_type == 'auth':
+                # If it's a login flow, we need to generate a session token and redirect
+                agent = db.query(Agent).filter(Agent.id == token_response.agent_id).first()
+                if not agent:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found after Microsoft auth.")
+
+                access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+                token_payload = {
+                    "role": agent.role,
+                    "workspace_id": str(agent.workspace_id),
+                    "name": agent.name,
+                    "email": agent.email,
+                    "auth_method": agent.auth_method
+                }
+                session_token = create_access_token(
+                    subject=str(agent.id),
+                    extra_data=token_payload,
+                    expires_delta=access_token_expires,
+                )
+                logger.info(f"Microsoft login successful, generated session token for agent {agent.id}")
+                redirect_url = get_frontend_redirect_url(f"/signin?microsoft_token={session_token}&success=true", original_hostname)
+            
+            else: # flow_type == 'profile_link'
+                success_message = urllib.parse.quote("Microsoft account linked successfully!")
+                redirect_url = get_frontend_redirect_url(f"/settings/profile?microsoft_link=true&status=success&message={success_message}", original_hostname)
+
+        # --- UNIFIED FLOW END ---
+        
+        elif state_data and state_data.get('flow') == 'mailbox_reconnect':
+            logger.info("📝 Processing as mailbox token regeneration flow")
             # Profile linking flow - use exchange_code_for_token with profile linking
             redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
             logger.info(f"Profile linking callback using redirect_uri: {redirect_uri}")
@@ -705,6 +785,74 @@ async def microsoft_auth_callback_get(
             
             success_message = urllib.parse.quote("Microsoft account linked successfully!")
             redirect_url = get_frontend_redirect_url(f"/settings/profile?microsoft_link=true&status=success&message={success_message}", original_hostname)
+        elif state_data and state_data.get('flow') == 'mailbox_reconnect':
+            logger.info("📝 Processing as mailbox token regeneration flow")
+            mailbox_id = int(state_data.get('mailbox_id'))
+            
+            # Regenerate token for specific mailbox
+            redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
+            logger.info(f"Mailbox reconnect callback for mailbox {mailbox_id} using redirect_uri: {redirect_uri}")
+            
+            microsoft_service = MicrosoftGraphService(db)
+            
+            # Verify mailbox exists
+            mailbox = db.query(MailboxConnection).filter(MailboxConnection.id == mailbox_id).first()
+            if not mailbox:
+                logger.error(f"Mailbox {mailbox_id} not found for token regeneration")
+                error_message = urllib.parse.quote(f"Mailbox not found")
+                redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=error&message={error_message}", original_hostname)
+                return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+            
+            try:
+                # Para el flow de regeneración, necesitamos actualizar el state con información del agente
+                # Obtener workspace del mailbox para determinar el agente
+                workspace_id = mailbox.workspace_id
+                
+                # Obtener el agente que creó este mailbox o cualquier admin del workspace
+                agent = db.query(Agent).filter(
+                    Agent.workspace_id == workspace_id,
+                    Agent.role.in_(['admin', 'manager']),
+                    Agent.is_active == True
+                ).first()
+                
+                if not agent:
+                    # Si no hay admin, usar el agente que creó el mailbox
+                    agent = db.query(Agent).filter(Agent.id == mailbox.created_by_agent_id).first()
+                
+                if not agent:
+                    logger.error(f"No suitable agent found for mailbox {mailbox_id} token regeneration")
+                    error_message = urllib.parse.quote("No suitable agent found for token regeneration")
+                    redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=error&message={error_message}", original_hostname)
+                    return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+                
+                # Crear un state actualizado con la información del agente
+                updated_state_data = {
+                    "workspace_id": str(workspace_id),
+                    "agent_id": str(agent.id),
+                    "connection_id": str(mailbox_id),
+                    "is_reconnect": "true",
+                    "flow": "mailbox_reconnect"
+                }
+                
+                updated_state_json = json.dumps(updated_state_data)
+                updated_state = base64.b64encode(updated_state_json.encode()).decode()
+                
+                # Exchange code for token and update the existing mailbox
+                new_token = microsoft_service.exchange_code_for_token(
+                    code=code,
+                    redirect_uri=redirect_uri,
+                    state=updated_state
+                )
+                
+                logger.info(f"Successfully regenerated token for mailbox {mailbox.email} (ID: {mailbox_id})")
+                success_message = urllib.parse.quote(f"Token regenerated successfully for {mailbox.email}")
+                redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=success&message={success_message}", original_hostname)
+                
+            except Exception as e:
+                logger.error(f"Failed to regenerate token for mailbox {mailbox_id}: {str(e)}")
+                error_message = urllib.parse.quote(f"Failed to regenerate token: {str(e)}")
+                redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=error&message={error_message}", original_hostname)
+                return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
         else:
             logger.info("📝 Processing as mailbox configuration flow (DEFAULT) - This should NOT happen for agent login!")
             redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
@@ -955,4 +1103,325 @@ def update_mailbox_connection(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update mailbox connection"
+        )
+
+@router.post("/mailboxes/{mailbox_id}/auto-regenerate-token")
+async def auto_regenerate_mailbox_token(
+    mailbox_id: int,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Regenera automáticamente el token de Microsoft para un mailbox usando refresh token
+    o copiando un token válido existente del workspace
+    """
+    try:
+        # Verificar que el mailbox existe y el agente tiene acceso
+        mailbox = db.query(MailboxConnection).filter(
+            MailboxConnection.id == mailbox_id,
+            MailboxConnection.workspace_id == current_agent.workspace_id
+        ).first()
+        
+        if not mailbox:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Mailbox not found or access denied"
+            )
+        
+        # Buscar un token existente para este mailbox
+        existing_token = db.query(MicrosoftToken).filter(
+            MicrosoftToken.mailbox_connection_id == mailbox_id
+        ).first()
+        
+        microsoft_service = MicrosoftGraphService(db)
+        
+        # Método 1: Intentar renovar con refresh token si existe
+        if existing_token and existing_token.refresh_token:
+            try:
+                logger.info(f"Attempting to refresh existing token for mailbox {mailbox.email}")
+                refreshed_token = await microsoft_service.refresh_token_async(existing_token)
+                
+                if refreshed_token:
+                    logger.info(f"Successfully refreshed token for mailbox {mailbox.email}")
+                    return {
+                        "success": True,
+                        "method": "refresh_token",
+                        "mailbox_email": mailbox.email,
+                        "token_expires_at": refreshed_token.expires_at.isoformat(),
+                        "message": f"Token refreshed successfully for {mailbox.email}"
+                    }
+            except Exception as refresh_error:
+                logger.warning(f"Failed to refresh token for mailbox {mailbox_id}: {refresh_error}")
+        
+        # Método 2: Copiar token válido de otro agente del workspace
+        logger.info(f"Attempting to clone token from workspace agents for mailbox {mailbox.email}")
+        
+        # Buscar tokens válidos de agentes en el mismo workspace
+        valid_agent_tokens = db.query(Agent, MicrosoftToken)\
+            .join(MicrosoftToken, MicrosoftToken.agent_id == Agent.id)\
+            .filter(
+                Agent.workspace_id == current_agent.workspace_id,
+                Agent.microsoft_id.isnot(None),
+                MicrosoftToken.access_token.isnot(None),
+                MicrosoftToken.expires_at > datetime.utcnow()
+            ).all()
+        
+        if valid_agent_tokens:
+            # Usar el primer token válido encontrado
+            source_agent, source_token = valid_agent_tokens[0]
+            logger.info(f"Cloning token from agent {source_agent.email} to mailbox {mailbox.email}")
+            
+            # Obtener o crear integración
+            integration = db.query(MicrosoftIntegration).first()
+            if not integration:
+                integration = MicrosoftIntegration(
+                    tenant_id=settings.MICROSOFT_TENANT_ID,
+                    client_id=settings.MICROSOFT_CLIENT_ID,
+                    client_secret=settings.MICROSOFT_CLIENT_SECRET
+                )
+                db.add(integration)
+                db.commit()
+                db.refresh(integration)
+            
+            # Crear/actualizar token para el mailbox basado en el token del agente
+            if existing_token:
+                # Actualizar token existente
+                existing_token.access_token = source_token.access_token
+                existing_token.expires_at = source_token.expires_at
+                existing_token.updated_at = datetime.utcnow()
+                logger.info(f"Updated existing token for mailbox {mailbox.email}")
+            else:
+                # Crear nuevo token
+                new_token = MicrosoftToken(
+                    integration_id=integration.id,
+                    agent_id=None,  # No agent_id for mailbox tokens
+                    mailbox_connection_id=mailbox_id,
+                    access_token=source_token.access_token,
+                    refresh_token="",  # Mailbox tokens usually don't have refresh tokens
+                    token_type="Bearer",
+                    expires_at=source_token.expires_at
+                )
+                db.add(new_token)
+                logger.info(f"Created new token for mailbox {mailbox.email}")
+            
+            db.commit()
+            
+            return {
+                "success": True,
+                "method": "token_clone",
+                "mailbox_email": mailbox.email,
+                "source_agent": source_agent.email,
+                "token_expires_at": source_token.expires_at.isoformat(),
+                "message": f"Token cloned successfully from {source_agent.email} to {mailbox.email}"
+            }
+        
+        # Método 3: Si no hay tokens válidos, devolver URL de autorización manual
+        logger.warning(f"No valid tokens found in workspace for cloning. Manual authorization required.")
+        
+        return {
+            "success": False,
+            "method": "manual_required",
+            "mailbox_email": mailbox.email,
+            "message": f"No valid tokens available for automatic regeneration. Manual authorization required.",
+            "manual_auth_endpoint": f"/v1/microsoft/mailboxes/{mailbox_id}/regenerate-token"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error auto-regenerating token for mailbox {mailbox_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to auto-regenerate token: {str(e)}"
+        )
+
+@router.post("/mailboxes/auto-regenerate-all")
+async def auto_regenerate_all_missing_tokens(
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Regenera automáticamente todos los tokens faltantes para mailboxes del workspace
+    """
+    try:
+        from datetime import datetime
+        
+        # Obtener todos los mailboxes del workspace que necesitan tokens
+        mailboxes = db.query(MailboxConnection).filter(
+            MailboxConnection.workspace_id == current_agent.workspace_id,
+            MailboxConnection.is_active == True
+        ).all()
+        
+        results = []
+        
+        for mailbox in mailboxes:
+            # Verificar si necesita token
+            token = db.query(MicrosoftToken).filter(
+                MicrosoftToken.mailbox_connection_id == mailbox.id
+            ).first()
+            
+            needs_regeneration = not token or token.expires_at < datetime.utcnow()
+            
+            if needs_regeneration:
+                try:
+                    # Llamar al endpoint de auto-regeneración para este mailbox
+                    result = await auto_regenerate_mailbox_token(mailbox.id, db, current_agent)
+                    results.append({
+                        "mailbox_id": mailbox.id,
+                        "mailbox_email": mailbox.email,
+                        **result
+                    })
+                except Exception as e:
+                    results.append({
+                        "mailbox_id": mailbox.id,
+                        "mailbox_email": mailbox.email,
+                        "success": False,
+                        "error": str(e)
+                    })
+            else:
+                results.append({
+                    "mailbox_id": mailbox.id,
+                    "mailbox_email": mailbox.email,
+                    "success": True,
+                    "method": "no_action_needed",
+                    "message": "Token is already valid"
+                })
+        
+        successful = len([r for r in results if r.get("success")])
+        total = len(results)
+        
+        logger.info(f"Auto-regeneration completed: {successful}/{total} successful")
+        
+        return {
+            "workspace_id": current_agent.workspace_id,
+            "total_mailboxes": total,
+            "successful_regenerations": successful,
+            "failed_regenerations": total - successful,
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error auto-regenerating all tokens: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to auto-regenerate all tokens: {str(e)}"
+        )
+
+@router.post("/mailboxes/{mailbox_id}/regenerate-token")
+async def regenerate_mailbox_token(
+    mailbox_id: int,
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Regenera el token de Microsoft para un mailbox específico
+    Útil cuando el token ha expirado o no existe
+    """
+    try:
+        # Verificar que el mailbox existe y el agente tiene acceso
+        mailbox = db.query(MailboxConnection).filter(
+            MailboxConnection.id == mailbox_id,
+            MailboxConnection.workspace_id == current_agent.workspace_id
+        ).first()
+        
+        if not mailbox:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Mailbox not found or access denied"
+            )
+        
+        # Generar URL de autorización para reconectar el mailbox
+        state_data = {
+            "workspace_id": str(current_agent.workspace_id),
+            "flow": "mailbox_reconnect",
+            "mailbox_id": str(mailbox_id),
+            "original_hostname": "app.enque.cc"  # Default hostname
+        }
+        
+        # Encode state data
+        state_json = json.dumps(state_data)
+        encoded_state = base64.b64encode(state_json.encode()).decode()
+        
+        # Build authorization URL
+        auth_url = (
+            f"https://login.microsoftonline.com/{settings.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
+            f"?client_id={settings.MICROSOFT_CLIENT_ID}"
+            f"&response_type=code"
+            f"&redirect_uri={urllib.parse.quote(settings.MICROSOFT_REDIRECT_URI)}"
+            f"&response_mode=query"
+            f"&scope={urllib.parse.quote('offline_access User.Read Mail.Read Mail.ReadWrite Mail.Send TeamMember.ReadWrite.All TeamsActivity.Send')}"
+            f"&state={encoded_state}"
+        )
+        
+        logger.info(f"Generated token regeneration URL for mailbox {mailbox.email} (ID: {mailbox_id})")
+        
+        return {
+            "auth_url": auth_url,
+            "mailbox_email": mailbox.email,
+            "message": f"Use this URL to regenerate token for mailbox {mailbox.email}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating token regeneration URL for mailbox {mailbox_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate regeneration URL: {str(e)}"
+        )
+
+@router.get("/mailboxes/missing-tokens")
+async def get_mailboxes_missing_tokens(
+    db: Session = Depends(get_db),
+    current_agent: Agent = Depends(get_current_active_user)
+):
+    """
+    Lista todos los mailboxes que no tienen tokens válidos
+    """
+    try:
+        from datetime import datetime
+        
+        # Obtener todos los mailboxes del workspace
+        mailboxes = db.query(MailboxConnection).filter(
+            MailboxConnection.workspace_id == current_agent.workspace_id,
+            MailboxConnection.is_active == True
+        ).all()
+        
+        missing_tokens = []
+        
+        for mailbox in mailboxes:
+            # Verificar si tiene token válido
+            token = db.query(MicrosoftToken).filter(
+                MicrosoftToken.mailbox_connection_id == mailbox.id
+            ).first()
+            
+            status_info = {
+                "mailbox_id": mailbox.id,
+                "email": mailbox.email,
+                "display_name": mailbox.display_name,
+                "has_token": token is not None,
+                "token_expired": False,
+                "needs_regeneration": False
+            }
+            
+            if token:
+                token_expired = token.expires_at < datetime.utcnow()
+                status_info["token_expired"] = token_expired
+                status_info["token_expires_at"] = token.expires_at.isoformat()
+                status_info["needs_regeneration"] = token_expired
+            else:
+                status_info["needs_regeneration"] = True
+            
+            if status_info["needs_regeneration"]:
+                missing_tokens.append(status_info)
+        
+        logger.info(f"Found {len(missing_tokens)} mailboxes needing token regeneration in workspace {current_agent.workspace_id}")
+        
+        return {
+            "workspace_id": current_agent.workspace_id,
+            "mailboxes_missing_tokens": missing_tokens,
+            "total_count": len(missing_tokens)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting mailboxes missing tokens: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get mailboxes missing tokens: {str(e)}"
         )

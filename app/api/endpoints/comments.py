@@ -84,14 +84,47 @@ async def read_comments(
     pass
     return comments_orm
 
+@router.get("/tasks/{task_id}/scheduled_comments", response_model=List[CommentSchema])
+async def get_scheduled_comments(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
+) -> Any:
+    start_time = time.time()
+    pass
+    permissions_start = time.time()
+    scheduled_comment = db.query(ScheduledCommentModel).filter(
+        ScheduledCommentModel.id == task_id,
+        ScheduledCommentModel.workspace_id == current_user.workspace_id,
+    )
+    permissions_time = time.time() - permissions_start
+
+    if not scheduled_comment:
+        total_time = time.time() - start_time
+        logger.error(f"Scheduled comment in inside the task with the id ${task_id} was not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scheduled comment not found",
+        )
+
+    if scheduled_comment[0].agent_id != current_user.id:
+        return {"message":"Only the owner can see before it arrives"}
+
+    query_start = time.time()
+    scheduled_comments_list:list = []
+    for comment in scheduled_comment:
+        scheduled_comments_list.append({"due_date":comment.scheduled_send_at, "status": comment.status})
+    return scheduled_comments_list
+
 
 @router.get("/tasks/{task_id}/comments/fast", response_model=List[CommentSchema])
 async def read_comments_optimized(
     task_id: int,
     db: Session = Depends(get_db),
+    current_user: AgentModel = Depends(get_current_active_user),
     skip: int = 0,
     limit: int = 50,  
-    current_user: AgentModel = Depends(get_current_active_user),
+   
 ) -> Any:
     start_time = time.time()
     permissions_start = time.time()
@@ -523,7 +556,7 @@ async def create_comment(
                         db=db,
                         workspace_id=task.workspace_id,
                         category="agents",
-                        notification_type="new_response",
+                        notification_type="new_response_agent",  # Corregir tipo para agentes
                         recipient_email=agent.email,
                         recipient_name=agent.name,
                         template_vars=template_vars,
@@ -797,6 +830,7 @@ def send_email_in_background(
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker, joinedload
     from app.models.task import Task as TaskModel
+    from app.models.scheduled_comment import ScheduledComment as ScheduledCommentModel
     from app.models.agent import Agent as AgentModel
     from app.models.microsoft import MailboxConnection
     from app.services.microsoft_service import get_microsoft_service
@@ -950,7 +984,7 @@ def get_comment_s3_content(
         from fastapi import Response
         response_data = {
             "status": "loaded_from_s3",
-            "content": processed_content,  # Usar contenido procesado
+            "content": processed_content,
             "s3_url": comment.s3_html_url,
             "message": "Content loaded from S3"
         }     

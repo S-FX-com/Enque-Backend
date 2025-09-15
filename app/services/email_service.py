@@ -5,6 +5,7 @@ from app.utils.logger import logger
 from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB session
 from typing import Optional, Tuple, List, Dict, Any
 from app.models.agent import Agent
+from app.models.workspace import Workspace
 from datetime import datetime
 
 # Placeholder for a more sophisticated HTML email template system
@@ -388,10 +389,7 @@ async def send_ticket_assignment_email(
     Uses the sender_mailbox_display_name to personalize the email signature.
     """
     subject = f"[ID:{ticket_id}] New ticket assigned: {ticket_title}"
-
-    # Use the origin URL if provided, otherwise fallback to settings.FRONTEND_URL
     base_url = request_origin if request_origin else settings.FRONTEND_URL
-    #ticket_link = f"{base_url}/tickets?openTicket={ticket_id}"
     ticket_link = f"{base_url}/tickets/{ticket_id}"
 
     html_content = create_ticket_assignment_email_html(
@@ -404,7 +402,6 @@ async def send_ticket_assignment_email(
 
     try:
         graph_service = MicrosoftGraphService(db=db)
-
         success = await graph_service.send_email_with_user_token(
             user_access_token=user_access_token,
             sender_mailbox_email=sender_mailbox_email,
@@ -415,6 +412,30 @@ async def send_ticket_assignment_email(
         )
         if success:
             logger.info(f"Ticket assignment email sent successfully to {to_email} from {sender_mailbox_email} ({sender_mailbox_display_name or 'No display name'})")
+            
+            # --- BEGIN TEAMS NOTIFICATION LOGIC ---
+            try:
+                agent_to_notify = db.query(Agent).filter(Agent.email == to_email).first()
+                if agent_to_notify and agent_to_notify.teams_notifications_enabled:
+                    logger.info(f"Agent {agent_to_notify.id} has Teams notifications enabled. Sending notification.")
+                    workspace = db.query(Workspace).filter(Workspace.id == agent_to_notify.workspace_id).first()
+                    if workspace:
+                        ticket_link_teams = f"https://{workspace.subdomain}.enque.cc/tickets/{ticket_id}"
+                        graph_service_for_teams = MicrosoftGraphService(db=db)
+                        await graph_service_for_teams.send_teams_activity_notification(
+                            agent_id=agent_to_notify.id,
+                            title=f"Ticket Asignado: #{ticket_id}",
+                            message=ticket_title,
+                            link_to_ticket=ticket_link_teams
+                        )
+                    else:
+                        logger.warning(f"Could not find workspace for agent {agent_to_notify.id} to send Teams notification.")
+                elif agent_to_notify:
+                    logger.info(f"Agent {agent_to_notify.id} has Teams notifications disabled. Skipping.")
+            except Exception as teams_error:
+                logger.error(f"Failed to send Teams notification for ticket assignment {ticket_id}: {teams_error}", exc_info=True)
+            # --- END TEAMS NOTIFICATION LOGIC ---
+            
             return True
         else:
             logger.error(f"Failed to send ticket assignment email to {to_email} using MicrosoftGraphService.send_email_with_user_token from {sender_mailbox_email}")

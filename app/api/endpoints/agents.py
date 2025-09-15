@@ -15,7 +15,8 @@ from app.models.team import Team, TeamMember
 from app.models.task import Task
 from app.models.workspace import Workspace
 from app.models.microsoft import MailboxConnection, MicrosoftToken # Import MailboxConnection and MicrosoftToken
-from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate, AgentInviteCreate, AgentAcceptInvitation 
+from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate, AgentInviteCreate, AgentAcceptInvitation
+from pydantic import BaseModel
 from app.schemas.team import Team as TeamSchema
 from app.schemas.token import Token 
 from app.core.security import get_password_hash, create_access_token 
@@ -541,6 +542,45 @@ async def accept_agent_invitation(
         "token_type": "bearer",
         "workspace_subdomain": workspace.subdomain if workspace else None
     }
+
+
+class TeamsNotificationSettings(BaseModel):
+    enabled: bool
+
+@router.put("/{agent_id}/teams-notifications", response_model=AgentSchema)
+async def update_teams_notification_settings(
+    agent_id: int,
+    settings: TeamsNotificationSettings,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+):
+    """
+    Update an agent's Microsoft Teams notification preference.
+    """
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+
+    # Permissions check: Admin can update anyone, users can only update themselves.
+    if current_user.role != "admin" and current_user.id != agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions to update this setting.",
+        )
+
+    agent.teams_notifications_enabled = settings.enabled
+    db.commit()
+    db.refresh(agent)
+    logger.info(f"Agent {agent.id} Teams notification settings updated to: {settings.enabled} by user {current_user.id}")
+    return agent
 
 
 @router.get("/{agent_id}/teams", response_model=List[TeamSchema])

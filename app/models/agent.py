@@ -16,6 +16,8 @@ class Agent(Base):
     phone_number = Column(String(50), nullable=True)
     email_signature = Column(Text, nullable=True) 
     is_active = Column(Boolean, default=True, nullable=False)
+    teams_notifications_enabled = Column(Boolean, default=False, nullable=False)
+    microsoft_refresh_token = Column(Text, nullable=True)
     # Microsoft 365 integration fields
     microsoft_id = Column(String(255), nullable=True, unique=True, index=True)
     microsoft_email = Column(String(255), nullable=True, index=True)

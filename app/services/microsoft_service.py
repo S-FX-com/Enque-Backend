@@ -221,25 +221,62 @@ class MicrosoftGraphService:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="State parameter is required.")
                  
             if not workspace_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID missing or invalid in state parameter.")
-            if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter.")
-            current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
-            if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+            
             workspace = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
             if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
-            if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")      
-            if state:
-                try:
-                    missing_padding = len(state) % 4
-                    if missing_padding: state += '=' * (4 - missing_padding)
-                    decoded_state_json = base64.urlsafe_b64decode(state).decode('utf-8')
-                    state_data = json.loads(decoded_state_json)
-                    flow_type = state_data.get('flow')
-                    if flow_type == 'profile_link':
-                        logger.info(f"Profile linking flow detected for agent {agent_id}")
-                        # Handle profile linking - update agent with Microsoft information
-                        return self._handle_profile_linking(token_data, user_info, current_agent, workspace)
-                except Exception as decode_err:
-                    logger.warning(f"Could not re-decode state for flow check: {decode_err}")
+
+            # --- START: Logic to handle both auth and profile_link flows ---
+            try:
+                missing_padding = len(state) % 4
+                if missing_padding: state += '=' * (4 - missing_padding)
+                decoded_state_json = base64.urlsafe_b64decode(state).decode('utf-8')
+                state_data = json.loads(decoded_state_json)
+                flow_type = state_data.get('flow')
+                
+                current_agent = None
+                if flow_type == 'profile_link':
+                    if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state for profile_link flow.")
+                    current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
+                    if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+                    if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+                
+                elif flow_type == 'auth':
+                    microsoft_id = user_info.get("id")
+                    microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+                    
+                    # Find agent by microsoft_id first
+                    agent = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id, Agent.workspace_id == workspace_id).first()
+                    
+                    if not agent:
+                        # If not found, find by email to link the account
+                        agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
+
+                    if not agent:
+                        # If still not found, create a new agent
+                        logger.info(f"Creating new Microsoft agent: {microsoft_email}")
+                        display_name = user_info.get("displayName", microsoft_email.split("@")[0])
+                        agent = Agent(
+                            name=display_name, email=microsoft_email, role="agent", auth_method="microsoft",
+                            workspace_id=workspace_id, is_active=True
+                        )
+                        self.db.add(agent)
+                        self.db.flush() # Flush to get the agent ID before commit
+                    
+                    current_agent = agent
+
+                if current_agent and flow_type in ['profile_link', 'auth']:
+                    logger.info(f"'{flow_type}' flow detected for agent {current_agent.id}. Updating agent with latest token info.")
+                    return self._handle_profile_linking(token_data, user_info, current_agent, workspace)
+
+            except Exception as decode_err:
+                logger.warning(f"Could not decode state for flow check: {decode_err}")
+            # --- END: Logic to handle both auth and profile_link flows ---
+            
+            # Fallback for mailbox connection if flow is not auth or profile_link
+            if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter for mailbox flow.")
+            current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
+            if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+            if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
             
             if needs_integration:
                 self.integration = MicrosoftIntegration(
@@ -1521,7 +1558,7 @@ class MicrosoftGraphService:
                                             db=self.db,
                                             workspace_id=workspace_id,
                                             category="agents",
-                                            notification_type="new_ticket_created",
+                                            notification_type="new_ticket_created_agent",  # Corregir tipo para agentes
                                             recipient_email=agent.email,
                                             recipient_name=agent.name,
                                             template_vars=agent_template_vars,
@@ -3002,56 +3039,75 @@ class MicrosoftGraphService:
             logger.error(f"Error sending email from {sender_mailbox_email} using user token: {e}", exc_info=True)
             return False
 
-    def _handle_profile_linking(self, token_data: dict, user_info: dict, current_agent, workspace) -> MicrosoftToken:
+    def _handle_profile_linking(self, token_data: dict, user_info: dict, current_agent: Agent, workspace: Workspace) -> MicrosoftToken:
         try:
-            current_agent.microsoft_id = user_info.get("id")
-            current_agent.microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
-            current_agent.microsoft_tenant_id = settings.MICROSOFT_TENANT_ID
-            current_agent.microsoft_profile_data = json.dumps(user_info)
-            if current_agent.auth_method == "password":
-                current_agent.auth_method = "both"
-            elif current_agent.auth_method == "microsoft":
-                pass
-            
-            logger.info(f"Linked Microsoft account {current_agent.microsoft_email} to agent {current_agent.email}")
+            # Re-fetch the agent from the database within the current session to ensure it's attached
+            agent_to_update = self.db.query(Agent).filter(Agent.id == current_agent.id).first()
+            if not agent_to_update:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found during profile linking.")
 
+            # 1. Assign all Microsoft-related data
+            agent_to_update.microsoft_id = user_info.get("id")
+            agent_to_update.microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+            agent_to_update.microsoft_tenant_id = settings.MICROSOFT_TENANT_ID
+            agent_to_update.microsoft_profile_data = json.dumps(user_info)
+            
+            logger.debug(f"Full token_data received from Microsoft for agent {agent_to_update.id}: {token_data}")
+            refresh_token_val = token_data.get("refresh_token")
+
+            if refresh_token_val:
+                agent_to_update.microsoft_refresh_token = refresh_token_val
+                logger.info(f"✅ Refresh token received for agent {agent_to_update.id}. Preparing to save.")
+                logger.info(f"   Token value (first 10 chars): {refresh_token_val[:10]}...")
+            else:
+                logger.warning(f"⚠️ No refresh token was provided by Microsoft for agent {agent_to_update.id}. Re-consent may be required.")
+
+            if agent_to_update.auth_method == "password":
+                agent_to_update.auth_method = "both"
+            
+            # 2. Commit the critical token and profile data FIRST
+            logger.info(f"PRE-COMMIT CHECK for agent {agent_to_update.id}: microsoft_refresh_token is set to: {agent_to_update.microsoft_refresh_token[:10] if agent_to_update.microsoft_refresh_token else 'None'}")
+            self.db.commit()
+            logger.info(f"✅ Committed Microsoft profile and token data for agent {agent_to_update.id}")
+
+            # 3. Handle non-critical updates (avatar) in a separate transaction
             try:
-                logger.info(f"🔍 Attempting to download profile photo for agent {current_agent.id}")
+                logger.info(f"🔍 Attempting to download profile photo for agent {agent_to_update.id}")
                 photo_bytes = self._get_user_profile_photo(token_data["access_token"])
-                
                 if photo_bytes:
                     logger.info(f"📸 Profile photo found ({len(photo_bytes)} bytes), uploading to S3...")
-                    avatar_url = self._upload_avatar_to_s3(photo_bytes, current_agent.id)
-                    
+                    avatar_url = self._upload_avatar_to_s3(photo_bytes, agent_to_update.id)
                     if avatar_url:
-                        current_agent.avatar_url = avatar_url
-                        logger.info(f"✅ Updated agent {current_agent.id} avatar: {avatar_url}")
-                    else:
-                        logger.warning(f"❌ Failed to upload avatar to S3 for agent {current_agent.id}")
-                else:
-                    logger.info(f"📷 No profile photo available for agent {current_agent.id}")              
+                        agent_to_update.avatar_url = avatar_url
+                        self.db.commit() # Commit avatar update separately
+                        logger.info(f"✅ Updated and committed agent {agent_to_update.id} avatar: {avatar_url}")
             except Exception as avatar_error:
-                logger.error(f"❌ Error processing avatar for agent {current_agent.id}: {str(avatar_error)}")
+                logger.error(f"❌ Error processing avatar for agent {agent_to_update.id}: {str(avatar_error)}")
+                self.db.rollback() # Rollback only the avatar transaction if it fails
+
+            # 4. Refresh the agent object to get the latest state from the DB
+            self.db.refresh(agent_to_update)
             
-            refresh_token_val = token_data.get("refresh_token", "")
-            token = MicrosoftToken(
+            # 5. Invalidate cache (another non-critical operation)
+            try:
+                from app.core.cache import user_cache
+                user_cache.delete(agent_to_update.id)
+                logger.info(f"🗑️ Invalidated user cache for agent {agent_to_update.id} after Microsoft profile linking")
+            except Exception as cache_error:
+                logger.error(f"❌ Failed to invalidate cache for agent {agent_to_update.id}: {cache_error}")
+
+            # 6. Create a temporary MicrosoftToken object for the response
+            token_obj_for_response = MicrosoftToken(
                 integration_id=self.integration.id,
-                agent_id=current_agent.id,
-                mailbox_connection_id=None,
+                agent_id=agent_to_update.id,
                 access_token=token_data["access_token"],
                 refresh_token=refresh_token_val,
                 token_type=token_data["token_type"],
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
             )
-            self.db.add(token)
-            self.db.commit()
-            self.db.refresh(token)
-            from app.core.cache import user_cache
-            user_cache.delete(current_agent.id)
-            logger.info(f"🗑️ Invalidated user cache for agent {current_agent.id} after Microsoft profile linking")
             
-            logger.info(f"Successfully linked Microsoft profile for agent {current_agent.email}")
-            return token
+            logger.info(f"Successfully linked Microsoft profile for agent {agent_to_update.email}")
+            return token_obj_for_response
             
         except Exception as e:
             self.db.rollback()
@@ -3088,6 +3144,125 @@ class MicrosoftGraphService:
         except Exception as e:
             logger.error(f"Error detecting system domains for workspace {workspace_id}: {str(e)}")
             return ["enque.cc", "microsoftexchange"]
+
+    async def _refresh_agent_token_async(self, agent: Agent) -> Optional[str]:
+        """Refreshes an agent's token using the refresh_token stored on the agent model."""
+        if not agent.microsoft_refresh_token:
+            logger.warning(f"Agent {agent.id} has no refresh token.")
+            return None
+
+        client_id = self.integration.client_id if self.integration else settings.MICROSOFT_CLIENT_ID
+        client_secret = self.integration.client_secret if self.integration else settings.MICROSOFT_CLIENT_SECRET
+        
+        data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": agent.microsoft_refresh_token,
+            "grant_type": "refresh_token",
+            "scope": "offline_access User.Read TeamsActivity.Send",
+        }
+        token_endpoint = settings.MICROSOFT_TOKEN_URL
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(token_endpoint, data=data)
+            response.raise_for_status()
+            token_data = response.json()
+
+            # Update the agent's refresh token if a new one is provided
+            if "refresh_token" in token_data:
+                agent.microsoft_refresh_token = token_data["refresh_token"]
+                self.db.commit()
+            
+            logger.info(f"Successfully refreshed token for agent {agent.id}")
+            return token_data["access_token"]
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"HTTP error refreshing token for agent {agent.id}: {exc.response.status_code} - {exc.response.text}")
+            if exc.response.status_code in [400, 401]:
+                # Invalidate the refresh token if it's bad
+                agent.microsoft_refresh_token = None
+                self.db.commit()
+                logger.warning(f"Invalidated refresh token for agent {agent.id}.")
+            return None
+        except Exception as exc:
+            logger.error(f"Unexpected error refreshing token for agent {agent.id}: {exc}")
+            return None
+
+    async def send_teams_activity_notification(self, agent_id: int, title: str, message: str, link_to_ticket: str, subdomain: str):
+        """
+        Sends an activity feed notification to a specific agent in Microsoft Teams.
+        """
+        agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
+        if not agent or not agent.microsoft_id:
+            logger.warning(f"Cannot send Teams notification: Agent {agent_id} not found or not linked to a Microsoft account.")
+            return
+
+        if not agent.teams_notifications_enabled:
+            logger.info(f"Skipping Teams notification for agent {agent_id} because they have it disabled.")
+            return
+
+        try:
+            # Get a valid access token for the agent, refreshing if necessary
+            access_token = await self._refresh_agent_token_async(agent)
+            if not access_token:
+                logger.error(f"Could not obtain a valid access token for agent {agent_id} to send Teams notification.")
+                return
+
+            notification_endpoint = f"{self.graph_url}/users/{agent.microsoft_id}/teamwork/sendActivityNotification"
+            
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
+            # The App ID from your manifest.json
+            teams_app_id = "9793e065-fc8e-4920-a72e-12eee326e783"
+            
+            # Construct the Teams deep link
+            # This creates a link to a specific tab in your personal app.
+            # We'll pass the subdomain and ticket_id in the context.
+            ticket_id = link_to_ticket.split('/')[-1]
+            context = {
+                "subEntityId": ticket_id,
+                "subdomain": subdomain
+            }
+            context_json_string = json.dumps(context)
+            context_encoded = urllib.parse.quote(context_json_string)
+            deep_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets?context={context_encoded}"
+
+            # Construct the notification payload
+            notification_payload = {
+                "topic": {
+                    "source": "text",
+                    "value": title,
+                    "webUrl": deep_link
+                },
+                "activityType": "ticketNotification", # This must match a type in your manifest
+                "previewText": {
+                    "content": message
+                },
+                "templateParameters": [
+                    { "name": "actor", "value": "Enque Helpdesk" },
+                    { "name": "action", "value": title },
+                    { "name": "ticketId", "value": f"#{ticket_id}" }
+                ]
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(notification_endpoint, headers=headers, json=notification_payload)
+                response.raise_for_status()
+            
+            logger.info(f"Successfully sent Teams activity notification to agent {agent_id} for ticket link: {link_to_ticket}")
+
+        except HTTPException as http_exc:
+            # Handle cases where the token might be invalid and couldn't be refreshed
+            if http_exc.status_code == 401:
+                logger.error(f"Authorization error sending Teams notification to agent {agent_id}. The token may be invalid and requires re-authentication.")
+            else:
+                logger.error(f"HTTP error sending Teams notification to agent {agent_id}: {http_exc.status_code} - {http_exc.detail}")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while sending Teams notification to agent {agent_id}: {str(e)}", exc_info=True)
+
 
 def get_microsoft_service(db: Session) -> MicrosoftGraphService:
     return MicrosoftGraphService(db)

@@ -278,6 +278,32 @@ class TokenService:
                 )
         return None
 
+    async def get_valid_agent_token_async(self, agent_id: int) -> Optional[str]:
+        """
+        Gets a valid access token for a specific agent, refreshing if necessary.
+        This is for agent-specific actions like Teams notifications.
+        """
+        # Find the token linked to the agent, not a shared mailbox
+        token = self.db.query(MicrosoftToken).filter(
+            MicrosoftToken.agent_id == agent_id,
+            MicrosoftToken.mailbox_connection_id.is_(None)
+        ).order_by(MicrosoftToken.created_at.desc()).first()
+
+        if not token:
+            logger.warning(f"No Microsoft token found for agent ID {agent_id}")
+            return None
+
+        if token.expires_at < datetime.utcnow():
+            logger.info(f"Token for agent {agent_id} is expired. Refreshing.")
+            try:
+                refreshed_token = await self.refresh_token_async(token)
+                return refreshed_token.access_token
+            except Exception as e:
+                logger.error(f"Failed to refresh token for agent {agent_id}: {e}")
+                return None
+        
+        return token.access_token
+
     async def check_and_refresh_all_tokens_async(self) -> None:
         """
         Periodic maintenance task: refresh any tokens expiring within the next
