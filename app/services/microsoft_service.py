@@ -148,7 +148,7 @@ class MicrosoftGraphService:
              final_redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
              logger.warning(f"No redirect_uri provided or configured, falling back to default: {final_redirect_uri}")
 
-        default_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read"]
+        default_scopes = ["offline_access", "Mail.Read", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared", "User.Read", "TeamsActivity.Send"]
         final_scopes = scopes if scopes else default_scopes
         scope_string = " ".join(final_scopes)
         auth_endpoint = self.auth_url  # This is now already set to /common in config
@@ -3202,10 +3202,16 @@ class MicrosoftGraphService:
             return
 
         try:
-            # Get a valid access token for the agent, refreshing if necessary
-            access_token = await self._refresh_agent_token_async(agent)
+            # Use application token instead of delegated token to avoid self-notification error
+            try:
+                import asyncio
+                access_token = await asyncio.to_thread(self.get_application_token)
+            except Exception as e:
+                logger.error(f"Failed to get application token for Teams notification: {e}", exc_info=True)
+                return
+
             if not access_token:
-                logger.error(f"Could not obtain a valid access token for agent {agent_id} to send Teams notification.")
+                logger.error(f"Could not obtain a valid application token to send Teams notification.")
                 return
 
             notification_endpoint = f"{self.graph_url}/users/{agent.microsoft_id}/teamwork/sendActivityNotification"
@@ -3241,16 +3247,23 @@ class MicrosoftGraphService:
                 "previewText": {
                     "content": message
                 },
+                "recipient": {
+                    "@odata.type": "microsoft.graph.aadUserNotificationRecipient",
+                    "userId": agent.microsoft_id
+                },
                 "templateParameters": [
-                    { "name": "actor", "value": "Enque Helpdesk" },
                     { "name": "action", "value": title },
                     { "name": "ticketId", "value": f"#{ticket_id}" }
                 ]
             }
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(notification_endpoint, headers=headers, json=notification_payload)
-                response.raise_for_status()
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(notification_endpoint, headers=headers, json=notification_payload)
+                    response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.error(f"Error response from Microsoft Graph API: {exc.response.text}")
+                raise exc
             
             logger.info(f"Successfully sent Teams activity notification to agent {agent_id} for ticket link: {link_to_ticket}")
 

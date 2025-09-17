@@ -426,7 +426,8 @@ async def send_ticket_assignment_email(
                             agent_id=agent_to_notify.id,
                             title=f"Ticket Asignado: #{ticket_id}",
                             message=ticket_title,
-                            link_to_ticket=ticket_link_teams
+                            link_to_ticket=ticket_link_teams,
+                            subdomain=workspace.subdomain
                         )
                     else:
                         logger.warning(f"Could not find workspace for agent {agent_to_notify.id} to send Teams notification.")

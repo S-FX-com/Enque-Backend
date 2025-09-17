@@ -84,7 +84,7 @@ async def read_comments(
     pass
     return comments_orm
 
-@router.get("/tasks/{task_id}/scheduled_comments", response_model=List[CommentSchema])
+@router.get("/tasks/{task_id}/scheduled_comments")
 async def get_scheduled_comments(
     task_id: int,
     db: Session = Depends(get_db),
@@ -113,7 +113,8 @@ async def get_scheduled_comments(
     query_start = time.time()
     scheduled_comments_list:list = []
     for comment in scheduled_comment:
-        scheduled_comments_list.append({"due_date":comment.scheduled_send_at, "status": comment.status})
+        dateScheduled:str = comment.scheduled_send_at.strftime("%Y-%m-%d %H:%M:%S")
+        scheduled_comments_list.append({"due_date":dateScheduled , "status": comment.status})
     return scheduled_comments_list
 
 
