@@ -3224,24 +3224,16 @@ class MicrosoftGraphService:
             # The App ID from your manifest.json
             teams_app_id = "9793e065-fc8e-4920-a72e-12eee326e783"
             
-            # Construct the Teams deep link
-            # This creates a link to a specific tab in your personal app.
-            # We'll pass the subdomain and ticket_id in the context.
+            # Instead of Teams deep link, use direct external URL
+            # This will open the external web app instead of the Teams app
             ticket_id = link_to_ticket.split('/')[-1]
-            context = {
-                "subEntityId": ticket_id,
-                "subdomain": subdomain
-            }
-            context_json_string = json.dumps(context)
-            context_encoded = urllib.parse.quote(context_json_string)
-            deep_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets?context={context_encoded}"
 
             # Construct the notification payload
             notification_payload = {
                 "topic": {
                     "source": "text",
                     "value": title,
-                    "webUrl": deep_link
+                    "webUrl": link_to_ticket  # Direct external URL
                 },
                 "activityType": "ticketNotification", # This must match a type in your manifest
                 "previewText": {

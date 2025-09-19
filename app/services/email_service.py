@@ -422,13 +422,25 @@ async def send_ticket_assignment_email(
                     if workspace:
                         ticket_link_teams = f"https://{workspace.subdomain}.enque.cc/tickets/{ticket_id}"
                         graph_service_for_teams = MicrosoftGraphService(db=db)
+                        
+                        # Send activity notification
                         await graph_service_for_teams.send_teams_activity_notification(
                             agent_id=agent_to_notify.id,
-                            title=f"Ticket Asignado: #{ticket_id}",
+                            title=f"Ticket Assigned: #{ticket_id}",
                             message=ticket_title,
                             link_to_ticket=ticket_link_teams,
                             subdomain=workspace.subdomain
                         )
+                        
+                        # Teams Chat Messages require Bot Service registration in Azure
+                        # Activity Notifications work perfectly and provide the same user experience
+                        # Uncomment below when Bot Service is properly configured:
+                        # await graph_service_for_teams.send_teams_chat_message(
+                        #     agent_id=agent_to_notify.id,
+                        #     message=ticket_title,
+                        #     ticket_id=str(ticket_id),
+                        #     link_to_ticket=ticket_link_teams
+                        # )
                     else:
                         logger.warning(f"Could not find workspace for agent {agent_to_notify.id} to send Teams notification.")
                 elif agent_to_notify:
