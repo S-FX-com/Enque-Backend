@@ -587,6 +587,46 @@ class MicrosoftGraphService:
             logger.error(f"Error processing HTML for {context}: {e}", exc_info=True)
             return html_content
 
+    def _is_mailbox_reply_loop(self, email_content: Dict, mailbox_email: str) -> bool:
+        """
+        Detecta si el mailbox está procesando su propia respuesta.
+        Esto ocurre cuando el mailbox aparece tanto en 'To' como en 'Cc',
+        indicando que es una respuesta de agente que el mailbox está volviendo a procesar.
+        """
+        try:
+            mailbox_email_lower = mailbox_email.lower()
+            
+            # Verificar si el mailbox está en los destinatarios 'To'
+            is_in_to = False
+            to_recipients = email_content.get("toRecipients", [])
+            for recipient in to_recipients:
+                email_addr = recipient.get("emailAddress", {}).get("address", "")
+                if email_addr and email_addr.lower() == mailbox_email_lower:
+                    is_in_to = True
+                    break
+            
+            # Verificar si el mailbox está en los destinatarios 'Cc'
+            is_in_cc = False
+            cc_recipients = email_content.get("ccRecipients", [])
+            for recipient in cc_recipients:
+                email_addr = recipient.get("emailAddress", {}).get("address", "")
+                if email_addr and email_addr.lower() == mailbox_email_lower:
+                    is_in_cc = True
+                    break
+            
+            # Si aparece en ambos (To y Cc), es muy probable que sea una respuesta del agente
+            # que el mailbox está procesando nuevamente
+            if is_in_to and is_in_cc:
+                sender_email = email_content.get("from", {}).get("emailAddress", {}).get("address", "")
+                logger.warning(f"[MAIL SYNC] Detected mailbox reply loop: mailbox {mailbox_email} appears in both To and Cc. Sender: {sender_email}")
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking mailbox reply loop: {e}")
+            return False
+
     def sync_emails(self, sync_config: EmailSyncConfig):
         user_email, token = self._get_user_email_for_sync(sync_config) # This calls the sync check_and_refresh_all_tokens
         if not user_email or not token:
@@ -649,6 +689,16 @@ class MicrosoftGraphService:
                     
                     email_content = self._get_full_email(user_access_token, user_email, email_id)
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
+                    
+                    # 🔧 ANTI-LOOP: Verificar si el mailbox está procesando su propia respuesta
+                    if self._is_mailbox_reply_loop(email_content, user_email):
+                        logger.info(f"[MAIL SYNC] Skipping mailbox reply loop for email {email_id}: {email_subject}")
+                        # Marcar como leído y mover a procesados para evitar reprocesamiento
+                        self._mark_email_as_read(user_access_token, user_email, email_id)
+                        if processed_folder_id:
+                            self._move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
+                        continue
+                    
                     conversation_id = email_content.get("conversationId")
                     
                     existing_mapping_by_conv = None
@@ -3224,16 +3274,35 @@ class MicrosoftGraphService:
             # The App ID from your manifest.json
             teams_app_id = "9793e065-fc8e-4920-a72e-12eee326e783"
             
-            # Instead of Teams deep link, use direct external URL
-            # This will open the external web app instead of the Teams app
+            # Construct the Teams deep link
             ticket_id = link_to_ticket.split('/')[-1]
+            
+            # For Teams personal tabs, we must use subEntityId to pass context
+            # Format: https://teams.microsoft.com/l/entity/{app-id}/{entity-id}/{sub-entity-id}
+            # The sub-entity-id becomes the subPageId in Teams context
+            context_data = {
+                "ticketId": ticket_id,
+                "subdomain": subdomain
+            }
+            sub_entity_id = json.dumps(context_data)
+            # URL encode the JSON to ensure it passes through Teams correctly
+            from urllib.parse import quote
+            encoded_sub_entity_id = quote(sub_entity_id)
+            
+            # Teams deep link with URL-encoded subEntityId
+            deep_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets/{encoded_sub_entity_id}"
+            
+            logger.info(f"Teams notification deep link: {deep_link}")
+            logger.info(f"SubEntityId JSON: {sub_entity_id}")
+            logger.info(f"Encoded SubEntityId: {encoded_sub_entity_id}")
+            logger.info(f"Target workspace URL should be: https://{subdomain}.enque.cc/tickets/{ticket_id}")
 
             # Construct the notification payload
             notification_payload = {
                 "topic": {
                     "source": "text",
                     "value": title,
-                    "webUrl": link_to_ticket  # Direct external URL
+                    "webUrl": deep_link  # Must use Teams deep link, not external URL
                 },
                 "activityType": "ticketNotification", # This must match a type in your manifest
                 "previewText": {

@@ -297,6 +297,58 @@ async def get_tasks_count(
     return {"count": count, "query_time_ms": round(query_time * 1000, 2)}
 
 
+@router.get("/count/my-teams")
+async def get_my_teams_tasks_count(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> dict:
+
+    start_time = time.time()
+    
+    from app.models.team import Team, TeamMember
+    is_admin_or_manager = current_user.role in ['admin', 'manager']
+    
+    total_count = 0
+    
+    if is_admin_or_manager:
+        total_count = db.query(func.count(Task.id)).filter(
+            Task.workspace_id == current_user.workspace_id,
+            Task.status != 'Closed',
+            Task.is_deleted == False
+        ).scalar() or 0
+    else:
+        user_teams = db.query(Team).join(TeamMember).filter(
+            TeamMember.agent_id == current_user.id,
+            Team.workspace_id == current_user.workspace_id
+        ).all()
+        
+        for team in user_teams:
+            team_ticket_count = db.query(func.count(Task.id.distinct())).filter(
+                or_(
+                    Task.team_id == team.id,
+                    and_(
+                        Task.team_id.is_(None),
+                        Task.mailbox_connection_id.isnot(None),
+                        Task.mailbox_connection_id.in_(
+                            db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
+                                mailbox_team_assignments.c.team_id == team.id
+                            )
+                        )
+                    )
+                ),
+                Task.status != 'Closed',
+                Task.is_deleted == False,
+                Task.workspace_id == current_user.workspace_id
+            ).scalar() or 0
+            
+            total_count += team_ticket_count
+    
+    query_time = time.time() - start_time
+    logger.info(f"MY TEAMS COUNT: {total_count} tickets contados en {query_time*1000:.2f}ms")
+    
+    return {"count": total_count, "query_time_ms": round(query_time * 1000, 2)}
+
+
 @router.get("/stats")
 async def get_tasks_stats(
     db: Session = Depends(get_db),

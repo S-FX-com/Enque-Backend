@@ -62,16 +62,11 @@ class Settings(BaseSettings):
         return None
 
     # Microsoft Graph API Configuration
-    MICROSOFT_CLIENT_ID: str = "9793e065-fc8e-4920-a72e-12eee326e783"
+    MICROSOFT_CLIENT_ID: str = ""
     MICROSOFT_CLIENT_SECRET: str = ""
-    MICROSOFT_TENANT_ID: str = "76d9eabb-931c-452b-9e08-058b058b6581"
+    MICROSOFT_TENANT_ID: str = ""
     MICROSOFT_REDIRECT_URI: str = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
     MICROSOFT_SCOPE: str = "offline_access Mail.Read Mail.ReadWrite"
-    
-    # Microsoft Bot Framework Configuration for Teams proactive messaging
-    MICROSOFT_BOT_APP_ID: str = "9793e065-fc8e-4920-a72e-12eee326e783"  # Application (client) ID
-    MICROSOFT_BOT_APP_PASSWORD: str = "BvH8Q~zwL6XzPTWwkW1ryLaq4bfbi7u-KYq5NcXe"  # Client Secret from Azure Portal
-    TEAMS_SERVICE_URL: str = "https://smba.trafficmanager.net/teams/"
     
     # Microsoft Graph API URLs - Using /common for multitenant support
     MICROSOFT_AUTH_URL: str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
