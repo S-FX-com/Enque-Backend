@@ -1146,6 +1146,130 @@ class MicrosoftGraphService:
         
         return None
 
+    def _format_email_with_name(self, name: str, email_address: str) -> str:
+        """
+        Formatea un email con nombre en el formato correcto: 'Name <email@domain.com>'
+        Si no hay nombre, retorna solo el email.
+        """
+        if not email_address:
+            return ""
+        
+        # Limpiar la dirección de email
+        clean_email = self._clean_email_address(email_address)
+        if not clean_email:
+            return ""
+        
+        # Si hay nombre, usar formato "Name <email>"
+        if name and name.strip():
+            clean_name = name.strip()
+            return f"{clean_name} <{clean_email}>"
+        
+        # Si no hay nombre, solo retornar el email
+        return clean_email
+
+    def _parse_email_recipients(self, recipients_data: List[Dict], recipient_type: str = "unknown") -> List[str]:
+        """
+        Procesa una lista de recipients y retorna strings formateados correctamente.
+        Mantiene el formato 'Name <email>' cuando hay nombre, solo 'email' cuando no.
+        """
+        formatted_recipients = []
+        
+        for recipient in recipients_data:
+            email_data = recipient.get("emailAddress", {})
+            name = email_data.get("name", "").strip()
+            address = email_data.get("address", "").strip()
+            
+            if address:
+                # Limpiar la dirección de email
+                clean_address = self._clean_email_address(address)
+                if clean_address:
+                    formatted_email = self._format_email_with_name(name, clean_address)
+                    if formatted_email and formatted_email not in formatted_recipients:
+                        formatted_recipients.append(formatted_email)
+                        logger.debug(f"Added {recipient_type} recipient: {formatted_email}")
+        
+        return formatted_recipients
+
+    def _merge_cc_recipients(self, original_cc_list: List[str], additional_cc_list: List[str]) -> List[str]:
+        """
+        Combina listas de CC recipients evitando duplicados basados en la dirección de email.
+        Mantiene el formato 'Name <email>' cuando está disponible.
+        """
+        merged_recipients = []
+        seen_emails = set()
+        
+        # Agregar recipients originales
+        for recipient in original_cc_list:
+            email_addr = self._clean_email_address(recipient)
+            if email_addr and email_addr.lower() not in seen_emails:
+                merged_recipients.append(recipient)
+                seen_emails.add(email_addr.lower())
+        
+        # Agregar recipients adicionales solo si no están duplicados
+        for recipient in additional_cc_list:
+            email_addr = self._clean_email_address(recipient)
+            if email_addr and email_addr.lower() not in seen_emails:
+                merged_recipients.append(recipient.strip())
+                seen_emails.add(email_addr.lower())
+        
+        return merged_recipients
+
+    def _debug_cc_recipients_format(self, cc_recipients: List[str], context: str):
+        """
+        Función de debug para rastrear el formato de CC recipients en diferentes puntos.
+        """
+        logger.info(f"🔍 DEBUG CC FORMAT [{context}]: Total recipients: {len(cc_recipients)}")
+        for i, recipient in enumerate(cc_recipients):
+            has_name = '<' in recipient and '>' in recipient
+            email_only = self._clean_email_address(recipient)
+            logger.info(f"🔍   [{i+1}] {recipient} -> Email: {email_only}, Has name: {has_name}")
+        return cc_recipients
+
+    def normalize_cc_recipients_format(self, cc_recipients_str: str) -> str:
+        """
+        Normaliza el formato de CC recipients para mantener consistencia.
+        Asegura que los emails con nombres mantengan el formato 'Name <email@domain.com>'
+        y los emails sin nombres mantengan solo 'email@domain.com'.
+        """
+        import re
+        if not cc_recipients_str or not cc_recipients_str.strip():
+            return ""
+        
+        # Dividir por comas y procesar cada recipient
+        recipients = [email.strip() for email in cc_recipients_str.split(',') if email.strip()]
+        normalized_recipients = []
+        
+        for recipient in recipients:
+            # Si ya tiene formato 'Name <email>', verificar que sea válido
+            if '<' in recipient and '>' in recipient:
+                email_match = re.search(r'<([^>]+)>', recipient)
+                if email_match:
+                    email_part = email_match.group(1).strip()
+                    # Verificar que el email sea válido
+                    clean_email = self._clean_email_address(email_part)
+                    if clean_email:
+                        # Extraer el nombre
+                        name_part = recipient[:recipient.find('<')].strip()
+                        if name_part:
+                            normalized_recipients.append(f"{name_part} <{clean_email}>")
+                        else:
+                            normalized_recipients.append(clean_email)
+                    else:
+                        logger.warning(f"Invalid email in formatted recipient: {recipient}")
+                else:
+                    logger.warning(f"Malformed recipient format: {recipient}")
+            else:
+                # Es solo un email, verificar que sea válido
+                clean_email = self._clean_email_address(recipient)
+                if clean_email:
+                    normalized_recipients.append(clean_email)
+                else:
+                    logger.warning(f"Invalid email address: {recipient}")
+        
+        result = ", ".join(normalized_recipients)
+        logger.info(f"📧 Normalized CC recipients: '{cc_recipients_str}' -> '{result}'")
+        return result
+
     def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
@@ -1309,6 +1433,8 @@ class MicrosoftGraphService:
                             cc_emails.append(cc.address)
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
+                    # Normalizar el formato para consistencia
+                    cc_recipients_str = self.normalize_cc_recipients_format(cc_recipients_str)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
             if original_email and original_name:
                 forwarded_by_email = email.sender.address
@@ -1322,6 +1448,8 @@ class MicrosoftGraphService:
                     cc_recipients_str = f"{cc_recipients_str}, {forwarded_by_formatted}"
                 else:
                     cc_recipients_str = forwarded_by_formatted
+                # Normalizar después de agregar el forwarder
+                cc_recipients_str = self.normalize_cc_recipients_format(cc_recipients_str)
                 logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_formatted}")
                 email_sender_field = f"{original_name} <{original_email}>"
             else:
@@ -2357,24 +2485,23 @@ class MicrosoftGraphService:
                 if response.status_code == 200:
                     message_data = response.json()
                     cc_recipients_data = message_data.get("ccRecipients", [])
-                    for cc_recipient in cc_recipients_data:
-                        email_address = cc_recipient.get("emailAddress", {}).get("address")
-                        if email_address:
-                            original_cc_recipients.append(email_address)
+                    # Usar el nuevo método para preservar nombres
+                    original_cc_recipients = self._parse_email_recipients(cc_recipients_data, "CC")
                     
                     if original_cc_recipients:
                         logger.info(f"Found {len(original_cc_recipients)} CC recipients from original email: {original_cc_recipients}")
+                        self._debug_cc_recipients_format(original_cc_recipients, "ORIGINAL_EMAIL")
                 else:
                     logger.warning(f"Could not fetch original message for CC recipients. Status: {response.status_code}")
             except Exception as cc_error:
                 logger.error(f"Error fetching original CC recipients: {str(cc_error)}")
+            # Combinar CC recipients del email original y del ticket, evitando duplicados
             cc_recipients = original_cc_recipients.copy()
             if task.cc_recipients:
                 ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
-                for ticket_cc in ticket_cc_recipients:
-                    if ticket_cc not in cc_recipients:
-                        cc_recipients.append(ticket_cc)
-                logger.info(f"Added {len(ticket_cc_recipients)} CC recipients from ticket: {ticket_cc_recipients}")
+                cc_recipients = self._merge_cc_recipients(cc_recipients, ticket_cc_recipients)
+                logger.info(f"Merged CC recipients from ticket. Total CC recipients: {len(cc_recipients)}")
+                self._debug_cc_recipients_format(cc_recipients, "AFTER_MERGE")
             
             if cc_recipients:
                 logger.info(f"Final CC recipients list ({len(cc_recipients)}): {cc_recipients}")
@@ -2404,6 +2531,7 @@ class MicrosoftGraphService:
             
             cc_recipients = cleaned_cc_recipients
             logger.info(f"✅ Cleaned CC recipients for Microsoft Graph: {cc_recipients}")
+            # Nota: En este punto los emails están limpios (solo direcciones) para Microsoft Graph API
         if not self._validate_ticket_mailbox_association(task, mailbox_connection, email_mapping):
             return False
         
