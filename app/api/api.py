@@ -32,10 +32,3 @@ api_router.include_router(automation_settings.router, prefix="/automation-settin
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(tasks_optimized.router, prefix="/tasks-optimized", tags=["tasks-optimized"])
 api_router.include_router(scheduled_comments.router, tags=["scheduled-comments"])
-
-@api_router.get("/health", tags=["health"])
-async def health_check():
-    """
-    Simple health check endpoint to verify the API is running.
-    """
-    return {"status": "ok"}
