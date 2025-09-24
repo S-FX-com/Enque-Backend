@@ -4,7 +4,7 @@ from app.api.endpoints import (
     agents, auth, comments, microsoft, tasks, users, workspaces, teams, attachments, 
     workflows, canned_replies, automations, companies, profile, activities, uploads, 
     categories, reports, global_signatures, notifications, dashboard,
-    tasks_optimized, automation_settings, scheduled_comments
+    tasks_optimized, automation_settings, scheduled_comments, teams_redirect
 )
 
 api_router = APIRouter()
@@ -13,6 +13,7 @@ api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(agents.router, prefix="/agents", tags=["agents"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(teams.router, prefix="/teams", tags=["teams"])
+api_router.include_router(teams_redirect.router, prefix="/teams", tags=["teams"])
 api_router.include_router(companies.router, prefix="/companies", tags=["companies"])
 api_router.include_router(microsoft.router, prefix="/microsoft", tags=["microsoft"])
 api_router.include_router(profile.router, prefix="/profile", tags=["profile"])

@@ -589,43 +589,210 @@ class MicrosoftGraphService:
 
     def _is_mailbox_reply_loop(self, email_content: Dict, mailbox_email: str) -> bool:
         """
-        Detecta si el mailbox está procesando su propia respuesta.
-        Esto ocurre cuando el mailbox aparece tanto en 'To' como en 'Cc',
-        indicando que es una respuesta de agente que el mailbox está volviendo a procesar.
+        Detecta si el mailbox está procesando una respuesta interna del sistema.
+        
+        Casos a detectar:
+        1. Mailbox aparece tanto en To como en Cc (respuesta de agente)
+        2. Sender es un agente del workspace (respuesta interna)  
+        3. Email tiene headers que indican que viene del propio sistema
         """
         try:
             mailbox_email_lower = mailbox_email.lower()
+            sender_email = email_content.get("from", {}).get("emailAddress", {}).get("address", "")
+            sender_name = email_content.get("from", {}).get("emailAddress", {}).get("name", "")
             
-            # Verificar si el mailbox está en los destinatarios 'To'
+            logger.info(f"[LOOP DETECTION] Analyzing email from: {sender_name} <{sender_email}>")
+            
+            # 1. Verificar si el mailbox está en los destinatarios 'To'
             is_in_to = False
             to_recipients = email_content.get("toRecipients", [])
             for recipient in to_recipients:
                 email_addr = recipient.get("emailAddress", {}).get("address", "")
                 if email_addr and email_addr.lower() == mailbox_email_lower:
                     is_in_to = True
+                    logger.info(f"[LOOP DETECTION] Mailbox {mailbox_email} found in TO recipients")
                     break
             
-            # Verificar si el mailbox está en los destinatarios 'Cc'
+            # 2. Verificar si el mailbox está en los destinatarios 'Cc'
             is_in_cc = False
             cc_recipients = email_content.get("ccRecipients", [])
             for recipient in cc_recipients:
                 email_addr = recipient.get("emailAddress", {}).get("address", "")
                 if email_addr and email_addr.lower() == mailbox_email_lower:
                     is_in_cc = True
+                    logger.info(f"[LOOP DETECTION] Mailbox {mailbox_email} found in CC recipients")
                     break
             
-            # Si aparece en ambos (To y Cc), es muy probable que sea una respuesta del agente
-            # que el mailbox está procesando nuevamente
+            # 3. Verificar si el sender es un agente del workspace
+            is_sender_agent = self._is_sender_internal_agent(sender_email, mailbox_email)
+            
+            # 4. DETECCIÓN PRINCIPAL: Si mailbox está en CC y sender es agente interno
+            if is_in_cc and is_sender_agent:
+                logger.warning(f"[LOOP DETECTION] 🔄 Internal agent reply detected: {sender_email} sent to mailbox {mailbox_email} (in CC)")
+                return True
+            
+            # 5. DETECCIÓN LEGACY: Si aparece en ambos (To y Cc) - mantener lógica original
             if is_in_to and is_in_cc:
-                sender_email = email_content.get("from", {}).get("emailAddress", {}).get("address", "")
-                logger.warning(f"[MAIL SYNC] Detected mailbox reply loop: mailbox {mailbox_email} appears in both To and Cc. Sender: {sender_email}")
+                logger.warning(f"[LOOP DETECTION] 🔄 Mailbox reply loop: {mailbox_email} appears in both To and Cc. Sender: {sender_email}")
+                return True
+            
+            # 6. Verificar si es respuesta a un ticket existente desde dominio interno
+            if self._is_internal_domain_reply(email_content, sender_email):
+                logger.warning(f"[LOOP DETECTION] 🔄 Internal domain reply detected from: {sender_email}")
                 return True
                 
+            logger.info(f"[LOOP DETECTION] ✅ Email appears to be external/legitimate from: {sender_email}")
             return False
             
         except Exception as e:
             logger.error(f"Error checking mailbox reply loop: {e}")
             return False
+
+    def _is_sender_internal_agent(self, sender_email: str, mailbox_email: str) -> bool:
+        """
+        Verifica si el sender del email es un agente interno del workspace
+        """
+        try:
+            if not sender_email:
+                return False
+                
+            sender_email_lower = sender_email.lower()
+            
+            # 1. Obtener el workspace_id del mailbox para buscar agentes
+            from app.models.microsoft import MailboxConnection
+            from app.models.agent import Agent
+            
+            mailbox = self.db.query(MailboxConnection).filter(
+                MailboxConnection.email.ilike(mailbox_email),
+                MailboxConnection.is_active == True
+            ).first()
+            
+            if not mailbox:
+                logger.warning(f"[AGENT CHECK] Could not find active mailbox: {mailbox_email}")
+                return False
+            
+            # 2. Buscar si el sender es un agente en el workspace
+            agent = self.db.query(Agent).filter(
+                Agent.email.ilike(sender_email),
+                Agent.workspace_id == mailbox.workspace_id,
+                Agent.is_active == True
+            ).first()
+            
+            if agent:
+                logger.info(f"[AGENT CHECK] ✅ Sender {sender_email} is internal agent: {agent.name}")
+                return True
+            
+            logger.info(f"[AGENT CHECK] ❌ Sender {sender_email} is not an internal agent")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking if sender is internal agent: {e}")
+            return False
+
+    def _is_internal_domain_reply(self, email_content: Dict, sender_email: str) -> bool:
+        """
+        Verifica si es una respuesta desde un dominio interno del sistema
+        IMPORTANTE: Solo marca como loop las RESPUESTAS, no los emails de creación de tickets
+        """
+        try:
+            if not sender_email:
+                return False
+            
+            # 1. Verificar si el subject indica que es respuesta a un ticket
+            subject = email_content.get("subject", "").lower()
+            has_ticket_id = re.search(r'\[id:\d+\]', subject)
+            
+            if not has_ticket_id:
+                # No es respuesta a ticket existente = podría ser nuevo ticket legítimo
+                logger.info(f"[INTERNAL DOMAIN] No ticket ID found - allowing as potential new ticket")
+                return False  
+            
+            # 2. Si tiene ticket ID, verificar si es respuesta vs forward
+            is_reply = subject.startswith("re:") or "reply" in subject
+            is_forward = subject.startswith("fwd:") or subject.startswith("fw:") or "forward" in subject
+            
+            if is_forward:
+                # Forwards pueden ser legítimos incluso desde dominios internos
+                logger.info(f"[INTERNAL DOMAIN] Forwarded email detected - allowing")
+                return False
+            
+            # 3. Obtener dominios internos conocidos
+            sender_domain = sender_email.split('@')[-1].lower() if '@' in sender_email else ""
+            
+            # Dominios que sabemos que son internos del sistema
+            internal_domains = ["s-fx.com", "enque.cc", "microsoftexchange"]
+            
+            # 4. Solo marcar como loop si es RESPUESTA desde dominio interno
+            if is_reply and any(domain in sender_domain for domain in internal_domains):
+                logger.info(f"[INTERNAL DOMAIN] Internal reply to existing ticket from {sender_domain} - likely loop")
+                return True
+                
+            logger.info(f"[INTERNAL DOMAIN] Email from {sender_domain} appears legitimate")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking internal domain reply: {e}")
+            return False
+
+    def _determine_primary_contact_for_reply(self, email: EmailData, mailbox_email: str, workspace_id: int) -> Optional['User']:
+        """
+        Determina el contacto primario correcto para un reply, priorizando usuarios reales sobre mailboxes
+        
+        Cuando un reply tiene múltiples destinatarios TO (ej: usuario + mailbox), 
+        debemos priorizar al usuario real como primary contact, no al mailbox.
+        """
+        from app.models.user import User
+        
+        # 1. Verificar si el sender es el usuario real (caso más común)
+        sender_email = email.sender.address.lower()
+        
+        # 2. Obtener todos los destinatarios TO para analizar
+        to_recipients_emails = [r.address.lower() for r in email.to_recipients if r.address]
+        
+        logger.info(f"[REPLY CONTACT] Analyzing reply from: {sender_email}")
+        logger.info(f"[REPLY CONTACT] TO recipients: {to_recipients_emails}")
+        
+        # 3. Obtener mailboxes activos del workspace para identificarlos
+        mailbox_emails = set()
+        try:
+            from app.models.microsoft import MailboxConnection
+            mailboxes = self.db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == workspace_id,
+                MailboxConnection.is_active == True
+            ).all()
+            mailbox_emails = {mb.email.lower() for mb in mailboxes if mb.email}
+            logger.info(f"[REPLY CONTACT] Known mailboxes: {mailbox_emails}")
+        except Exception as e:
+            logger.warning(f"[REPLY CONTACT] Could not get mailbox emails: {e}")
+        
+        # 4. Si el sender NO es un mailbox, usar el sender como primary contact
+        if sender_email not in mailbox_emails:
+            logger.info(f"[REPLY CONTACT] Sender {sender_email} is not a mailbox - using as primary contact")
+            return get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+        
+        # 5. Si el sender ES un mailbox, buscar en los TO recipients un usuario real
+        logger.info(f"[REPLY CONTACT] Sender {sender_email} is a mailbox - looking for real user in TO recipients")
+        
+        for to_recipient in email.to_recipients:
+            to_email = to_recipient.address.lower()
+            
+            # Skip si es un mailbox conocido
+            if to_email in mailbox_emails:
+                logger.info(f"[REPLY CONTACT] Skipping mailbox in TO: {to_email}")
+                continue
+                
+            # Skip si es el mismo mailbox que está enviando
+            if to_email == mailbox_email.lower():
+                logger.info(f"[REPLY CONTACT] Skipping same mailbox: {to_email}")
+                continue
+            
+            # Este debería ser el usuario real
+            logger.info(f"[REPLY CONTACT] Found real user in TO recipients: {to_email} - using as primary contact")
+            return get_or_create_user(self.db, to_recipient.address, to_recipient.name or "Unknown", workspace_id=workspace_id)
+        
+        # 6. Fallback: usar el sender original si no encontramos nada mejor
+        logger.warning(f"[REPLY CONTACT] Could not find real user, falling back to sender: {sender_email}")
+        return get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
 
     def sync_emails(self, sync_config: EmailSyncConfig):
         user_email, token = self._get_user_email_for_sync(sync_config) # This calls the sync check_and_refresh_all_tokens
@@ -692,7 +859,7 @@ class MicrosoftGraphService:
                     
                     # 🔧 ANTI-LOOP: Verificar si el mailbox está procesando su propia respuesta
                     if self._is_mailbox_reply_loop(email_content, user_email):
-                        logger.info(f"[MAIL SYNC] Skipping mailbox reply loop for email {email_id}: {email_subject}")
+                        logger.info(f"[MAIL SYNC] 🔄 Skipping internal reply loop for email {email_id}: {email_subject}")
                         # Marcar como leído y mover a procesados para evitar reprocesamiento
                         self._mark_email_as_read(user_access_token, user_email, email_id)
                         if processed_folder_id:
@@ -716,8 +883,12 @@ class MicrosoftGraphService:
                     if existing_mapping_by_conv:
                         email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
-                        reply_user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=sync_config.workspace_id)
-                        if not reply_user: logger.error(f"Could not get or create user for reply email sender: {email.sender.address}"); continue
+                        
+                        # 🔧 MEJORA: Determinar el usuario correcto para el reply
+                        # Si hay múltiples destinatarios TO, priorizar usuario real sobre mailbox
+                        reply_user = self._determine_primary_contact_for_reply(email, user_email, sync_config.workspace_id)
+                        
+                        if not reply_user: logger.error(f"Could not determine primary contact for reply email: {email_id}"); continue
                         workspace = self.db.query(Workspace).filter(Workspace.id == sync_config.workspace_id).first()
                         if not workspace: logger.error(f"Workspace ID {sync_config.workspace_id} not found for reply. Skipping comment creation."); continue
                         processed_reply_html = self._process_html_body(email.body_content, email.attachments, f"reply email {email.id}")
@@ -1146,130 +1317,6 @@ class MicrosoftGraphService:
         
         return None
 
-    def _format_email_with_name(self, name: str, email_address: str) -> str:
-        """
-        Formatea un email con nombre en el formato correcto: 'Name <email@domain.com>'
-        Si no hay nombre, retorna solo el email.
-        """
-        if not email_address:
-            return ""
-        
-        # Limpiar la dirección de email
-        clean_email = self._clean_email_address(email_address)
-        if not clean_email:
-            return ""
-        
-        # Si hay nombre, usar formato "Name <email>"
-        if name and name.strip():
-            clean_name = name.strip()
-            return f"{clean_name} <{clean_email}>"
-        
-        # Si no hay nombre, solo retornar el email
-        return clean_email
-
-    def _parse_email_recipients(self, recipients_data: List[Dict], recipient_type: str = "unknown") -> List[str]:
-        """
-        Procesa una lista de recipients y retorna strings formateados correctamente.
-        Mantiene el formato 'Name <email>' cuando hay nombre, solo 'email' cuando no.
-        """
-        formatted_recipients = []
-        
-        for recipient in recipients_data:
-            email_data = recipient.get("emailAddress", {})
-            name = email_data.get("name", "").strip()
-            address = email_data.get("address", "").strip()
-            
-            if address:
-                # Limpiar la dirección de email
-                clean_address = self._clean_email_address(address)
-                if clean_address:
-                    formatted_email = self._format_email_with_name(name, clean_address)
-                    if formatted_email and formatted_email not in formatted_recipients:
-                        formatted_recipients.append(formatted_email)
-                        logger.debug(f"Added {recipient_type} recipient: {formatted_email}")
-        
-        return formatted_recipients
-
-    def _merge_cc_recipients(self, original_cc_list: List[str], additional_cc_list: List[str]) -> List[str]:
-        """
-        Combina listas de CC recipients evitando duplicados basados en la dirección de email.
-        Mantiene el formato 'Name <email>' cuando está disponible.
-        """
-        merged_recipients = []
-        seen_emails = set()
-        
-        # Agregar recipients originales
-        for recipient in original_cc_list:
-            email_addr = self._clean_email_address(recipient)
-            if email_addr and email_addr.lower() not in seen_emails:
-                merged_recipients.append(recipient)
-                seen_emails.add(email_addr.lower())
-        
-        # Agregar recipients adicionales solo si no están duplicados
-        for recipient in additional_cc_list:
-            email_addr = self._clean_email_address(recipient)
-            if email_addr and email_addr.lower() not in seen_emails:
-                merged_recipients.append(recipient.strip())
-                seen_emails.add(email_addr.lower())
-        
-        return merged_recipients
-
-    def _debug_cc_recipients_format(self, cc_recipients: List[str], context: str):
-        """
-        Función de debug para rastrear el formato de CC recipients en diferentes puntos.
-        """
-        logger.info(f"🔍 DEBUG CC FORMAT [{context}]: Total recipients: {len(cc_recipients)}")
-        for i, recipient in enumerate(cc_recipients):
-            has_name = '<' in recipient and '>' in recipient
-            email_only = self._clean_email_address(recipient)
-            logger.info(f"🔍   [{i+1}] {recipient} -> Email: {email_only}, Has name: {has_name}")
-        return cc_recipients
-
-    def normalize_cc_recipients_format(self, cc_recipients_str: str) -> str:
-        """
-        Normaliza el formato de CC recipients para mantener consistencia.
-        Asegura que los emails con nombres mantengan el formato 'Name <email@domain.com>'
-        y los emails sin nombres mantengan solo 'email@domain.com'.
-        """
-        import re
-        if not cc_recipients_str or not cc_recipients_str.strip():
-            return ""
-        
-        # Dividir por comas y procesar cada recipient
-        recipients = [email.strip() for email in cc_recipients_str.split(',') if email.strip()]
-        normalized_recipients = []
-        
-        for recipient in recipients:
-            # Si ya tiene formato 'Name <email>', verificar que sea válido
-            if '<' in recipient and '>' in recipient:
-                email_match = re.search(r'<([^>]+)>', recipient)
-                if email_match:
-                    email_part = email_match.group(1).strip()
-                    # Verificar que el email sea válido
-                    clean_email = self._clean_email_address(email_part)
-                    if clean_email:
-                        # Extraer el nombre
-                        name_part = recipient[:recipient.find('<')].strip()
-                        if name_part:
-                            normalized_recipients.append(f"{name_part} <{clean_email}>")
-                        else:
-                            normalized_recipients.append(clean_email)
-                    else:
-                        logger.warning(f"Invalid email in formatted recipient: {recipient}")
-                else:
-                    logger.warning(f"Malformed recipient format: {recipient}")
-            else:
-                # Es solo un email, verificar que sea válido
-                clean_email = self._clean_email_address(recipient)
-                if clean_email:
-                    normalized_recipients.append(clean_email)
-                else:
-                    logger.warning(f"Invalid email address: {recipient}")
-        
-        result = ", ".join(normalized_recipients)
-        logger.info(f"📧 Normalized CC recipients: '{cc_recipients_str}' -> '{result}'")
-        return result
-
     def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
@@ -1433,8 +1480,6 @@ class MicrosoftGraphService:
                             cc_emails.append(cc.address)
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
-                    # Normalizar el formato para consistencia
-                    cc_recipients_str = self.normalize_cc_recipients_format(cc_recipients_str)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
             if original_email and original_name:
                 forwarded_by_email = email.sender.address
@@ -1448,8 +1493,6 @@ class MicrosoftGraphService:
                     cc_recipients_str = f"{cc_recipients_str}, {forwarded_by_formatted}"
                 else:
                     cc_recipients_str = forwarded_by_formatted
-                # Normalizar después de agregar el forwarder
-                cc_recipients_str = self.normalize_cc_recipients_format(cc_recipients_str)
                 logger.info(f"[FORWARD DETECTION] Added forwarder to CC: {forwarded_by_formatted}")
                 email_sender_field = f"{original_name} <{original_email}>"
             else:
@@ -2485,23 +2528,24 @@ class MicrosoftGraphService:
                 if response.status_code == 200:
                     message_data = response.json()
                     cc_recipients_data = message_data.get("ccRecipients", [])
-                    # Usar el nuevo método para preservar nombres
-                    original_cc_recipients = self._parse_email_recipients(cc_recipients_data, "CC")
+                    for cc_recipient in cc_recipients_data:
+                        email_address = cc_recipient.get("emailAddress", {}).get("address")
+                        if email_address:
+                            original_cc_recipients.append(email_address)
                     
                     if original_cc_recipients:
                         logger.info(f"Found {len(original_cc_recipients)} CC recipients from original email: {original_cc_recipients}")
-                        self._debug_cc_recipients_format(original_cc_recipients, "ORIGINAL_EMAIL")
                 else:
                     logger.warning(f"Could not fetch original message for CC recipients. Status: {response.status_code}")
             except Exception as cc_error:
                 logger.error(f"Error fetching original CC recipients: {str(cc_error)}")
-            # Combinar CC recipients del email original y del ticket, evitando duplicados
             cc_recipients = original_cc_recipients.copy()
             if task.cc_recipients:
                 ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
-                cc_recipients = self._merge_cc_recipients(cc_recipients, ticket_cc_recipients)
-                logger.info(f"Merged CC recipients from ticket. Total CC recipients: {len(cc_recipients)}")
-                self._debug_cc_recipients_format(cc_recipients, "AFTER_MERGE")
+                for ticket_cc in ticket_cc_recipients:
+                    if ticket_cc not in cc_recipients:
+                        cc_recipients.append(ticket_cc)
+                logger.info(f"Added {len(ticket_cc_recipients)} CC recipients from ticket: {ticket_cc_recipients}")
             
             if cc_recipients:
                 logger.info(f"Final CC recipients list ({len(cc_recipients)}): {cc_recipients}")
@@ -2531,7 +2575,6 @@ class MicrosoftGraphService:
             
             cc_recipients = cleaned_cc_recipients
             logger.info(f"✅ Cleaned CC recipients for Microsoft Graph: {cc_recipients}")
-            # Nota: En este punto los emails están limpios (solo direcciones) para Microsoft Graph API
         if not self._validate_ticket_mailbox_association(task, mailbox_connection, email_mapping):
             return False
         
@@ -3417,20 +3460,50 @@ class MicrosoftGraphService:
             from urllib.parse import quote
             encoded_sub_entity_id = quote(sub_entity_id)
             
-            # Teams deep link with URL-encoded subEntityId
-            deep_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets/{encoded_sub_entity_id}"
+            # Para Teams activity notifications, necesitamos usar un approach diferente
+            # El deep link debe abrir directamente el tab con el subEntityId
             
-            logger.info(f"Teams notification deep link: {deep_link}")
-            logger.info(f"SubEntityId JSON: {sub_entity_id}")
-            logger.info(f"Encoded SubEntityId: {encoded_sub_entity_id}")
-            logger.info(f"Target workspace URL should be: https://{subdomain}.enque.cc/tickets/{ticket_id}")
+            # NUEVA ESTRATEGIA: Crear un token temporal y guardarlo en caché en memoria
+            import secrets
+            import time
+            
+            # Generar un token único para esta notificación
+            redirect_token = secrets.token_urlsafe(32)
+            
+            # Guardar la información en el caché en memoria
+            redirect_data = {
+                "ticketId": ticket_id,
+                "subdomain": subdomain,
+                "agentId": agent_id,
+                "timestamp": time.time(),
+                "expires_at": time.time() + 3600  # Expira en 1 hora
+            }
+            
+            # Usar el cache en memoria existente para guardar temporalmente
+            from app.core.cache import user_cache
+            # Crear un caché específico para redirects si no existe
+            if not hasattr(user_cache, '_redirect_cache'):
+                user_cache._redirect_cache = {}
+            
+            user_cache._redirect_cache[redirect_token] = redirect_data
+            
+            # URL simple con el token
+            redirect_url_with_token = f"https://app.enque.cc/teams-redirect?token={redirect_token}"
+            
+            # Teams deep link simple que abre la app
+            teams_simple_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets"
+            
+            logger.info(f"Generated redirect token: {redirect_token}")
+            logger.info(f"Redirect URL with token: {redirect_url_with_token}")
+            logger.info(f"Cached redirect data for 1 hour")
+            logger.info(f"Target workspace: https://{subdomain}.enque.cc/tickets/{ticket_id}")
 
             # Construct the notification payload
             notification_payload = {
                 "topic": {
                     "source": "text",
                     "value": title,
-                    "webUrl": deep_link  # Must use Teams deep link, not external URL
+                    "webUrl": teams_simple_link  # Teams deep link que abre la app
                 },
                 "activityType": "ticketNotification", # This must match a type in your manifest
                 "previewText": {
@@ -3442,7 +3515,9 @@ class MicrosoftGraphService:
                 },
                 "templateParameters": [
                     { "name": "action", "value": title },
-                    { "name": "ticketId", "value": f"#{ticket_id}" }
+                    { "name": "ticketId", "value": f"#{ticket_id}" },
+                    { "name": "redirectUrl", "value": redirect_url_with_token },  # URL con token
+                    { "name": "subdomain", "value": subdomain }
                 ]
             }
 
