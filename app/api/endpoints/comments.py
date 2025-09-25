@@ -95,7 +95,6 @@ async def get_scheduled_comments(
     permissions_start = time.time()
     scheduled_comment = db.query(ScheduledComment).filter(
         ScheduledComment.id == task_id,
-        ScheduledComment.workspace_id == current_user.workspace_id,
     )
 
     permissions_time = time.time() - permissions_start
@@ -106,7 +105,8 @@ async def get_scheduled_comments(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Scheduled comment not found",
             )
-
+    from app.services.s3_service import get_s3_service
+    s3_service = get_s3_service()
     query_start = time.time()
     scheduled_comments_list: list = []
     for comment in scheduled_comment:
@@ -115,6 +115,8 @@ async def get_scheduled_comments(
             AgentModel.id == comment.agent_id,
             AgentModel.workspace_id == current_user.workspace_id,
         ).first()
+        content = comment.content
+        s3_content = s3_service.get_comment_html(comment.s3_html_url)
         agent_name = agent.name if agent else "Unknown"
         dateScheduled: str = comment.scheduled_send_at.strftime("%Y-%m-%d %H:%M:%S")
         scheduled_comments_list.append({
@@ -187,19 +189,19 @@ async def create_comment(
         try:
             from app.services.email_service import parse_other_destinaries
             from app.services.microsoft_service import get_microsoft_service
-            
+
             cc_recipients = parse_other_destinaries(comment_in.other_destinaries)
-            
+
             # Normalizar el formato de CC recipients para consistencia
             microsoft_service = get_microsoft_service(db)
             normalized_cc_str = microsoft_service.normalize_cc_recipients_format(comment_in.other_destinaries)
-            
+
             logger.info(f"Parsed {len(cc_recipients)} CC recipients for comment on task {task_id}")
             logger.info(f"Normalized CC format: '{comment_in.other_destinaries}' -> '{normalized_cc_str}'")
-            
+
             # Actualizar el comment_in con el formato normalizado
             comment_in.other_destinaries = normalized_cc_str
-            
+
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
