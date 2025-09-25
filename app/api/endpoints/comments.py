@@ -115,8 +115,7 @@ async def get_scheduled_comments(
             AgentModel.id == comment.agent_id,
             AgentModel.workspace_id == current_user.workspace_id,
         ).first()
-        content = comment.content
-        s3_content = s3_service.get_comment_html(comment.s3_html_url)
+        s3_content = s3_service.get_comment_html(comment.content)
         agent_name = agent.name if agent else "Unknown"
         dateScheduled: str = comment.scheduled_send_at.strftime("%Y-%m-%d %H:%M:%S")
         scheduled_comments_list.append({
