@@ -121,7 +121,7 @@ async def get_scheduled_comments(
         scheduled_comments_list.append({
             "due_date": dateScheduled,
             "status": comment.status,
-            "content": comment.content,
+            "content": s3_content,
             "agent_name": agent_name,
         })
     query_time = time.time() - query_start
