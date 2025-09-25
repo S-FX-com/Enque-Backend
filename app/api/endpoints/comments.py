@@ -187,6 +187,7 @@ async def create_comment(
     if comment_in.other_destinaries and not comment_in.is_private:
         try:
             from app.services.email_service import parse_other_destinaries
+<<<<<<< HEAD
             from app.services.microsoft_service import get_microsoft_service
 
             cc_recipients = parse_other_destinaries(comment_in.other_destinaries)
@@ -201,6 +202,10 @@ async def create_comment(
             # Actualizar el comment_in con el formato normalizado
             comment_in.other_destinaries = normalized_cc_str
 
+=======
+            cc_recipients = parse_other_destinaries(comment_in.other_destinaries)
+            logger.info(f"Parsed {len(cc_recipients)} CC recipients for comment on task {task_id}")
+>>>>>>> 067173fe672463c8d3eadaacbc3f077977bc0cfd
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

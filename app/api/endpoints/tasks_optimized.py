@@ -2,9 +2,11 @@ from typing import Any, List, Optional
 import time
 import logging
 from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session, noload
 from sqlalchemy import or_, and_, func, String
+
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
 from app.models.task import Task
@@ -192,6 +194,9 @@ async def read_team_tasks_optimized(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
+    """
+    ENDPOINT OPTIMIZADO: Tasks asignadas a un equipo específico
+    """
     start_time = time.time()
 
     query = db.query(Task).filter(
@@ -234,6 +239,8 @@ async def search_tasks_optimized(
 ) -> Any:
 
     start_time = time.time()
+    
+    # Consulta optimizada de búsqueda
     query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False,
@@ -295,7 +302,12 @@ async def get_my_tickets_count(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> dict:
+    """
+    Cuenta los tickets asignados directamente al usuario actual.
+    """
     start_time = time.time()
+    
+    # Contar tickets asignados al usuario actual (no cerrados)
     count = db.query(func.count(Task.id)).filter(
         Task.assignee_id == current_user.id,
         Task.workspace_id == current_user.workspace_id,
@@ -307,6 +319,7 @@ async def get_my_tickets_count(
     logger.info(f"MY TICKETS COUNT: {count} tickets asignados al usuario {current_user.id} contados en {query_time*1000:.2f}ms")
     
     return {"count": count, "query_time_ms": round(query_time * 1000, 2)}
+
 
 @router.get("/count/my-teams")
 async def get_my_teams_tasks_count(
@@ -690,9 +703,11 @@ async def update_task_optimized_for_refresh(
     except Exception as e:
         socketio_time = time.time() - socketio_start
         logger.warning(f"Socket.IO error en refresh optimizado: {e}")
-
+    
+    # 5. 📊 Performance summary
     total_time = time.time() - refresh_start_time
     
+    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas para mostrar contacto
     return TaskWithDetails.from_orm(updated_task)
 
 
@@ -704,7 +719,8 @@ async def performance_comparison_test(
 ) -> Any:
 
     results = {}
-
+    
+    # Verificar que el ticket existe primero
     exists_start = time.time()
     ticket_exists = db.query(Task.id).filter(
         Task.id == task_id,
@@ -803,7 +819,9 @@ async def performance_comparison_test(
         logger.info(f"🐌 SLOWEST: {slowest_method} = {slowest_data['time_ms']}ms ({slowest_data['method']})")
         
         if len(sorted_methods) > 1:
-            improvement = ((slowest_data['time_ms'] - fastest_data['time_ms']) / slowest_data['time_ms']) * 100       
+            improvement = ((slowest_data['time_ms'] - fastest_data['time_ms']) / slowest_data['time_ms']) * 100
+        
+        # Recomendaciones
         if fastest_data['time_ms'] < 30:
             pass
         if slowest_data['time_ms'] > 150:
@@ -846,6 +864,7 @@ async def read_task_smart_optimization(
 
     analysis_start = time.time()
     
+    # Verificar existencia con EXISTS optimizado
     from sqlalchemy import exists as sql_exists
     ticket_exists = db.query(
         sql_exists().where(
@@ -872,7 +891,10 @@ async def read_task_smart_optimization(
     
     analysis_time = time.time() - analysis_start
     
-    decision_start = time.time() 
+    # 2. 🧠 DECISIÓN INTELIGENTE basada en análisis
+    decision_start = time.time()
+    
+    # Calcular métricas para decisión
     title_size = len(basic_data.title) if basic_data.title else 0
     desc_size = len(basic_data.description) if basic_data.description else 0
     total_content = title_size + desc_size
@@ -882,6 +904,8 @@ async def read_task_smart_optimization(
     has_category = basic_data.category_id is not None
     
     relations_needed = sum([has_assignee, has_user, has_category])
+    
+    # 🎯 ALGORITMO DE DECISIÓN INTELIGENTE
     if total_content < 100 and relations_needed == 0:
         strategy = "ULTRA_FAST"
         method = "Sin relaciones (contenido mínimo, sin datos relacionados)"
