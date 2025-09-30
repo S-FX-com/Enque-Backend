@@ -41,25 +41,7 @@ async def get_microsoft_signin_auth_url(
     This endpoint is specifically for the signin flow and doesn't require authentication
     """
     try:
-        # Default workspace if not provided
-        if not workspace_id:
-            workspace = db.query(Workspace).first()
-            if not workspace:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No workspace available"
-                )
-            workspace_id = workspace.id
-            
-        # Validate workspace exists
-        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
-        if not workspace:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Workspace with ID {workspace_id} not found"
-            )
-        
-        # Get original hostname from origin_url parameter or referer
+        # Get original hostname from origin_url parameter or referer first
         original_hostname = None
         if origin_url:
             from urllib.parse import urlparse
@@ -75,6 +57,37 @@ async def get_microsoft_signin_auth_url(
                 logger.info(f"Extracted original_hostname from referer: {original_hostname}")
             else:
                 logger.warning("No origin_url or referer found, original_hostname will be None")
+
+        # Determine workspace from hostname if not provided
+        if not workspace_id and original_hostname:
+            # Extract subdomain from hostname (e.g., "sfx" from "sfx.enque.cc")
+            if original_hostname.endswith('.enque.cc'):
+                subdomain = original_hostname.replace('.enque.cc', '')
+                workspace = db.query(Workspace).filter(Workspace.subdomain == subdomain).first()
+                if workspace:
+                    workspace_id = workspace.id
+                    logger.info(f"🎯 Found workspace {workspace_id} for subdomain '{subdomain}' from hostname '{original_hostname}'")
+                else:
+                    logger.warning(f"⚠️ No workspace found for subdomain '{subdomain}' from hostname '{original_hostname}'")
+            
+        # Default workspace if still not found
+        if not workspace_id:
+            workspace = db.query(Workspace).first()
+            if not workspace:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No workspace available"
+                )
+            workspace_id = workspace.id
+            logger.warning(f"🔄 Using default workspace {workspace_id} as fallback")
+            
+        # Validate workspace exists
+        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Workspace with ID {workspace_id} not found"
+            )
         
         # Create state data for signin flow
         state_data = {
@@ -727,11 +740,9 @@ async def microsoft_auth_callback_get(
 
     try:
         flow_type = state_data.get('flow') if state_data else None
-        logger.info(f"🔍 Microsoft callback - Flow type: {flow_type}, State data: {state_data}")
 
         # --- UNIFIED FLOW START ---
         if flow_type in ['auth', 'profile_link']:
-            logger.info(f"📝 Processing as '{flow_type}' flow")
             redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
             
             microsoft_service = MicrosoftGraphService(db)

@@ -54,7 +54,17 @@ async def login_access_token(
         user = db.query(Agent).filter(Agent.email == form_data.username).first()
         logger.info(f"Searching for user {form_data.username} without workspace restriction: {'Found' if user else 'Not found'}")
     
-    if not user or not verify_password(form_data.password, user.password):
+    # Verificar contraseña con manejo robusto de errores
+    password_valid = False
+    try:
+        if user:
+            password_valid = verify_password(form_data.password, user.password)
+            logger.info(f"Password verification result for {form_data.username}: {password_valid}")
+    except Exception as pwd_error:
+        logger.error(f"Error during password verification for {form_data.username}: {pwd_error}")
+        password_valid = False
+    
+    if not user or not password_valid:
         logger.warning(f"Authentication failed for user: {form_data.username} (User not found or incorrect password)")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -469,6 +479,24 @@ async def get_microsoft_auth_url(
     db: Session = Depends(get_db)
 ):
     try:
+        # Get original hostname from referer first
+        original_hostname = None
+        referer = request.headers.get("referer", "")
+        if referer:
+            from urllib.parse import urlparse
+            parsed = urlparse(referer)
+            original_hostname = parsed.netloc
+
+        # Determine workspace from hostname if not provided
+        if not workspace_id and original_hostname:
+            # Extract subdomain from hostname (e.g., "sfx" from "sfx.enque.cc")
+            if original_hostname.endswith('.enque.cc'):
+                subdomain = original_hostname.replace('.enque.cc', '')
+                workspace = db.query(Workspace).filter(Workspace.subdomain == subdomain).first()
+                if workspace:
+                    workspace_id = workspace.id
+            
+        # Default workspace if still not found
         if not workspace_id:
             workspace = db.query(Workspace).first()
             if not workspace:
@@ -477,23 +505,14 @@ async def get_microsoft_auth_url(
                     detail="No workspace available"
                 )
             workspace_id = workspace.id
+            
+        # Validate workspace exists
         workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
         if not workspace:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Workspace with ID {workspace_id} not found"
             )
-        
-        # Get original hostname from referer or default
-        original_hostname = None
-        referer = request.headers.get("referer", "")
-        if referer:
-            from urllib.parse import urlparse
-            parsed = urlparse(referer)
-            original_hostname = parsed.netloc
-            logger.info(f"Extracted original_hostname from referer: {original_hostname}")
-        else:
-            logger.warning("No referer found, original_hostname will be None")
         
         state_data = {
             "workspace_id": str(workspace_id),
@@ -516,8 +535,6 @@ async def get_microsoft_auth_url(
         import urllib.parse
         auth_url_params_encoded = urllib.parse.urlencode(auth_url_params)
         auth_url = f"https://login.microsoftonline.com/{settings.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize?{auth_url_params_encoded}"
-        
-        logger.info(f"Generated Microsoft auth URL for workspace {workspace_id}")
         
         return {
             "auth_url": auth_url,
