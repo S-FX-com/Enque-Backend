@@ -244,16 +244,25 @@ class MicrosoftGraphService:
                     microsoft_id = user_info.get("id")
                     microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
                     
-                    # Find agent by microsoft_id first
+                    # Strategy 1: Find agent by microsoft_id in the target workspace
                     agent = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id, Agent.workspace_id == workspace_id).first()
                     
                     if not agent:
-                        # If not found, find by email to link the account
+                        # Strategy 2: Find by email in the target workspace (to link existing account)
                         agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
 
                     if not agent:
-                        # If still not found, create a new agent
-                        logger.info(f"Creating new Microsoft agent: {microsoft_email}")
+                        # Strategy 3: Check if this Microsoft user exists in OTHER workspaces
+                        existing_agent_other_workspace = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first()
+                        if existing_agent_other_workspace:
+                            # Check if there's an agent with the same email in the target workspace that we can link
+                            same_email_agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
+                            if same_email_agent:
+                                agent = same_email_agent
+
+                    if not agent:
+                        # Strategy 4: Create a new agent in the target workspace
+                        logger.info(f"Creating new Microsoft agent: {microsoft_email} in workspace {workspace_id}")
                         display_name = user_info.get("displayName", microsoft_email.split("@")[0])
                         agent = Agent(
                             name=display_name, email=microsoft_email, role="agent", auth_method="microsoft",
@@ -3267,43 +3276,62 @@ class MicrosoftGraphService:
             if not agent_to_update:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found during profile linking.")
 
-            # 1. Assign all Microsoft-related data
-            agent_to_update.microsoft_id = user_info.get("id")
-            agent_to_update.microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+            # 1. Check if microsoft_id already exists in another agent
+            microsoft_id = user_info.get("id")
+            microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+            
+            # Check if this Microsoft ID is already used by another agent
+            existing_agent_with_ms_id = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first()
+            if existing_agent_with_ms_id and existing_agent_with_ms_id.id != agent_to_update.id:
+                # If it's the same email, we might want to unlink from the old agent
+                if existing_agent_with_ms_id.email == microsoft_email:
+                    # Clear Microsoft data from the old agent
+                    existing_agent_with_ms_id.microsoft_id = None
+                    existing_agent_with_ms_id.microsoft_email = None
+                    existing_agent_with_ms_id.microsoft_tenant_id = None
+                    existing_agent_with_ms_id.microsoft_profile_data = None
+                    existing_agent_with_ms_id.microsoft_refresh_token = None
+                    # Update auth method if it was Microsoft-only
+                    if existing_agent_with_ms_id.auth_method == "microsoft":
+                        existing_agent_with_ms_id.auth_method = "password"
+                    elif existing_agent_with_ms_id.auth_method == "both":
+                        existing_agent_with_ms_id.auth_method = "password"
+                else:
+                    # Different email - this should not happen, but handle it gracefully
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, 
+                        detail=f"Microsoft account {microsoft_email} is already linked to a different user ({existing_agent_with_ms_id.email})"
+                    )
+
+            # 2. Assign all Microsoft-related data to the current agent
+            agent_to_update.microsoft_id = microsoft_id
+            agent_to_update.microsoft_email = microsoft_email
             agent_to_update.microsoft_tenant_id = settings.MICROSOFT_TENANT_ID
             agent_to_update.microsoft_profile_data = json.dumps(user_info)
             
-            logger.debug(f"Full token_data received from Microsoft for agent {agent_to_update.id}: {token_data}")
             refresh_token_val = token_data.get("refresh_token")
 
             if refresh_token_val:
                 agent_to_update.microsoft_refresh_token = refresh_token_val
-                logger.info(f"✅ Refresh token received for agent {agent_to_update.id}. Preparing to save.")
-                logger.info(f"   Token value (first 10 chars): {refresh_token_val[:10]}...")
             else:
-                logger.warning(f"⚠️ No refresh token was provided by Microsoft for agent {agent_to_update.id}. Re-consent may be required.")
+                logger.warning(f"No refresh token provided for agent {agent_to_update.id}")
 
             if agent_to_update.auth_method == "password":
                 agent_to_update.auth_method = "both"
             
-            # 2. Commit the critical token and profile data FIRST
-            logger.info(f"PRE-COMMIT CHECK for agent {agent_to_update.id}: microsoft_refresh_token is set to: {agent_to_update.microsoft_refresh_token[:10] if agent_to_update.microsoft_refresh_token else 'None'}")
+            # 3. Commit the critical token and profile data FIRST
             self.db.commit()
-            logger.info(f"✅ Committed Microsoft profile and token data for agent {agent_to_update.id}")
 
-            # 3. Handle non-critical updates (avatar) in a separate transaction
+            # 4. Handle non-critical updates (avatar) in a separate transaction
             try:
-                logger.info(f"🔍 Attempting to download profile photo for agent {agent_to_update.id}")
                 photo_bytes = self._get_user_profile_photo(token_data["access_token"])
                 if photo_bytes:
-                    logger.info(f"📸 Profile photo found ({len(photo_bytes)} bytes), uploading to S3...")
                     avatar_url = self._upload_avatar_to_s3(photo_bytes, agent_to_update.id)
                     if avatar_url:
                         agent_to_update.avatar_url = avatar_url
                         self.db.commit() # Commit avatar update separately
-                        logger.info(f"✅ Updated and committed agent {agent_to_update.id} avatar: {avatar_url}")
             except Exception as avatar_error:
-                logger.error(f"❌ Error processing avatar for agent {agent_to_update.id}: {str(avatar_error)}")
+                logger.error(f"Error processing avatar for agent {agent_to_update.id}: {str(avatar_error)}")
                 self.db.rollback() # Rollback only the avatar transaction if it fails
 
             # 4. Refresh the agent object to get the latest state from the DB
@@ -3313,9 +3341,8 @@ class MicrosoftGraphService:
             try:
                 from app.core.cache import user_cache
                 user_cache.delete(agent_to_update.id)
-                logger.info(f"🗑️ Invalidated user cache for agent {agent_to_update.id} after Microsoft profile linking")
             except Exception as cache_error:
-                logger.error(f"❌ Failed to invalidate cache for agent {agent_to_update.id}: {cache_error}")
+                logger.error(f"Failed to invalidate cache for agent {agent_to_update.id}: {cache_error}")
 
             # 6. Create a temporary MicrosoftToken object for the response
             token_obj_for_response = MicrosoftToken(
@@ -3327,7 +3354,6 @@ class MicrosoftGraphService:
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
             )
             
-            logger.info(f"Successfully linked Microsoft profile for agent {agent_to_update.email}")
             return token_obj_for_response
             
         except Exception as e:
@@ -3442,68 +3468,30 @@ class MicrosoftGraphService:
                 "Content-Type": "application/json"
             }
 
-            # The App ID from your manifest.json
             teams_app_id = "9793e065-fc8e-4920-a72e-12eee326e783"
-            
-            # Construct the Teams deep link
             ticket_id = link_to_ticket.split('/')[-1]
+
+            # The subEntityId will be passed to our backend redirector
+            # It contains the necessary info to construct the final URL
+            import urllib.parse
+            sub_entity_data = f"{ticket_id}|{subdomain}"
+            encoded_sub_entity = urllib.parse.quote(sub_entity_data, safe='')
+
+            # This is the deep link that Teams requires for the webUrl field
+            teams_deep_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/teams-redirect?subEntityId={encoded_sub_entity}"
             
-            # For Teams personal tabs, we must use subEntityId to pass context
-            # Format: https://teams.microsoft.com/l/entity/{app-id}/{entity-id}/{sub-entity-id}
-            # The sub-entity-id becomes the subPageId in Teams context
-            context_data = {
-                "ticketId": ticket_id,
-                "subdomain": subdomain
-            }
-            sub_entity_id = json.dumps(context_data)
-            # URL encode the JSON to ensure it passes through Teams correctly
-            from urllib.parse import quote
-            encoded_sub_entity_id = quote(sub_entity_id)
-            
-            # Para Teams activity notifications, necesitamos usar un approach diferente
-            # El deep link debe abrir directamente el tab con el subEntityId
-            
-            # NUEVA ESTRATEGIA: Crear un token temporal y guardarlo en caché en memoria
-            import secrets
-            import time
-            
-            # Generar un token único para esta notificación
-            redirect_token = secrets.token_urlsafe(32)
-            
-            # Guardar la información en el caché en memoria
-            redirect_data = {
-                "ticketId": ticket_id,
-                "subdomain": subdomain,
-                "agentId": agent_id,
-                "timestamp": time.time(),
-                "expires_at": time.time() + 3600  # Expira en 1 hora
-            }
-            
-            # Usar el cache en memoria existente para guardar temporalmente
-            from app.core.cache import user_cache
-            # Crear un caché específico para redirects si no existe
-            if not hasattr(user_cache, '_redirect_cache'):
-                user_cache._redirect_cache = {}
-            
-            user_cache._redirect_cache[redirect_token] = redirect_data
-            
-            # URL simple con el token
-            redirect_url_with_token = f"https://app.enque.cc/teams-redirect?token={redirect_token}"
-            
-            # Teams deep link simple que abre la app
-            teams_simple_link = f"https://teams.microsoft.com/l/entity/{teams_app_id}/tickets"
-            
-            logger.info(f"Generated redirect token: {redirect_token}")
-            logger.info(f"Redirect URL with token: {redirect_url_with_token}")
-            logger.info(f"Cached redirect data for 1 hour")
-            logger.info(f"Target workspace: https://{subdomain}.enque.cc/tickets/{ticket_id}")
+            logger.info(f"Constructed Teams deep link: {teams_deep_link}")
+            logger.info(f"Target redirect URL to be built by backend: https://{subdomain}.enque.cc/tickets/{ticket_id}")
+
+            # The final URL for the template text can be direct, as it's just for display
+            final_web_url = f"https://{subdomain}.enque.cc/tickets/{ticket_id}"
 
             # Construct the notification payload
             notification_payload = {
                 "topic": {
                     "source": "text",
                     "value": title,
-                    "webUrl": teams_simple_link  # Teams deep link que abre la app
+                    "webUrl": teams_deep_link  # Use the required Teams deep link here
                 },
                 "activityType": "ticketNotification", # This must match a type in your manifest
                 "previewText": {
@@ -3516,8 +3504,7 @@ class MicrosoftGraphService:
                 "templateParameters": [
                     { "name": "action", "value": title },
                     { "name": "ticketId", "value": f"#{ticket_id}" },
-                    { "name": "redirectUrl", "value": redirect_url_with_token },  # URL con token
-                    { "name": "subdomain", "value": subdomain }
+                    { "name": "workspaceUrl", "value": final_web_url } # Display the final URL in the notification text
                 ]
             }
 

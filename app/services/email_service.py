@@ -602,6 +602,56 @@ async def send_team_ticket_notification_email(
         logger.error(f"Exception in send_team_ticket_notification_email for {to_email}: {e}", exc_info=True)
         return False
 
+def clean_html_recipients(recipients_input: str) -> str:
+    """
+    Clean HTML-serialized recipients and extract valid email addresses.
+    
+    Args:
+        recipients_input: String that might contain HTML or plain text emails
+        
+    Returns:
+        Comma-separated string of clean email addresses
+    """
+    if not recipients_input or not recipients_input.strip():
+        return ""
+    
+    # If it looks like HTML, extract emails from it
+    if '<' in recipients_input and '>' in recipients_input:
+        import re
+        
+        # Extract emails from HTML spans - look for patterns like:
+        # <span class="text-xs">Name &lt;email@domain.com&gt;</span>
+        # <span class="text-xs">email@domain.com</span>
+        
+        # First, decode HTML entities
+        html_decoded = recipients_input.replace('&lt;', '<').replace('&gt;', '>')
+        
+        # Extract all text content from spans
+        span_pattern = r'<span[^>]*class="text-xs"[^>]*>([^<]+)</span>'
+        matches = re.findall(span_pattern, html_decoded)
+        
+        valid_emails = []
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        
+        for match in matches:
+            match = match.strip()
+            
+            # Extract email from "Name <email@domain.com>" format
+            email_match = re.search(r'<([^>]+)>', match)
+            if email_match:
+                email = email_match.group(1).strip()
+                if re.match(email_pattern, email):
+                    valid_emails.append(match)  # Keep the full format
+            else:
+                # Check if it's a plain email
+                if re.match(email_pattern, match):
+                    valid_emails.append(match)
+        
+        return ', '.join(valid_emails)
+    
+    # If it's plain text, return as-is
+    return recipients_input.strip()
+
 def validate_email_addresses(email_string: str) -> Tuple[bool, List[str]]:
     """
     Validate a comma-separated string of email addresses.
@@ -641,7 +691,7 @@ def parse_other_destinaries(other_destinaries: Optional[str]) -> List[str]:
     Parse and validate the other_destinaries field.
 
     Args:
-        other_destinaries: Comma-separated string of email addresses
+        other_destinaries: Comma-separated string of email addresses or HTML content
 
     Returns:
         List of valid email addresses
@@ -649,7 +699,13 @@ def parse_other_destinaries(other_destinaries: Optional[str]) -> List[str]:
     if not other_destinaries:
         return []
 
-    is_valid, emails = validate_email_addresses(other_destinaries)
+    # Clean any HTML content and extract valid emails
+    cleaned_emails = clean_html_recipients(other_destinaries)
+    
+    if not cleaned_emails:
+        return []
+
+    is_valid, emails = validate_email_addresses(cleaned_emails)
     if not is_valid:
         raise ValueError("Invalid email addresses in other_destinaries field")
 
