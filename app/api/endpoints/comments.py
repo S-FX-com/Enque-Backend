@@ -108,17 +108,17 @@ async def get_scheduled_comments(
     from app.services.s3_service import get_s3_service
     s3_service = get_s3_service()
     query_start = time.time()
-    regex_matchS3 = r"[MIGRATED_TO_S3] Content moved to S3:"
+    regex_matchS3 = re.escape("[MIGRATED_TO_S3] Content moved to S3: ")
     scheduled_comments_list: list = []
     for comment in scheduled_comment:
-        # buscar agente relacionado
         agent = db.query(AgentModel).filter(
             AgentModel.id == comment.agent_id,
             AgentModel.workspace_id == current_user.workspace_id,
         ).first()
-        s3_content:str = str(s3_service.get_comment_html(comment.content))
-        if re.match(regex_matchS3, s3_content):
-            s3_content = re.sub(regex_matchS3,'', s3_content)
+        url = comment.content
+        if re.match(regex_matchS3, url):
+            url = re.sub(regex_matchS3,'', url, count=1)
+        s3_content:str = str(s3_service.get_comment_html(url))
         agent_name = agent.name if agent else "Unknown"
         dateScheduled: str = comment.scheduled_send_at.strftime("%Y-%m-%d %H:%M:%S")
         scheduled_comments_list.append({
