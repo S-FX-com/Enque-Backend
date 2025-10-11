@@ -1,9 +1,11 @@
 from typing import Any, List, Optional
 import asyncio  # Importar asyncio
+import time
+import logging
 from concurrent.futures import ThreadPoolExecutor  # Importar ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, noload
 from sqlalchemy import or_, and_ # Import 'or_' for OR condition and 'and_' for AND condition
 
 # Import dependencies
@@ -16,13 +18,17 @@ from app.models.team import TeamMember # Import TeamMember for filtering
 from app.models.microsoft import EmailTicketMapping, MailboxConnection, mailbox_team_assignments # Import MailboxConnection
 from app.models.activity import Activity # Import Activity model
 # Use TaskWithDetails and the renamed TicketCreate/TicketUpdate schemas
-from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema
+from app.schemas.task import TaskWithDetails, TicketCreate, TicketUpdate, EmailInfo, Task as TaskSchema, TicketMergeRequest, TicketMergeResponse
 # Import logger if needed for activity logging errors
 from app.utils.logger import logger
+
+# Logger específico para este módulo
+task_logger = logging.getLogger(__name__)
 # Import update_task service function and Microsoft service
 from app.services.task_service import update_task, send_assignment_notification # Importar función de notificación
 from app.services.microsoft_service import MicrosoftGraphService # Import the service
 from app.services.automation_service import execute_automations_for_ticket # Import automation service
+from app.services.ticket_merge_service import TicketMergeService # Import merge service
 from datetime import datetime # Import datetime
 from app.core.config import settings # Import settings
 from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_deleted, emit_comment_update # Import Socket.IO functions
@@ -30,81 +36,52 @@ from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_d
 router = APIRouter()
 
 
-# Use TaskWithDetails as the response model to include sender details
-@router.get("/", response_model=List[TaskWithDetails])
-async def read_tasks(
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 50,
-    current_user: Agent = Depends(get_current_active_user),
-    subject: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    team_id: Optional[int] = Query(None),
-    assignee_id: Optional[int] = Query(None),
-    priority: Optional[str] = Query(None),
-    category_id: Optional[int] = Query(None),
-) -> Any:
-    query = db.query(Task).filter(
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    )
-
-    if subject:
-        query = query.filter(Task.title.ilike(f"%{subject}%"))
-    if status:
-        query = query.filter(Task.status == status)
-    if team_id:
-        query = query.filter(
-            or_(
-                Task.team_id == team_id,
-                and_(
-                    Task.team_id.is_(None),
-                    Task.mailbox_connection_id.isnot(None),
-                    Task.mailbox_connection_id.in_(
-                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                            mailbox_team_assignments.c.team_id == team_id
-                        )
-                    )
-                )
-            )
-        )
-    if assignee_id:
-        query = query.filter(Task.assignee_id == assignee_id)
-    if priority:
-        query = query.filter(Task.priority == priority)
-    if category_id:
-        query = query.filter(Task.category_id == category_id)
-
-    query = query.options(
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category)
-    )
-
-    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/
+# Este endpoint ya no se usa en el frontend
 
 
 # Endpoint for ticket search - MOVED BEFORE /{task_id} endpoint
 @router.get("/search", response_model=List[TaskWithDetails])
 async def search_tickets(
-    q: str = Query(...),
+    q: str = Query(..., description="Search term to find in ticket title, description, body, or ticket ID"),
     db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 30,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    query = db.query(Task).filter(
+    """
+    Search for tickets containing the search term in title, description, body, or by ticket ID.
+    If the search query is numeric, it will search by ticket ID first, then by text.
+    """
+    base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
     
+    # Check if query is numeric (ticket ID search)
+    if q.strip().isdigit():
+        ticket_id = int(q.strip())
+        # Search by exact ticket ID first
+        id_query = base_query.filter(Task.id == ticket_id)
+        id_query = id_query.options(
+            joinedload(Task.sent_from),
+            joinedload(Task.sent_to),
+            joinedload(Task.assignee),
+            joinedload(Task.user),
+            joinedload(Task.team),
+            joinedload(Task.company),
+            joinedload(Task.category),
+            joinedload(Task.body)
+        )
+        tickets = id_query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+        
+        # If found by ID, return immediately
+        if tickets:
+            return tickets
+    
+    # Text search (original logic)
     search_term = f"%{q}%"
-    query = query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
+    query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
         or_(
             Task.title.ilike(search_term),
             Task.description.ilike(search_term),
@@ -283,125 +260,13 @@ async def create_task(
     return task
 
 
-# Update response model to TaskWithDetails to include body
-@router.get("/{task_id}", response_model=TaskWithDetails)
-async def read_task(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Get task by ID, including its body content and related details.
-    Ensures the task belongs to the current user's workspace.
-    """
-    # Eager load relationships including the new 'body'
-    task = db.query(Task).options(
-        joinedload(Task.workspace),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.user),
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.category), # Eager load category
-        joinedload(Task.body) # Eager load the body
-    ).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id, # Ensure task is in user's workspace
-        Task.is_deleted == False
-    ).first()
-
-    if not task:
-        # Use 404 even if it exists in another workspace for security
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Ticket not found",
-        )
-
-    return task
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/{task_id}/fast o /cached
+# Este endpoint ya no se usa en el frontend
 
 
-@router.put("/{task_id}", response_model=TaskWithDetails)
-async def update_task_endpoint(
-    task_id: int,
-    task_in: TicketUpdate,
-    request: Request,
-    db: Session = Depends(get_db),
-    # Inject the basic active user dependency
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Update a task. All roles (admin, manager, agent) can update all fields including assignee and team.
-    """
-    # Fetch the task ensuring it belongs to the user's workspace
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first()
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/{task_id}/refresh
+# Este endpoint ya no se usa en el frontend
 
-    if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found",
-        )
-
-    # Get origin URL for notification
-    origin = request.headers.get("origin") or settings.FRONTEND_URL
-
-    # Use the service function which handles the actual update logic
-    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
-
-    if not updated_task_dict: # Service function returns the updated dict or None
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, # Or appropriate error from service
-            detail="Task update failed", # Or more specific error from service
-        )
-    
-    # Load the complete task object with all relationships required by TaskWithDetails
-    updated_task_obj = db.query(Task).options(
-        joinedload(Task.workspace),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.user),
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.category),
-        joinedload(Task.body)
-    ).filter(Task.id == task_id).first()
-
-    if not updated_task_obj:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found after update",
-        )
-
-    # --- Socket.IO Event ---
-    try:
-        # ✅ OPTIMIZACIÓN: Usar función síncrona para respuesta más rápida
-        task_data = {
-            'id': updated_task_obj.id,
-            'title': updated_task_obj.title,
-            'status': updated_task_obj.status,
-            'priority': updated_task_obj.priority,
-            'workspace_id': updated_task_obj.workspace_id,
-            'assignee_id': updated_task_obj.assignee_id,
-            'team_id': updated_task_obj.team_id,
-            'user_id': updated_task_obj.user_id,
-            'updated_at': updated_task_obj.updated_at.isoformat() if updated_task_obj.updated_at else None
-        }
-        
-        # Usar función síncrona para no bloquear la respuesta
-        from app.core.socketio import emit_ticket_update_sync
-        emit_ticket_update_sync(updated_task_obj.workspace_id, task_data)
-        
-    except Exception as e:
-        logger.error(f"Failed to emit ticket_updated event for task {task_id}: {str(e)}")
-    # --- End Socket.IO Event ---
-
-    # Return the updated ORM object with all relationships
-    return updated_task_obj
 
 
 @router.delete("/{task_id}")
@@ -441,96 +306,16 @@ async def delete_task(
     return {"message": "Task deleted successfully"}
 
 
-@router.get("/user/{user_id}", response_model=List[TaskSchema])
-async def read_user_tasks(
-    user_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Retrieve tasks created by a specific user WITHIN the current user's workspace
-    """
-    # Add workspace filter
-    tasks = db.query(Task).filter(
-        Task.user_id == user_id,
-        Task.workspace_id == current_user.workspace_id, # Filter by current user's workspace
-        Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/assignee/{agent_id}
+# Este endpoint ya no se usa en el frontend
 
 
-@router.get("/assignee/{agent_id}", response_model=List[TaskWithDetails])
-async def read_assigned_tasks(
-    agent_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 25,
-    current_user: Agent = Depends(get_current_active_user),
-    subject: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    priority: Optional[str] = Query(None),
-) -> Any:
-    query = db.query(Task).filter(
-        Task.assignee_id == agent_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    )
-
-    if subject:
-        query = query.filter(Task.title.ilike(f"%{subject}%"))
-    if status:
-        query = query.filter(Task.status == status)
-    if priority:
-        query = query.filter(Task.priority == priority)
-
-    query = query.options(
-        joinedload(Task.sent_from),
-        joinedload(Task.sent_to),
-        joinedload(Task.assignee),
-        joinedload(Task.user),
-        joinedload(Task.team),
-        joinedload(Task.company),
-        joinedload(Task.category)
-    )
-
-    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/assignee/{agent_id}/fast
+# Este endpoint ya no se usa en el frontend
 
 
-@router.get("/team/{team_id}", response_model=List[TaskSchema])
-async def read_team_tasks(
-    team_id: int,
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-    """
-    Retrieve tasks assigned to a specific team WITHIN the current user's workspace.
-    Includes both direct team assignments and mailbox team assignments.
-    """
-    # Include both direct team assignments and mailbox team assignments (avoiding duplicates)
-    tasks = db.query(Task).filter(
-        or_(
-            Task.team_id == team_id,  # Direct team assignment
-            and_(  # Mailbox team assignment (only for tickets without direct team assignment)
-                Task.team_id.is_(None),  # Only include mailbox tickets that don't have team_id
-                Task.mailbox_connection_id.isnot(None),
-                Task.mailbox_connection_id.in_(
-                    db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                        mailbox_team_assignments.c.team_id == team_id
-                    )
-                )
-            )
-        ),
-        Task.workspace_id == current_user.workspace_id, # Filter by current user's workspace
-        Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
-
-    return tasks
+# ENDPOINT ELIMINADO: Reemplazado por /v1/tasks-optimized/team/{team_id}
+# Este endpoint ya no se usa en el frontend
 
 
 @router.get("/{task_id}/initial-content")
@@ -582,12 +367,9 @@ def get_task_initial_content(
         ).order_by(CommentModel.created_at.asc()).first()
 
         if not initial_comment:
-            # No comments found, return empty or fallback content
             fallback_content = task.description or task.body.email_body if task.body else ""
             if fallback_content and fallback_content.startswith('[MIGRATED_TO_S3]'):
-                # Clean the migrated message
                 clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
-                # Remove the URL part
                 import re
                 clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
                 fallback_content = clean_content or "Content not available"
@@ -597,8 +379,6 @@ def get_task_initial_content(
                 "content": fallback_content or "No initial content found",
                 "message": "No initial comment found for this ticket"
             }
-
-        # Check if initial comment has S3 content
         if not initial_comment.s3_html_url:
             return {
                 "status": "content_in_database",
@@ -627,17 +407,13 @@ def get_task_initial_content(
                 "content": fallback_content,
                 "message": "Failed to retrieve from S3, showing database content"
             }
-
-        # Process S3 content for images and attachments
         try:
-            # Process images if needed (similar to comment S3 processing)
             from app.services.microsoft_service import MicrosoftGraphService
             from app.utils.image_processor import extract_base64_images
             
             ms_service = MicrosoftGraphService(db)
             processed_content = s3_content
-            
-            # Process base64 images that might be in the content
+
             final_content, extracted_images = extract_base64_images(processed_content, task.id)
             
             if extracted_images:
@@ -666,13 +442,12 @@ def get_ticket_html_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get complete ticket HTML content directly from S3 URLs stored in comments.
-    This is MUCH simpler - just reads the s3_html_url field and fetches from S3.
-    """
+
     try:
         # Verify the task exists and user has access
-        task = db.query(Task).filter(
+        task = db.query(Task).options(
+            joinedload(Task.user).joinedload(User.company)
+        ).filter(
             Task.id == task_id,
             Task.workspace_id == current_user.workspace_id,
             Task.is_deleted == False
@@ -686,10 +461,20 @@ def get_ticket_html_content(
 
         from app.models.comment import Comment as CommentModel
         from app.services.s3_service import get_s3_service
+
+        
+        def get_avatar_url(sender_type: str, agent=None, user=None):
+            if sender_type == "agent" and agent and agent.avatar_url:
+                return agent.avatar_url
+            elif sender_type == "user":
+                if user and user.avatar_url:
+                    return user.avatar_url
+                elif user and user.company and user.company.logo_url:
+                    return user.company.logo_url
+            return None
         
         s3_service = get_s3_service()
-        
-        # Get all comments with their S3 URLs, ordered by creation date
+
         comments = db.query(CommentModel).options(
             joinedload(CommentModel.agent),
             joinedload(CommentModel.attachments)
@@ -699,30 +484,35 @@ def get_ticket_html_content(
 
         # Prepare results
         html_contents = []
-        
-        # 1. Handle initial ticket content (first comment or ticket description)
+
         initial_content = None
         initial_sender = None
-        
-        # Check if we have comments first - initial content is usually the first comment
+
         if comments and comments[0].s3_html_url:
-            # First comment has S3 content - this is the initial message
             try:
                 s3_content = s3_service.get_comment_html(comments[0].s3_html_url)
                 if s3_content:
                     initial_content = s3_content
-                    
-                    # ✅ EXTRAER INFORMACIÓN DEL ORIGINAL-SENDER (como hacía el frontend)
                     import re
                     original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', s3_content)
                     
                     if original_sender_match:
-                        # Es un mensaje de usuario con información extraída
+                        user_name = original_sender_match.group(1).strip()
+                        user_email = original_sender_match.group(2).strip()
+
+                        user = db.query(User).options(
+                            joinedload(User.company)
+                        ).filter(
+                            User.email == user_email,
+                            User.workspace_id == current_user.workspace_id
+                        ).first()
+                        
                         initial_sender = {
                             "type": "user", 
-                            "name": original_sender_match.group(1).strip(),
-                            "email": original_sender_match.group(2).strip(),
-                            "created_at": comments[0].created_at
+                            "name": user_name,
+                            "email": user_email,
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("user", user=user)
                         }
                     elif comments[0].agent:
                         # Es un mensaje de agente real
@@ -730,7 +520,8 @@ def get_ticket_html_content(
                             "type": "agent", 
                             "name": comments[0].agent.name,
                             "email": comments[0].agent.email,
-                            "created_at": comments[0].created_at
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("agent", agent=comments[0].agent)
                         }
             except Exception as e:
                 logger.warning(f"Failed to get initial S3 content: {e}")
@@ -747,23 +538,33 @@ def get_ticket_html_content(
                     "type": "user",
                     "name": task.user.name if task.user else "Unknown User",
                     "email": task.user.email if task.user else "unknown",
-                    "created_at": task.created_at
+                    "created_at": task.created_at,
+                    "avatar_url": get_avatar_url("user", user=task.user)
                 }
 
-        # Add initial content if we have it
         if initial_content:
+            initial_attachments = []
+            if comments and comments[0].attachments:
+                for att in comments[0].attachments:
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
+                    initial_attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": download_url
+                    })
+            
             html_contents.append({
                 "id": "initial",
                 "content": initial_content,
                 "sender": initial_sender,
                 "is_private": False,
-                "attachments": [],
+                "attachments": initial_attachments,
                 "created_at": comments[0].created_at if comments else task.created_at
             })
-
-        # 2. Process ALL comments - much simpler approach
-        
-        # First, collect all S3 URLs that need to be fetched
         s3_urls_needed = []
         comment_mapping = {}
         
@@ -775,7 +576,7 @@ def get_ticket_html_content(
         # Fetch all S3 content in parallel if we have any S3 URLs
         s3_content_cache = {}
         if s3_urls_needed:
-            logger.info(f"Fetching {len(s3_urls_needed)} S3 contents in parallel for ticket {task_id}")
+            # Fetching S3 contents in parallel
             
             # Simple concurrent fetching using ThreadPoolExecutor
             from concurrent.futures import as_completed
@@ -815,8 +616,7 @@ def get_ticket_html_content(
                         from app.utils.image_processor import extract_base64_images
                         processed_content, extracted_images = extract_base64_images(content, task.id)
                         content = processed_content
-                        if extracted_images:
-                            logger.info(f"Processed {len(extracted_images)} base64 images in comment {comment.id}")
+                        # Base64 images processed silently
                     except Exception as e:
                         logger.warning(f"Error processing images in comment {comment.id}: {e}")
             
@@ -824,40 +624,48 @@ def get_ticket_html_content(
             if not content:
                 content = comment.content or "Content not available"
 
-            # ✅ DETERMINAR SENDER INFO - extraer de original-sender si existe
             import re
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             
             if original_sender_match:
-                # Es un mensaje de usuario con información extraída del HTML
+                user_name = original_sender_match.group(1).strip()
+                user_email = original_sender_match.group(2).strip()
+                
+                # Try to find the user by email to get avatar_url
+                user = db.query(User).options(
+                    joinedload(User.company)
+                ).filter(
+                    User.email == user_email,
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+                
                 sender = {
                     "type": "user",
-                    "name": original_sender_match.group(1).strip(),
-                    "email": original_sender_match.group(2).strip(),
-                    "created_at": comment.created_at
+                    "name": user_name,
+                    "email": user_email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("user", user=user)
                 }
             elif comment.agent:
-                # Es un mensaje de agente real
                 sender = {
                     "type": "agent",
                     "name": comment.agent.name,
                     "email": comment.agent.email,
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("agent", agent=comment.agent)
                 }
             else:
-                # Fallback
                 sender = {
                     "type": "unknown",
                     "name": "Unknown",
                     "email": "unknown",
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": None
                 }
 
-            # Process attachments
             attachments = []
             if comment.attachments:
                 for att in comment.attachments:
-                    # Use S3 URL directly if available, otherwise use API endpoint
                     download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
                     
                     attachments.append({
@@ -876,10 +684,7 @@ def get_ticket_html_content(
                 "is_private": comment.is_private,
                 "attachments": attachments,
                 "created_at": comment.created_at
-            })
-
-        logger.info(f"Successfully retrieved HTML content for ticket {task_id}: {len(html_contents)} items")
-        
+            })        
         return {
             "status": "success",
             "ticket_id": task_id,
@@ -892,3 +697,143 @@ def get_ticket_html_content(
     except Exception as e:
         logger.error(f"❌ Error getting HTML content for ticket {task_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get ticket HTML content: {str(e)}")
+
+
+# === MERGE ENDPOINTS ===
+
+@router.post("/merge", response_model=TicketMergeResponse)
+async def merge_tickets(
+    merge_request: TicketMergeRequest,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Merge multiple tickets into a main ticket.
+    Transfers all comments, attachments and content from secondary tickets to the main one.
+    """
+    try:
+        result = TicketMergeService.merge_tickets(
+            db=db,
+            target_ticket_id=merge_request.target_ticket_id,
+            ticket_ids_to_merge=merge_request.ticket_ids_to_merge,
+            current_user=current_user
+        )
+        
+        if result["success"]:
+            logger.info(f"Successful merge: ticket {merge_request.target_ticket_id} with {result['merged_ticket_ids']}")
+            return TicketMergeResponse(
+                success=True,
+                target_ticket_id=result["target_ticket_id"],
+                merged_ticket_ids=result["merged_ticket_ids"],
+                comments_transferred=result["comments_transferred"],
+                message=result["message"]
+            )
+        else:
+            logger.error(f"Merge error: {result.get('errors', [])}")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Error merging tickets",
+                    "errors": result.get("errors", [])
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in merge_tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/mergeable", response_model=List[TaskSchema])
+async def get_mergeable_tickets(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    exclude_ticket_id: Optional[int] = Query(None, description="Ticket ID to exclude from search"),
+    search: Optional[str] = Query(None, description="Search term to filter tickets"),
+    limit: int = Query(50, le=100, description="Results limit")
+) -> Any:
+    """
+    Get list of tickets that can be merged.
+    Excludes already merged tickets, deleted tickets, and optionally a specific ticket.
+    """
+    try:
+        tickets = TicketMergeService.get_mergeable_tickets(
+            db=db,
+            workspace_id=current_user.workspace_id,
+            exclude_ticket_id=exclude_ticket_id,
+            search_term=search,
+            limit=limit
+        )
+        
+        return tickets
+        
+    except Exception as e:
+        logger.error(f"Error getting mergeable tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting tickets: {str(e)}")
+
+
+@router.get("/{ticket_id}/merge-info")
+async def get_ticket_merge_info(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get merge information for a specific ticket.
+    Includes if it's merged, with which ticket, and which tickets were merged into it.
+    """
+    try:
+        ticket = db.query(Task).filter(
+            Task.id == ticket_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+        
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        
+        merge_info = {
+            "ticket_id": ticket_id,
+            "is_merged": ticket.is_merged,
+            "merged_to_ticket_id": ticket.merged_to_ticket_id,
+            "merged_at": ticket.merged_at,
+            "merged_by_agent_id": ticket.merged_by_agent_id,
+            "merged_by_agent_name": None,
+            "merged_tickets": [],
+            "merged_to_ticket_title": None
+        }
+        
+        if ticket.is_merged and ticket.merged_to_ticket_id:
+            target_ticket = db.query(Task).filter(Task.id == ticket.merged_to_ticket_id).first()
+            if target_ticket:
+                merge_info["merged_to_ticket_title"] = target_ticket.title
+        
+        if ticket.merged_by_agent_id:
+            agent = db.query(Agent).filter(Agent.id == ticket.merged_by_agent_id).first()
+            if agent:
+                merge_info["merged_by_agent_name"] = agent.name
+        
+        merged_tickets = TicketMergeService.get_merged_tickets_for_ticket(
+            db=db,
+            ticket_id=ticket_id,
+            workspace_id=current_user.workspace_id
+        )
+        
+        merge_info["merged_tickets"] = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "merged_at": t.merged_at,
+                "status": t.status
+            }
+            for t in merged_tickets
+        ]
+        
+        return merge_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting merge info for {ticket_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting merge information: {str(e)}")

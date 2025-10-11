@@ -92,7 +92,7 @@ def extract_base64_images(html_content: str, ticket_id: int) -> Tuple[str, List[
             # Close the tag
             new_img += ' />'
             
-            logger.info(f"Extracted and uploaded image from email to S3: {s3_url}")
+            # Image extracted and uploaded to S3
             return new_img
             
         except Exception as e:

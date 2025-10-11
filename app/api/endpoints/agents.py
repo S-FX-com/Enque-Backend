@@ -15,7 +15,8 @@ from app.models.team import Team, TeamMember
 from app.models.task import Task
 from app.models.workspace import Workspace
 from app.models.microsoft import MailboxConnection, MicrosoftToken # Import MailboxConnection and MicrosoftToken
-from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate, AgentInviteCreate, AgentAcceptInvitation 
+from app.schemas.agent import Agent as AgentSchema, AgentCreate, AgentUpdate, AgentInviteCreate, AgentAcceptInvitation
+from pydantic import BaseModel
 from app.schemas.team import Team as TeamSchema
 from app.schemas.token import Token 
 from app.core.security import get_password_hash, create_access_token 
@@ -243,13 +244,26 @@ async def invite_agent(
         email=agent_invite_in.email,
         role=agent_invite_in.role,
         workspace_id=agent_invite_in.workspace_id,
+        job_title=agent_invite_in.job_title,
         is_active=False, 
         password=None, 
         invitation_token=invitation_token,
         invitation_token_expires_at=token_expires_at,
     )
     
-    db_agent = Agent(**new_agent_data.dict()) 
+    # Crear agente con campos explícitos para evitar problemas de compatibilidad
+    db_agent = Agent(
+        name=new_agent_data.name,
+        email=new_agent_data.email,
+        role=new_agent_data.role,
+        auth_method=new_agent_data.auth_method,
+        workspace_id=new_agent_data.workspace_id,
+        job_title=new_agent_data.job_title,
+        is_active=new_agent_data.is_active,
+        password=new_agent_data.password,
+        invitation_token=new_agent_data.invitation_token,
+        invitation_token_expires_at=new_agent_data.invitation_token_expires_at,
+    ) 
 
     try:
         db.add(db_agent)
@@ -341,6 +355,135 @@ async def invite_agent(
     return db_agent
 
 
+@router.post("/{agent_id}/resend-invite", response_model=AgentSchema)
+async def resend_agent_invitation(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_admin), # Ensure only admins can resend invitations
+    current_workspace: Workspace = Depends(get_current_workspace),
+):
+    """
+    Resend an invitation to an inactive agent.
+    Generates a new invitation token and sends a new invitation email.
+    """
+    # Find the agent to resend invitation to
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+    
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found in this workspace",
+        )
+    
+    # Check if agent is already active
+    if agent.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Agent is already active. Cannot resend invitation to active agents.",
+        )
+    
+    # Generate new invitation token
+    invitation_token = secrets.token_urlsafe(32)
+    token_expires_at = datetime.utcnow() + timedelta(hours=settings.AGENT_INVITATION_TOKEN_EXPIRE_HOURS)
+    
+    # Update agent with new token
+    agent.invitation_token = invitation_token
+    agent.invitation_token_expires_at = token_expires_at
+    
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    
+    # Create invitation link
+    invitation_link = f"https://{current_workspace.subdomain}.enque.cc/accept-invitation?token={invitation_token}"
+    
+    # Find an active mailbox to send from (same logic as original invite)
+    admin_mailbox_connection = db.query(MailboxConnection).filter(
+        MailboxConnection.created_by_agent_id == current_user.id,
+        MailboxConnection.workspace_id == current_workspace.id,
+        MailboxConnection.is_active == True
+    ).first()
+
+    if not admin_mailbox_connection:
+        logger.info(f"Admin {current_user.email} has no active mailbox. Looking for any active mailbox in workspace {current_workspace.id}.")
+        admin_agents = db.query(Agent.id).filter(
+            Agent.workspace_id == current_workspace.id,
+            Agent.role == "admin",
+            Agent.is_active == True
+        ).all()
+        admin_ids = [admin.id for admin in admin_agents]
+        
+        admin_mailbox_connection = db.query(MailboxConnection).filter(
+            MailboxConnection.created_by_agent_id.in_(admin_ids),
+            MailboxConnection.workspace_id == current_workspace.id,
+            MailboxConnection.is_active == True
+        ).first()
+        
+        # If still no mailbox found, try any active mailbox in the workspace
+        if not admin_mailbox_connection:
+            admin_mailbox_connection = db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == current_workspace.id,
+                MailboxConnection.is_active == True
+            ).first()
+
+    if not admin_mailbox_connection:
+        logger.error(f"No active mailbox connection found in workspace {current_workspace.id} to send invitation from.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active mailbox found in this workspace. Please connect a mailbox to send invitations."
+        )
+    
+    # Get Microsoft token for the mailbox
+    ms_token = db.query(MicrosoftToken).filter(
+        MicrosoftToken.mailbox_connection_id == admin_mailbox_connection.id
+    ).order_by(MicrosoftToken.created_at.desc()).first()
+
+    if not ms_token:
+        logger.error(f"No Microsoft token found for mailbox {admin_mailbox_connection.email} (ID: {admin_mailbox_connection.id}).")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No token found for the connected mailbox {admin_mailbox_connection.email}. Please re-authenticate."
+        )
+    
+    # Refresh token if expired
+    graph_service = MicrosoftGraphService(db=db)
+    if ms_token.expires_at < datetime.utcnow():
+        try:
+            logger.info(f"Token for {admin_mailbox_connection.email} expired, attempting refresh.")
+            ms_token = graph_service.refresh_token(ms_token)
+        except HTTPException as e:
+            logger.error(f"Failed to refresh token for {admin_mailbox_connection.email}: {e.detail}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not refresh token for mailbox {admin_mailbox_connection.email}. Please re-authenticate. Error: {e.detail}"
+            )
+
+    # Send the invitation email
+    email_sent = await send_agent_invitation_email(
+        db=db,
+        to_email=agent.email,
+        agent_name=agent.name,
+        invitation_link=invitation_link,
+        sender_mailbox_email=admin_mailbox_connection.email,
+        user_access_token=ms_token.access_token,
+        workspace_name=current_workspace.subdomain
+    )
+
+    if not email_sent:
+        logger.error(f"Failed to resend invitation email to {agent.email} from {admin_mailbox_connection.email} for agent ID {agent.id}.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send invitation email. Please try again later."
+        )
+    
+    logger.info(f"Invitation resent to agent {agent.name} ({agent.email}) in workspace {current_workspace.subdomain} by {current_user.email}. Sent from {admin_mailbox_connection.email}. New token: {invitation_token}")
+    
+    return agent
+
+
 @router.post("/accept-invitation", response_model=Token) # Responds with a JWT token upon successful activation
 async def accept_agent_invitation(
     invitation_data: AgentAcceptInvitation,
@@ -401,6 +544,45 @@ async def accept_agent_invitation(
     }
 
 
+class TeamsNotificationSettings(BaseModel):
+    enabled: bool
+
+@router.put("/{agent_id}/teams-notifications", response_model=AgentSchema)
+async def update_teams_notification_settings(
+    agent_id: int,
+    settings: TeamsNotificationSettings,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    current_workspace: Workspace = Depends(get_current_workspace),
+):
+    """
+    Update an agent's Microsoft Teams notification preference.
+    """
+    agent = db.query(Agent).filter(
+        Agent.id == agent_id,
+        Agent.workspace_id == current_workspace.id
+    ).first()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+
+    # Permissions check: Admin can update anyone, users can only update themselves.
+    if current_user.role != "admin" and current_user.id != agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not enough permissions to update this setting.",
+        )
+
+    agent.teams_notifications_enabled = settings.enabled
+    db.commit()
+    db.refresh(agent)
+    logger.info(f"Agent {agent.id} Teams notification settings updated to: {settings.enabled} by user {current_user.id}")
+    return agent
+
+
 @router.get("/{agent_id}/teams", response_model=List[TeamSchema])
 async def read_agent_teams(
     agent_id: int,
@@ -430,7 +612,7 @@ async def read_agent_teams(
 
         ticket_count = db.query(func.count(Task.id)).filter(
             Task.team_id == team_model.id,
-            Task.status.notin_(['Closed', 'Resolved']) 
+                            Task.status != 'Closed' 
         ).scalar() or 0
         
         team_schema = TeamSchema.from_orm(team_model)

@@ -217,6 +217,7 @@ class EmailAddress(BaseModel):
 
 class EmailData(BaseModel):
     id: str
+    internet_message_id: Optional[str] = None
     conversation_id: Optional[str] = None
     subject: str
     sender: EmailAddress

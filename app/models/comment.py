@@ -7,8 +7,10 @@ class Comment(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False)
-    agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     other_destinaries = Column(Text, nullable=True)
+    bcc_recipients = Column(Text, nullable=True)  # Campo agregado para BCC recipients
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
     content = Column(Text, nullable=True)  # Ahora puede ser NULL si está en S3
     s3_html_url = Column(Text, nullable=True)  # URL del HTML almacenado en S3
@@ -19,5 +21,6 @@ class Comment(Base):
     # Relationships
     ticket = relationship("Task", back_populates="comments")
     agent = relationship("Agent", back_populates="comments")
+    user = relationship("User", back_populates="comments")
     workspace = relationship("Workspace", back_populates="comments")
     attachments = relationship("TicketAttachment", back_populates="comment", cascade="all, delete-orphan")

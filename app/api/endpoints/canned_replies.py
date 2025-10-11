@@ -21,7 +21,8 @@ def create_canned_reply(
     canned_reply_in: CannedReplyCreate,
 ) -> Any:
     """Create a new canned reply."""
-    if current_agent.role != "admin":
+    # Allow admin and manager roles to create canned replies
+    if current_agent.role not in ["admin", "manager"]:
         raise HTTPException(
             status_code=403, detail="INSUFFICIENT_PERMISSIONS"
         )
@@ -42,14 +43,10 @@ def get_canned_reply_stats(
     *,
     db: Session = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_agent),
-    workspace_id: int = Query(..., description="Workspace ID"),
 ) -> Any:
-    """Get canned reply statistics for a workspace."""
-    # Make sure the agent belongs to the workspace
-    if current_agent.workspace_id != workspace_id:
-        raise HTTPException(
-            status_code=403, detail="INSUFFICIENT_PERMISSIONS"
-        )
+    """Get canned reply statistics for the current agent's workspace."""
+    # Use the current agent's workspace_id
+    workspace_id = current_agent.workspace_id
     
     stats = get_stats(db=db, workspace_id=workspace_id)
     return CannedReplyStats(**stats)
@@ -67,24 +64,35 @@ def get_canned_replies(
     limit: int = Query(100, ge=1, le=1000, description="Number of records to return"),
 ) -> Any:
     """Get canned replies with optional filtering."""
-    # If workspace_id is provided, make sure the agent belongs to that workspace
-    target_workspace_id = workspace_id or current_agent.workspace_id
-    
-    if current_agent.workspace_id != target_workspace_id:
+    try:
+        # Use the current agent's workspace_id if no workspace_id is provided
+        target_workspace_id = workspace_id or current_agent.workspace_id
+        
+        # Verify that the agent belongs to the target workspace
+        if current_agent.workspace_id != target_workspace_id:
+            raise HTTPException(
+                status_code=403, detail="INSUFFICIENT_PERMISSIONS"
+            )
+        
+        if enabled_only:
+            canned_replies = get_enabled_by_workspace_id(
+                db=db, workspace_id=target_workspace_id, skip=skip, limit=limit
+            )
+        else:
+            canned_replies = get_by_workspace_id(
+                db=db, workspace_id=target_workspace_id, skip=skip, limit=limit
+            )
+        
+        return canned_replies
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        # Log other exceptions and return a generic error
+        print(f"Error in get_canned_replies: {str(e)}")
         raise HTTPException(
-            status_code=403, detail="INSUFFICIENT_PERMISSIONS"
+            status_code=500, detail="Internal server error"
         )
-    
-    if enabled_only:
-        canned_replies = get_enabled_by_workspace_id(
-            db=db, workspace_id=target_workspace_id, skip=skip, limit=limit
-        )
-    else:
-        canned_replies = get_by_workspace_id(
-            db=db, workspace_id=target_workspace_id, skip=skip, limit=limit
-        )
-    
-    return canned_replies
 
 
 @router.get("/{canned_reply_id}", response_model=CannedReply)
@@ -122,8 +130,8 @@ def update_canned_reply(
     canned_reply_in: CannedReplyUpdate,
 ) -> Any:
     """Update canned reply."""
-    # Only admins can update canned replies
-    if current_agent.role != "admin":
+    # Only admins and managers can update canned replies
+    if current_agent.role not in ["admin", "manager"]:
         raise HTTPException(
             status_code=403, detail="INSUFFICIENT_PERMISSIONS"
         )
@@ -158,8 +166,8 @@ def delete_canned_reply(
     canned_reply_id: int,
 ) -> Any:
     """Delete canned reply."""
-    # Only admins can delete canned replies
-    if current_agent.role != "admin":
+    # Only admins and managers can delete canned replies
+    if current_agent.role not in ["admin", "manager"]:
         raise HTTPException(
             status_code=403, detail="INSUFFICIENT_PERMISSIONS"
         )

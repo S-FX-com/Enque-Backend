@@ -15,8 +15,7 @@ class TaskStatus(str, PyEnum):
     OPEN = "Open"
     WITH_USER = "With User" 
     IN_PROGRESS = "In Progress" 
-    CLOSED = "Closed"
-    RESOLVED = "Resolved" 
+    CLOSED = "Closed" 
 
 
 class TaskPriority(str, PyEnum):
@@ -67,6 +66,9 @@ class TicketCreate(BaseModel):
     company_id: Optional[int] = None
     workspace_id: int
     category_id: Optional[int] = None 
+    to_recipients: Optional[str] = None
+    cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
 
 class TicketUpdate(BaseModel):
     title: Optional[str] = None
@@ -74,10 +76,13 @@ class TicketUpdate(BaseModel):
     status: Optional[TaskStatus] = None
     priority: Optional[TaskPriority] = None
     assignee_id: Optional[int] = None 
-    company_id: Optional[int] = None
-    due_date: Optional[datetime] = None
     team_id: Optional[int] = None
+    due_date: Optional[datetime] = None
     category_id: Optional[int] = None 
+    to_recipients: Optional[str] = None
+    cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
+    user_id: Optional[int] = None
     
     @validator("status")
     def validate_status(cls, v):
@@ -93,6 +98,29 @@ class TicketUpdate(BaseModel):
                  raise ValueError(f"Priority must be one of {list(TaskPriority.__members__.values())}")
         return v
 
+# Schemas for merge functionality
+class TicketMergeRequest(BaseModel):
+    """Schema for merging tickets"""
+    target_ticket_id: int  # El ticket principal al que se van a fusionar
+    ticket_ids_to_merge: List[int]  # Lista de IDs de tickets a fusionar
+
+class TicketMergeResponse(BaseModel):
+    """Response schema for merge operation"""
+    success: bool
+    target_ticket_id: int
+    merged_ticket_ids: List[int]
+    comments_transferred: int
+    message: str
+
+class MergedTicketInfo(BaseModel):
+    """Information about merged tickets"""
+    merged_to_ticket_id: Optional[int] = None
+    is_merged: bool = False
+    merged_at: Optional[datetime] = None
+    merged_by_agent_id: Optional[int] = None
+    
+    class Config:
+        from_attributes = True
 
 class EmailInfo(BaseModel):
     """Information about an email associated with a ticket"""
@@ -125,6 +153,15 @@ class TicketInDBBase(BaseModel):
     updated_at: datetime
     last_update: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
+    to_recipients: Optional[str] = None
+    cc_recipients: Optional[str] = None
+    bcc_recipients: Optional[str] = None
+    
+    # Merge fields
+    merged_to_ticket_id: Optional[int] = None
+    is_merged: bool = False
+    merged_at: Optional[datetime] = None
+    merged_by_agent_id: Optional[int] = None
     
     class Config:
         from_attributes = True
@@ -132,21 +169,25 @@ class TicketInDBBase(BaseModel):
 class Ticket(TicketInDBBase): 
     is_from_email: bool = False
     email_info: Optional[EmailInfo] = None
+    merge_info: Optional[MergedTicketInfo] = None
 
 class TicketBodySchema(BaseModel):
     email_body: Optional[str] = None
     
     class Config:
         from_attributes = True
+
 class TicketWithDetails(Ticket): 
-    workspace: WorkspaceRef
+    workspace: Optional[WorkspaceRef] = None  # 🔧 CORREGIDO: Hacer workspace Optional
     team: Optional[TeamRef] = None
     company: Optional[CompanyRef] = None
     user: Optional[UserRef] = None 
+    assignee: Optional[AgentRef] = None  # 🔧 AGREGADO: Campo assignee faltante
     sent_from: Optional[AgentRef] = None 
     sent_to: Optional[AgentRef] = None
     category: Optional[CategoryRef] = None 
     body: Optional[TicketBodyRef] = None 
+    merged_by_agent: Optional[AgentRef] = None
     
     class Config:
         from_attributes = True

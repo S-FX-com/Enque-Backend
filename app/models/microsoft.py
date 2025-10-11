@@ -64,7 +64,7 @@ class MicrosoftToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     integration_id = Column(Integer, ForeignKey("microsoft_integration.id", ondelete="CASCADE"), nullable=False)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
-    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="CASCADE"), nullable=False)
+    mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="CASCADE"), nullable=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=False)
     token_type = Column(String(50), nullable=False, default="Bearer")
@@ -94,8 +94,8 @@ class EmailTicketMapping(Base):
     email_id = Column(String(255), nullable=False, unique=True)
     email_conversation_id = Column(String(255), nullable=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False)
-    email_subject = Column(String(255), nullable=True)
-    email_sender = Column(String(255), nullable=True)
+    email_subject = Column(String(1000), nullable=True)  # Increased for long forwarded subjects
+    email_sender = Column(String(1000), nullable=True)   # Increased for long forwarded email addresses
     email_received_at = Column(DateTime, nullable=True)
     is_processed = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=func.now())

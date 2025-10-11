@@ -1,4 +1,5 @@
 from typing import Any
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -8,6 +9,9 @@ from app.database.session import get_db
 from app.models.agent import Agent
 from app.schemas.agent import Agent as AgentSchema, AgentUpdate
 from app.core.security import get_password_hash
+from app.core.cache import user_cache
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -51,5 +55,9 @@ async def update_user_me(
     db.add(current_user)
     db.commit()
     db.refresh(current_user)
+    
+    # INVALIDAR CACHÉ DEL USUARIO ACTUALIZADO
+    user_cache.delete(current_user.id)
+    logger.info(f"PROFILE UPDATE: Usuario {current_user.id} ({current_user.email}) actualizado y removido del caché")
     
     return current_user 

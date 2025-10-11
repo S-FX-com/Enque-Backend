@@ -7,6 +7,10 @@ from app.models.agent import Agent
 from app.models.team import Team, TeamMember
 from app.schemas.task import TaskWithDetails
 from typing import Any, List, Dict
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -97,4 +101,76 @@ async def get_dashboard_stats(
         },
         "recentTickets": recent_tickets,
         "teamsStats": team_stats,
-    } 
+    }
+
+
+@router.post("/emergency/reset-email-sync")
+async def emergency_reset_email_sync(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user)
+) -> Any:
+    """🚑 EMERGENCY: Reset email sync circuit breaker"""
+    
+    # Solo admin/manager puede usar este endpoint
+    if current_user.role not in ['Admin', 'Manager']:
+        raise HTTPException(
+            status_code=403,
+            detail="Only Admin/Manager can reset email sync circuit breaker"
+        )
+    
+    try:
+        from app.services.email_sync_task import reset_email_sync_circuit_breaker, email_sync_circuit_breaker
+        from app.database.session import get_pool_status, log_pool_status
+        
+        # Log pool status antes del reset
+        logger.info("🚑 EMERGENCY RESET requested by user: " + current_user.email)
+        log_pool_status()
+        
+        # Información del circuit breaker antes del reset
+        cb_status_before = {
+            "failure_count": email_sync_circuit_breaker.failure_count,
+            "last_failure_time": email_sync_circuit_breaker.last_failure_time,
+            "can_execute": email_sync_circuit_breaker.can_execute()
+        }
+        
+        # Resetear circuit breaker
+        result = reset_email_sync_circuit_breaker()
+        
+        return {
+            "success": True,
+            "message": "Email sync circuit breaker reset successfully",
+            "reset_by": current_user.email,
+            "circuit_breaker_before": cb_status_before,
+            "db_pool_status": get_pool_status(),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error resetting email sync circuit breaker: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error resetting circuit breaker: {str(e)}"
+        )
+
+
+@router.get("/timezone-info")
+async def get_timezone_info():
+    """Get current timezone information for debugging"""
+    import pytz
+    from datetime import datetime, timezone
+    
+    # UTC time
+    now_utc = datetime.now(timezone.utc)
+    
+    # Eastern time
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    
+    return {
+        "utc_time": now_utc.isoformat(),
+        "eastern_time": now_et.isoformat(),
+        "timezone_name": now_et.tzname(),
+        "utc_offset": str(now_et.utcoffset())
+    }
+
+ 

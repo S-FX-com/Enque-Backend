@@ -20,7 +20,7 @@ class Task(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', 'Resolved', name='ticket_status'), default='Unread', nullable=False) 
+    status = Column(Enum('Unread', 'Open', 'With User', 'In Progress', 'Closed', name='ticket_status'), default='Unread', nullable=False) 
     priority = Column(Enum('Low', 'Medium', 'High', 'Critical', name='ticket_priority'), default='Medium', nullable=False)
     assignee_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id", ondelete="SET NULL"), nullable=True)
@@ -39,6 +39,21 @@ class Task(Base):
     mailbox_connection_id = Column(Integer, ForeignKey("mailbox_connections.id", ondelete="SET NULL"), nullable=True, index=True) 
     category_id = Column(Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True) 
 
+    # Email-related columns
+    email_message_id = Column(String(255), nullable=True, index=True)
+    email_internet_message_id = Column(String(255), nullable=True, index=True)
+    email_conversation_id = Column(String(255), nullable=True)
+    email_sender = Column(String(1000), nullable=True)  # Increased for long forwarded email addresses
+    to_recipients = Column(Text, nullable=True)
+    cc_recipients = Column(Text, nullable=True)
+    bcc_recipients = Column(Text, nullable=True)
+
+    # Merge-related columns
+    merged_to_ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True, index=True)
+    is_merged = Column(Boolean, default=False, index=True)
+    merged_at = Column(DateTime, nullable=True)
+    merged_by_agent_id = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+
     # Relationships
     workspace = relationship("Workspace", back_populates="tasks")
     assignee = relationship("Agent", back_populates="assigned_tasks", foreign_keys=[assignee_id])
@@ -48,10 +63,17 @@ class Task(Base):
     user = relationship("User", back_populates="tasks")
     company = relationship("Company", back_populates="tasks")
     comments = relationship("Comment", back_populates="ticket", cascade="all, delete-orphan") 
+    scheduled_comments = relationship("ScheduledComment", back_populates="ticket", cascade="all, delete-orphan")
     email_mappings = relationship("EmailTicketMapping", back_populates="ticket", cascade="all, delete-orphan")
     body = relationship("TicketBody", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
     mailbox_connection = relationship("MailboxConnection", back_populates="tasks") 
     category = relationship("Category", back_populates="tasks") 
+    
+    # Merge relationships
+    merged_to_ticket = relationship("Task", remote_side=[id], foreign_keys=[merged_to_ticket_id])
+    merged_tickets = relationship("Task", foreign_keys=[merged_to_ticket_id], overlaps="merged_to_ticket")
+    merged_by_agent = relationship("Agent", foreign_keys=[merged_by_agent_id])
+    
     @property
     def is_from_email(self):
         """Check if this task was created from an email"""

@@ -82,20 +82,44 @@ async def read_tasks(
     return tasks
 @router.get("/search", response_model=List[TaskWithDetails])
 async def search_tickets(
-    q: str = Query(..., description="Search term to find in ticket title, description or body"),
+    q: str = Query(..., description="Search term to find in ticket title, description, body, or ticket ID"),
     db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 50,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
-    Search for tickets containing the search term in title, description or body.
+    Search for tickets containing the search term in title, description, body, or by ticket ID.
+    If the search query is numeric, it will search by ticket ID first, then by text.
     All users can search ALL tickets in the workspace regardless of team membership.
     """
     base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
+    
+    # Check if query is numeric (ticket ID search)
+    if q.strip().isdigit():
+        ticket_id = int(q.strip())
+        # Search by exact ticket ID first
+        id_query = base_query.filter(Task.id == ticket_id)
+        id_query = id_query.options(
+            selectinload(Task.sent_from),
+            selectinload(Task.sent_to),
+            selectinload(Task.assignee),
+            selectinload(Task.user),
+            selectinload(Task.team),
+            selectinload(Task.company),
+            selectinload(Task.category),
+            selectinload(Task.body),
+        )
+        tickets = id_query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+        
+        # If found by ID, return immediately
+        if tickets:
+            return tickets
+    
+    # Text search (original logic)
     search_term = f"%{q}%"
     query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
         or_(
@@ -184,6 +208,21 @@ async def create_task(
             await send_assignment_notification(db, task, request_origin)
         except Exception as e:
             logger.error(f"Failed to send assignment notification for task {task.id}: {str(e)}")
+    
+    # --- Team Notification ---
+    # Send notification to team members if ticket is assigned to team but no specific agent
+    if task.team_id and not task.assignee_id:
+        try:
+            request_origin = None
+            if request:
+                request_origin = str(request.headers.get("origin", ""))
+                logger.info(f"Request origin detected for team notification: {request_origin}")
+            from app.services.task_service import send_team_notification
+            await send_team_notification(db, task, request_origin)
+        except Exception as e:
+            logger.error(f"Failed to send team notification for task {task.id}: {str(e)}")
+    # --- End Team Notification ---
+    
     try:
         task_data = {
             'id': task.id,
@@ -327,9 +366,7 @@ async def delete_task(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Delete a task. All roles can delete tasks.
-    """
+   
     task = db.query(Task).filter(
         Task.id == task_id,
         Task.workspace_id == current_user.workspace_id
@@ -355,9 +392,7 @@ async def read_user_tasks(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Retrieve tasks created by a specific user WITHIN the current user's workspace
-    """
+  
     tasks = db.query(Task).filter(
         Task.user_id == user_id,
         Task.workspace_id == current_user.workspace_id,
@@ -375,9 +410,7 @@ async def read_assigned_tasks(
     status: Optional[str] = Query(None, description="Filter by status (e.g., Open, Closed, Unread)"),
     priority: Optional[str] = Query(None, description="Filter by priority (e.g., Low, Medium, High)"),
 ) -> Any:
-    """
-    Retrieve tasks assigned to a specific agent WITHIN the current user's workspace, with optional filters.
-    """
+    
     query = db.query(Task).options(
         selectinload(Task.user)
     )
@@ -400,10 +433,7 @@ async def read_team_tasks(
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-    """
-    Retrieve tasks assigned to a specific team WITHIN the current user's workspace.
-    Includes both direct team assignments and mailbox team assignments.
-    """
+   
     tasks = db.query(Task).filter(
         or_(
             Task.team_id == team_id,
@@ -427,10 +457,7 @@ def get_task_initial_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get initial ticket content from S3 when it's migrated there.
-    Falls back to description or email_body if not in S3.
-    """
+    
     try:
         task = db.query(Task).filter(
             Task.id == task_id,
@@ -520,12 +547,11 @@ def get_ticket_html_content(
     db: Session = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ):
-    """
-    Get complete ticket HTML content directly from S3 URLs stored in comments.
-    This is MUCH simpler - just reads the s3_html_url field and fetches from S3.
-    """
+
     try:
-        task = db.query(Task).filter(
+        task = db.query(Task).options(
+            joinedload(Task.user).joinedload(User.company)
+        ).filter(
             Task.id == task_id,
             Task.workspace_id == current_user.workspace_id,
             Task.is_deleted == False
@@ -537,6 +563,18 @@ def get_ticket_html_content(
             )
         from app.models.comment import Comment as CommentModel
         from app.services.s3_service import get_s3_service
+
+        
+        def get_avatar_url(sender_type: str, agent=None, user=None):
+            if sender_type == "agent" and agent and agent.avatar_url:
+                return agent.avatar_url
+            elif sender_type == "user":
+                if user and user.avatar_url:
+                    return user.avatar_url
+                elif user and user.company and user.company.logo_url:
+                    return user.company.logo_url
+            return None
+        
         s3_service = get_s3_service()
         comments = db.query(CommentModel).options(
             selectinload(CommentModel.agent),
@@ -583,12 +621,28 @@ def get_ticket_html_content(
                     "created_at": task.created_at
                 }
         if initial_content:
+            # ✅ FIX: Obtener adjuntos del primer comentario si existe
+            initial_attachments = []
+            if comments and comments[0].attachments:
+                for att in comments[0].attachments:
+                    # Use S3 URL directly if available, otherwise use API endpoint
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
+                    initial_attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": download_url
+                    })
+            
             html_contents.append({
                 "id": "initial",
                 "content": initial_content,
                 "sender": initial_sender,
                 "is_private": False,
-                "attachments": [],
+                "attachments": initial_attachments,
                 "created_at": comments[0].created_at if comments else task.created_at
             })
         s3_urls_needed = []
@@ -599,7 +653,7 @@ def get_ticket_html_content(
                 comment_mapping[comment.s3_html_url] = comment
         s3_content_cache = {}
         if s3_urls_needed:
-            logger.info(f"Fetching {len(s3_urls_needed)} S3 contents in parallel for ticket {task_id}")
+            # Fetching S3 contents in parallel
             from concurrent.futures import as_completed
             def fetch_s3_content(s3_url):
                 try:
@@ -625,8 +679,7 @@ def get_ticket_html_content(
                         from app.utils.image_processor import extract_base64_images
                         processed_content, extracted_images = extract_base64_images(content, task.id)
                         content = processed_content
-                        if extracted_images:
-                            logger.info(f"Processed {len(extracted_images)} base64 images in comment {comment.id}")
+                        # Base64 images processed silently
                     except Exception as e:
                         logger.warning(f"Error processing images in comment {comment.id}: {e}")
             if not content:
@@ -634,25 +687,37 @@ def get_ticket_html_content(
             import re
             original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
             if original_sender_match:
+                user_name = original_sender_match.group(1).strip()
+                user_email = original_sender_match.group(2).strip()
+                user = db.query(User).options(
+                    joinedload(User.company)
+                ).filter(
+                    User.email == user_email,
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+                
                 sender = {
                     "type": "user",
-                    "name": original_sender_match.group(1).strip(),
-                    "email": original_sender_match.group(2).strip(),
-                    "created_at": comment.created_at
+                    "name": user_name,
+                    "email": user_email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("user", user=user)
                 }
             elif comment.agent:
                 sender = {
                     "type": "agent",
                     "name": comment.agent.name,
                     "email": comment.agent.email,
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("agent", agent=comment.agent)
                 }
             else:
                 sender = {
                     "type": "unknown",
                     "name": "Unknown",
                     "email": "unknown",
-                    "created_at": comment.created_at
+                    "created_at": comment.created_at,
+                    "avatar_url": None
                 }
             attachments = []
             if comment.attachments:
@@ -674,7 +739,7 @@ def get_ticket_html_content(
                 "attachments": attachments,
                 "created_at": comment.created_at
             })
-        logger.info(f"Successfully retrieved HTML content for ticket {task_id}: {len(html_contents)} items")
+        # Successfully retrieved HTML content
         return {
             "status": "success",
             "ticket_id": task_id,

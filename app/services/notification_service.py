@@ -195,16 +195,47 @@ def format_notification_settings_response(
                 response.users.email.new_ticket_created.is_enabled = setting.is_enabled
                 response.users.email.new_ticket_created.id = setting.id
                 response.users.email.new_ticket_created.template = template_content
-            elif setting.type == "ticket_resolved" and "email" in channels:
-                response.users.email.ticket_resolved.is_enabled = setting.is_enabled
-                response.users.email.ticket_resolved.id = setting.id
-                response.users.email.ticket_resolved.template = template_content
+            elif setting.type == "ticket_closed" and "email" in channels:
+                response.users.email.ticket_closed.is_enabled = setting.is_enabled
+                response.users.email.ticket_closed.id = setting.id
+                response.users.email.ticket_closed.template = template_content
             elif setting.type == "new_agent_response" and "email" in channels:
                 response.users.email.new_agent_response.is_enabled = setting.is_enabled
                 response.users.email.new_agent_response.id = setting.id
                 response.users.email.new_agent_response.template = template_content
     
     return response
+
+
+def is_team_notification_enabled(db: Session, workspace_id: int) -> bool:
+    """
+    Check if team notifications are enabled for a workspace.
+    
+    Args:
+        db: Database session
+        workspace_id: Workspace ID
+        
+    Returns:
+        bool: Whether team notifications are enabled
+    """
+    try:
+        notification_setting = db.query(NotificationSetting).filter(
+            NotificationSetting.workspace_id == workspace_id,
+            NotificationSetting.category == "agents",
+            NotificationSetting.type == "new_ticket_for_team",
+            NotificationSetting.is_enabled == True
+        ).first()
+        
+        if not notification_setting:
+            return False
+        
+        # Check if email channel is enabled for this notification
+        channels = json.loads(notification_setting.channels) if isinstance(notification_setting.channels, str) else notification_setting.channels
+        return "email" in channels
+        
+    except Exception as e:
+        logger.error(f"Error checking team notification setting for workspace {workspace_id}: {str(e)}")
+        return False
 
 
 async def send_notification(
@@ -271,6 +302,74 @@ async def send_notification(
         if not template:
             logger.warning(f"[NOTIFY] No se encontró plantilla para notificación {notification_type} en workspace {workspace_id}")
             return False
+        
+        success_email = False
+        success_teams = False
+        
+        # Enviar por email si está habilitado
+        if "email" in channels:
+            logger.info(f"[NOTIFY] Enviando notificación por EMAIL")
+            success_email = await _send_email_notification(
+                db, workspace_id, template, template_vars, 
+                recipient_email, task_id
+            )
+
+        # Enviar por Microsoft Teams si es un agente y lo tiene habilitado
+        if category == "agents":
+            agent = db.query(Agent).filter(
+                Agent.email == recipient_email,
+                Agent.workspace_id == workspace_id
+            ).first()
+
+            if agent and agent.teams_notifications_enabled:
+                logger.info(f"[NOTIFY] Enviando notificación por TEAMS al agente {agent.id}")
+                try:
+                    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+                    if workspace and task_id:
+                        link_to_ticket = f"https://{workspace.subdomain}.enque.cc/tickets/{task_id}"
+                        
+                        # Usar el subject y un resumen del cuerpo como título y mensaje
+                        title = template.subject
+                        for var_name, var_value in template_vars.items():
+                            placeholder = "{{" + var_name + "}}"
+                            title = title.replace(placeholder, str(var_value))
+                        
+                        # Extraer un mensaje de vista previa más simple
+                        preview_message = f"Ticket #{task_id}: {template_vars.get('ticket_title', '')}"
+
+                        graph_service = MicrosoftGraphService(db=db)
+                        await graph_service.send_teams_activity_notification(
+                            agent_id=agent.id,
+                            title=title,
+                            message=preview_message,
+                            link_to_ticket=link_to_ticket,
+                            subdomain=workspace.subdomain
+                        )
+                        success_teams = True
+                    else:
+                        logger.warning(f"No se pudo enviar notificación de Teams para el agente {agent.id} porque falta workspace o task_id.")
+
+                except Exception as teams_error:
+                    logger.error(f"Error al enviar notificación de Teams: {str(teams_error)}", exc_info=True)
+        
+        # Considerar exitoso si al menos uno de los canales funcionó
+        return success_email or success_teams
+            
+    except Exception as e:
+        logger.error(f"[NOTIFY] Error enviando notificación: {str(e)}", exc_info=True)
+        return False
+
+
+async def _send_email_notification(
+    db: Session,
+    workspace_id: int,
+    template: NotificationTemplate,
+    template_vars: Dict[str, Any],
+    recipient_email: str,
+    task_id: Optional[int] = None
+) -> bool:
+    """Envía notificación por email"""
+    try:
         
         # Intentar usar el mailbox específico del ticket primero
         preferred_mailbox = None
@@ -380,4 +479,4 @@ async def send_notification(
             
     except Exception as e:
         logger.error(f"[NOTIFY] Error enviando notificación: {str(e)}", exc_info=True)
-        return False 
+        return False

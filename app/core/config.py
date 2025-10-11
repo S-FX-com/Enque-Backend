@@ -7,7 +7,9 @@ from pydantic import validator
 class Settings(BaseSettings):
     API_V1_STR: str = "/v1"
     PROJECT_NAME: str = "Enque API"
-    FRONTEND_URL: str = "https://app.enque.cc" # Default Frontend URL (should be overridden by env var in production/dev)
+    FRONTEND_URL: str = "https://app.enque.cc" 
+    
+    
     
     # CORS Configuration
     BACKEND_CORS_ORIGINS: Union[List[str], str] = ["https://app.enque.cc", "https://*.enque.cc"]
@@ -79,6 +81,11 @@ class Settings(BaseSettings):
     
     # Base URL for API
     API_BASE_URL: str = "https://enque-backend-production.up.railway.app"
+    
+    @property
+    def clean_api_base_url(self) -> str:
+        """Return API_BASE_URL without trailing slash"""
+        return self.API_BASE_URL.rstrip('/')
 
     # System Email Sender
     SYSTEM_SENDER_EMAIL: str = "noreply@enque.cc" # Default system sender email, ensure this mailbox exists or app has send-as permission
@@ -93,19 +100,20 @@ class Settings(BaseSettings):
     CACHE_EXPIRE_MAILBOX_LIST: int = 600  # Mailbox list cache (10 minutes)
     CACHE_EXPIRE_FOLDERS: int = 1800  # Folder list cache (30 minutes)
     
-    # Database Connection Pool
-    DB_POOL_SIZE: int = 10  # Connection pool size
-    DB_MAX_OVERFLOW: int = 20  # Max overflow connections
-    DB_POOL_TIMEOUT: int = 30  # Pool timeout in seconds
+    # Database Connection Pool - EMERGENCY INCREASE for email processing
+    DB_POOL_SIZE: int = 40  # Increased from 25 to 40 for email sync stability
+    DB_MAX_OVERFLOW: int = 80  # Increased from 50 to 80 to handle peak loads
+    DB_POOL_TIMEOUT: int = 60  # Increased from 30 to 60 seconds
     DB_POOL_RECYCLE: int = 3600  # Recycle connections after 1 hour
     
     # Rate Limiting for Microsoft Graph
     MS_GRAPH_RATE_LIMIT: int = 10  # Requests per second to Microsoft Graph
     MS_GRAPH_BURST_LIMIT: int = 50  # Burst limit
     
-    # Background Job Configuration
-    EMAIL_SYNC_BATCH_SIZE: int = 25  # Process emails in batches
-    EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 3  # Max concurrent mailbox syncs
+    # Background Job Configuration - EMERGENCY TUNING for DB pool stability
+    EMAIL_SYNC_BATCH_SIZE: int = 5  # 🚑 REDUCED: From 10 to 5 to minimize DB connections
+    EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 2  # 🚑 REDUCED: From 3 to 2 max concurrent syncs
+    EMAIL_SYNC_FREQUENCY_SECONDS: int = 180  # 🚑 INCREASED: From 120 to 180 seconds (3 min intervals)
 
     class Config:
         # Leer variables de entorno directamente, sin depender de archivos .env

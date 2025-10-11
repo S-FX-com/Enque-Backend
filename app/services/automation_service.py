@@ -1,12 +1,14 @@
 from typing import Any, Dict, Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import func, distinct
-from app.models.automation import Automation, AutomationCondition, AutomationAction, ConditionType, ConditionOperator, ActionType
+from app.models.automation import Automation, AutomationCondition, AutomationAction, ConditionType, ConditionOperator, ActionType, LogicalOperator
 from app.schemas.automation import AutomationCreate, AutomationUpdate
 from app.models.task import Task
 from app.models.agent import Agent
 from app.models.team import Team
+from app.models.category import Category
 from app.utils.logger import logger
+import re
 
 
 def create(db: Session, *, obj_in: AutomationCreate, created_by_agent_id: int) -> Automation:
@@ -191,21 +193,13 @@ def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
         Automation.is_active == True
     ).all()
     
-    logger.info(f"Checking {len(automations)} active automations for ticket {ticket.id}")
-    
     for automation in automations:
         try:
             # Check if all conditions match
             if _check_automation_conditions(automation, ticket):
-                logger.info(f"Automation {automation.id} '{automation.name}' matches ticket {ticket.id}")
-                
                 # Execute all actions
                 actions_executed = _execute_automation_actions(db, automation, ticket)
                 executed_actions.extend(actions_executed)
-                
-                logger.info(f"Executed {len(actions_executed)} actions for automation {automation.id}")
-            else:
-                logger.debug(f"Automation {automation.id} conditions do not match ticket {ticket.id}")
                 
         except Exception as e:
             logger.error(f"Error executing automation {automation.id} for ticket {ticket.id}: {str(e)}")
@@ -213,21 +207,29 @@ def execute_automations_for_ticket(db: Session, ticket: Task) -> List[str]:
     
     if executed_actions:
         db.commit()
-        logger.info(f"Successfully executed {len(executed_actions)} automation actions for ticket {ticket.id}")
+        logger.info(f"Executed {len(executed_actions)} automation actions for ticket #{ticket.id}")
     
     return executed_actions
 
 
 def _check_automation_conditions(automation: Automation, ticket: Task) -> bool:
-    """Check if all conditions of an automation match the ticket"""
+    """Check if conditions of an automation match the ticket using logical operators"""
     if not automation.conditions:
         return False
     
+    # Evaluate each condition
+    condition_results = []
     for condition in automation.conditions:
-        if not _check_single_condition(condition, ticket):
-            return False
+        result = _check_single_condition(condition, ticket)
+        condition_results.append(result)
     
-    return True
+    # Apply logical operator
+    if automation.conditions_operator == LogicalOperator.OR:
+        # At least one condition must be true
+        return any(condition_results)
+    else:  # Default to AND
+        # All conditions must be true
+        return all(condition_results)
 
 
 def _check_single_condition(condition: AutomationCondition, ticket: Task) -> bool:
@@ -266,12 +268,23 @@ def _get_ticket_value(condition_type: ConditionType, ticket: Task) -> Optional[s
     """Get the value from the ticket based on the condition type"""
     try:
         if condition_type == ConditionType.DESCRIPTION:
+            # DESCRIPTION en el frontend se mapea a "Subject", que corresponde al campo title del ticket
+            return ticket.title or ""
+        elif condition_type == ConditionType.TICKET_BODY:  # Changed from NOTE
+            # For ticket body, we might need to check the description or first comment
             return ticket.description or ""
-        elif condition_type == ConditionType.NOTE:
-            # For notes, we might need to check related comments/notes
-            return ""  # TODO: Implement note checking if needed
         elif condition_type == ConditionType.USER:
             return ticket.user.email if ticket.user else ""
+        elif condition_type == ConditionType.USER_DOMAIN:  # New condition type
+            if ticket.user and ticket.user.email:
+                # Extract domain from email
+                email_parts = ticket.user.email.split('@')
+                return email_parts[1] if len(email_parts) > 1 else ""
+            return ""
+        elif condition_type == ConditionType.INBOX:  # New condition type
+            # This would need to be implemented based on how inbox information is stored
+            # For now, return empty string - this needs to be implemented based on your data model
+            return ticket.mailbox_connection_id or "" if hasattr(ticket, 'mailbox_connection_id') else ""
         elif condition_type == ConditionType.AGENT:
             return ticket.assignee.email if ticket.assignee else ""
         elif condition_type == ConditionType.COMPANY:
@@ -289,17 +302,29 @@ def _get_ticket_value(condition_type: ConditionType, ticket: Task) -> Optional[s
 
 
 def _execute_automation_actions(db: Session, automation: Automation, ticket: Task) -> List[str]:
-    """Execute all actions of an automation on a ticket"""
+    """Execute actions of an automation on a ticket using logical operators"""
     executed_actions = []
     
-    for action in automation.actions:
-        try:
-            action_result = _execute_single_action(db, action, ticket)
-            if action_result:
-                executed_actions.append(f"Automation '{automation.name}': {action_result}")
-        except Exception as e:
-            logger.error(f"Error executing action {action.id}: {str(e)}")
-            continue
+    if automation.actions_operator == LogicalOperator.OR:
+        # Execute only the first successful action
+        for action in automation.actions:
+            try:
+                action_result = _execute_single_action(db, action, ticket)
+                if action_result:
+                    executed_actions.append(f"Automation '{automation.name}': {action_result}")
+                    break  # Stop after first successful action
+            except Exception as e:
+                logger.error(f"Error executing action {action.id}: {str(e)}")
+                continue
+    else:  # Default to AND - execute all actions
+        for action in automation.actions:
+            try:
+                action_result = _execute_single_action(db, action, ticket)
+                if action_result:
+                    executed_actions.append(f"Automation '{automation.name}': {action_result}")
+            except Exception as e:
+                logger.error(f"Error executing action {action.id}: {str(e)}")
+                continue
     
     return executed_actions
 
@@ -319,7 +344,7 @@ def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) 
                 ticket.assignee_id = agent.id
                 return f"Set agent from '{old_assignee}' to '{agent.email}'"
             else:
-                logger.warning(f"Agent not found: {action.action_value}")
+                logger.warning(f"Agent not found: '{action.action_value}' in workspace {ticket.workspace_id}")
                 return None
                 
         elif action.action_type == ActionType.SET_TEAM:
@@ -334,7 +359,7 @@ def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) 
                 ticket.team_id = team.id
                 return f"Set team from '{old_team}' to '{team.name}'"
             else:
-                logger.warning(f"Team not found: {action.action_value}")
+                logger.warning(f"Team not found: '{action.action_value}' in workspace {ticket.workspace_id}")
                 return None
                 
         elif action.action_type == ActionType.SET_PRIORITY:
@@ -346,6 +371,63 @@ def _execute_single_action(db: Session, action: AutomationAction, ticket: Task) 
             old_status = ticket.status or "Unassigned"
             ticket.status = action.action_value
             return f"Set status from '{old_status}' to '{action.action_value}'"
+            
+        elif action.action_type == ActionType.SET_CATEGORY:  # New action type
+            # Find category by name
+            category = db.query(Category).filter(
+                Category.name == action.action_value,
+                Category.workspace_id == ticket.workspace_id
+            ).first()
+            
+            if category:
+                old_category = ticket.category.name if ticket.category else "Unassigned"
+                ticket.category_id = category.id
+                return f"Set category from '{old_category}' to '{category.name}'"
+            else:
+                logger.warning(f"Category not found: '{action.action_value}' in workspace {ticket.workspace_id}")
+                return None
+                
+        elif action.action_type == ActionType.ALSO_NOTIFY:  # New action type
+            # Find agent to notify by email
+            agent = db.query(Agent).filter(
+                Agent.email == action.action_value,
+                Agent.workspace_id == ticket.workspace_id
+            ).first()
+            
+            if agent:
+                try:
+                    # Import the notification function
+                    from app.services.task_service import send_assignment_notification
+                    import asyncio
+                    
+                    # Create a temporary task with the agent to notify
+                    # We'll temporarily set the assignee to the agent we want to notify
+                    original_assignee_id = ticket.assignee_id
+                    ticket.assignee_id = agent.id
+                    ticket.assignee = agent
+                    
+                    # Send the notification
+                    loop = asyncio.new_event_loop()
+                    try:
+                        loop.run_until_complete(send_assignment_notification(db, ticket))
+                        logger.info(f"Successfully sent notification email to agent {agent.email} about ticket #{ticket.id}")
+                    finally:
+                        loop.close()
+                    
+                    # Restore the original assignee
+                    ticket.assignee_id = original_assignee_id
+                    if original_assignee_id:
+                        ticket.assignee = db.query(Agent).filter(Agent.id == original_assignee_id).first()
+                    else:
+                        ticket.assignee = None
+                    
+                    return f"Also notified agent '{agent.email}' via email"
+                except Exception as e:
+                    logger.error(f"Error sending notification email to agent {agent.email}: {str(e)}")
+                    return f"Failed to notify agent '{agent.email}' - {str(e)}"
+            else:
+                logger.warning(f"Agent not found for notification: '{action.action_value}' in workspace {ticket.workspace_id}")
+                return None
             
         else:
             logger.warning(f"Unknown action type: {action.action_type}")
