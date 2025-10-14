@@ -186,6 +186,20 @@ async def create_comment(
     db: Session = Depends(get_db),
     current_user: AgentModel = Depends(get_current_active_user), # Use alias AgentModel
 ) -> Any:
+    # Process TO recipients
+    to_recipients = []
+    logger.info(f"🔍 DEBUG: Background task received to_recipients: {comment_in.to_recipients}")
+    if comment_in.to_recipients and not comment_in.is_private:
+        try:
+            from app.services.email_service import parse_other_destinaries
+            to_recipients = parse_other_destinaries(comment_in.to_recipients)
+            logger.info(f"✅ Parsed {len(to_recipients)} TO recipients for comment on task {task_id}: {to_recipients}")
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid email addresses in to_recipients: {str(e)}"
+            )
+
     cc_recipients = []
     if comment_in.other_destinaries and not comment_in.is_private:
         try:
@@ -252,6 +266,23 @@ async def create_comment(
 
     task.last_update = datetime.utcnow()  # Use import
     db.add(task)
+
+    # Update TO recipients on ticket
+    if to_recipients and not comment_in.is_private:
+        existing_to = []
+        if task.to_recipients:
+            existing_to = [email.strip() for email in task.to_recipients.split(",") if email.strip()]
+
+        all_to = existing_to.copy()
+        for new_to in to_recipients:
+            if new_to not in all_to:
+                all_to.append(new_to)
+
+        if all_to:
+            task.to_recipients = ", ".join(all_to)
+            logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
+
+        db.add(task)
 
     # Update CC recipients on ticket
     if cc_recipients and not comment_in.is_private:
@@ -384,6 +415,7 @@ async def create_comment(
         workspace_id=current_user.workspace_id,
         content=content_to_store,
         s3_html_url=s3_html_url,
+        to_recipients=comment_in.to_recipients,
         other_destinaries=comment_in.other_destinaries,
         bcc_recipients=comment_in.bcc_recipients,
         is_private=comment_in.is_private
@@ -612,6 +644,7 @@ async def create_comment(
                 agent_email=current_user.email,
                 agent_name=current_user.name,
                 is_private=comment_in.is_private,
+                to_recipients=to_recipients,
                 cc_recipients=cc_recipients,
                 bcc_recipients=bcc_recipients,
                 processed_attachment_ids=processed_attachment_ids,
@@ -842,9 +875,10 @@ def send_email_in_background(
     agent_email: str,
     agent_name: str,
     is_private: bool,
-    processed_attachment_ids: list,
+    to_recipients: List[str],
     cc_recipients: List[str],
     bcc_recipients: List[str],
+    processed_attachment_ids: list,
     db_path: str
 ):
     import time
@@ -878,8 +912,9 @@ def send_email_in_background(
             pass
 
         if task_with_user.mailbox_connection_id:
+            logger.info(f"🔍 DEBUG: Background task received to_recipients: {to_recipients}")
             microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients)
+            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, to_recipients=to_recipients, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients)
         else:
             if not task_with_user.user or not task_with_user.user.email:
                 return

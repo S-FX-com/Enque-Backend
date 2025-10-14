@@ -178,7 +178,6 @@ def sync_single_config(config: EmailSyncConfig) -> int:
             return -1
             
         service = MicrosoftGraphService(config_db)
-        service._init_cache_if_needed()
         start_time = time.time()
         max_sync_time = 60  # 60 seconds max per config
         

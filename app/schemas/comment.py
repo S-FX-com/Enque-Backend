@@ -17,6 +17,7 @@ class CommentCreate(CommentBase):
     # Campos adicionales para gestión de asignación y archivos adjuntos
     preserve_assignee: bool = False  # Flag para no cambiar el asignado actual
     assignee_id: Optional[int] = None  # ID de agente a asignar (si se quiere cambiar)
+    to_recipients: Optional[str] = None        # TO recipients adicionales
     other_destinaries: Optional[str] = None  # CC recipients
     bcc_recipients: Optional[str] = None       # BCC recipients
     is_attachment_upload: bool = False  # Flag para indicar si es una carga de adjunto
@@ -33,6 +34,7 @@ class CommentInDBBase(CommentBase):
     agent_id: Optional[int] = None
     user_id: Optional[int] = None   # Campo agregado para user_id
     workspace_id: int
+    to_recipients: Optional[str] = None        # TO recipients adicionales
     other_destinaries: Optional[str] = None  # CC recipients
     bcc_recipients: Optional[str] = None     # BCC recipients
     s3_html_url: Optional[str] = None  # URL del contenido en S3

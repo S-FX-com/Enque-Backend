@@ -9,6 +9,7 @@ class Comment(Base):
     ticket_id = Column(Integer, ForeignKey("tickets.id", ondelete="CASCADE"), nullable=False)
     agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    to_recipients = Column(Text, nullable=True)    # Campo para destinatarios adicionales del To:
     other_destinaries = Column(Text, nullable=True)
     bcc_recipients = Column(Text, nullable=True)  # Campo agregado para BCC recipients
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
