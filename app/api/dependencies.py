@@ -12,7 +12,7 @@ from app.database.session import get_db
 from app.models.agent import Agent
 from app.models.workspace import Workspace
 from app.schemas.token import TokenPayload
-from app.core.cache import user_cache, create_user_from_cache
+from app.services.cache_service import cache_service
 
 # OAuth2 bearer token for authentication
 oauth2_scheme = OAuth2PasswordBearer(
@@ -20,12 +20,12 @@ oauth2_scheme = OAuth2PasswordBearer(
 )
 
 
-def get_current_user(
+async def get_current_user(
     db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
 ) -> Agent:
     """
-    Get the current authenticated user from the token
-    Implementa caché para evitar consultas repetitivas durante 5 minutos
+    Get the current authenticated user from the token.
+    Implements Redis caching to avoid repetitive DB queries.
     """
     try:
         payload = jwt.decode(
@@ -37,22 +37,24 @@ def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Could not validate credentials: {str(e)}",
         )
-    
+
     if token_data.sub is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token payload",
         )
-    
+
     user_id = token_data.sub
-    
-    # INTENTAR OBTENER DESDE CACHÉ PRIMERO
-    cached_user_data = user_cache.get(user_id)
-    if cached_user_data:
-        return create_user_from_cache(cached_user_data)
-    
-    # SI NO ESTÁ EN CACHÉ, CONSULTAR BASE DE DATOS
-    # OPTIMIZACIÓN: Consulta sin relaciones pesadas para mejorar velocidad
+    cache_key = f"user_agent:{user_id}"
+
+    # Try to get from Redis cache first
+    cached_user = await cache_service.get(cache_key)
+    if cached_user:
+        # Reconstruct the Agent object from cached dictionary
+        agent = Agent(**cached_user)
+        return agent
+
+    # If not in cache, query the database
     user = db.query(Agent).filter(Agent.id == user_id).options(
         noload(Agent.assigned_tasks),
         noload(Agent.sent_tasks),
@@ -63,15 +65,25 @@ def get_current_user(
         noload(Agent.microsoft_tokens),
         noload(Agent.created_canned_replies)
     ).first()
+
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-    
-    # GUARDAR EN CACHÉ PARA PRÓXIMAS SOLICITUDES
-    user_cache.set(user)
-    
+
+    # Save to cache for subsequent requests
+    user_data_for_cache = {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "workspace_id": user.workspace_id,
+        "is_active": user.is_active,
+        "avatar_url": user.avatar_url
+    }
+    await cache_service.set(cache_key, user_data_for_cache, ttl=300)  # Cache for 5 minutes
+
     return user
 
 

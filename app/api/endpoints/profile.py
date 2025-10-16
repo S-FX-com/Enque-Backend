@@ -9,7 +9,7 @@ from app.database.session import get_db
 from app.models.agent import Agent
 from app.schemas.agent import Agent as AgentSchema, AgentUpdate
 from app.core.security import get_password_hash
-from app.core.cache import user_cache
+from app.services.cache_service import cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +56,9 @@ async def update_user_me(
     db.commit()
     db.refresh(current_user)
     
-    # INVALIDAR CACHÉ DEL USUARIO ACTUALIZADO
-    user_cache.delete(current_user.id)
-    logger.info(f"PROFILE UPDATE: Usuario {current_user.id} ({current_user.email}) actualizado y removido del caché")
+    # Invalidate the user's cache in Redis
+    cache_key = f"user_agent:{current_user.id}"
+    await cache_service.delete(cache_key)
+    logger.info(f"PROFILE UPDATE: User {current_user.id} ({current_user.email}) updated and cache invalidated.")
     
-    return current_user 
+    return current_user

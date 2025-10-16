@@ -1,8 +1,36 @@
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, DateTime, Index, Enum, Table
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.types import TypeDecorator
 from app.database.base_class import Base
 from datetime import datetime
+# from app.core.encryption import encryption_service
+# from cryptography.fernet import InvalidToken
+
+# # Custom SQLAlchemy type for encryption
+# class EncryptedString(TypeDecorator):
+#     """A SQLAlchemy type that encrypts and decrypts string values."""
+#     impl = Text
+
+#     def process_bind_param(self, value, dialect):
+#         if value is not None:
+#             if encryption_service is None:
+#                 raise RuntimeError("Encryption service is not initialized. Check ENCRYPTION_KEY.")
+#             return encryption_service.encrypt(value)
+#         return value
+
+#     def process_result_value(self, value, dialect):
+#         if value is not None:
+#             if encryption_service is None:
+#                 raise RuntimeError("Encryption service is not initialized. Check ENCRYPTION_KEY.")
+#             try:
+#                 # First, try to decode as if it's encrypted
+#                 return encryption_service.decrypt(value)
+#             except (InvalidToken, ValueError):
+#                 # If decryption fails, it's likely an old, unencrypted token.
+#                 # Return the raw value. All new tokens will be encrypted.
+#                 return value
+#         return value
 
 # Junction table for many-to-many relationship between mailboxes and teams
 mailbox_team_assignments = Table(

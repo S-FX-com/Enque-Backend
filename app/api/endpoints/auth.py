@@ -20,12 +20,14 @@ from app.services.email_service import send_password_reset_email
 import logging 
 import json 
 import base64 
+from app.core.rate_limiter import limiter
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 @router.post("/login", response_model=Token)
+@limiter.limit("10/minute")
 async def login_access_token(
     request: Request,
     db: Session = Depends(get_db), 
@@ -33,26 +35,27 @@ async def login_access_token(
     x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID") 
 ) -> Any:
     logger.info(f"Login attempt for user: {form_data.username} with X-Workspace-ID: {x_workspace_id or 'Not Provided'}")
-    requested_workspace_id: Optional[int] = None
-    if x_workspace_id:
-        try:
-            requested_workspace_id = int(x_workspace_id)
-        except ValueError:
-            logger.warning(f"Invalid X-Workspace-ID format provided: {x_workspace_id}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid X-Workspace-ID header format.",
-            )
-    user = None
-    if requested_workspace_id is not None:
-        user = db.query(Agent).filter(
-            Agent.email == form_data.username,
-            Agent.workspace_id == requested_workspace_id
-        ).first()
-        logger.info(f"Searching for user {form_data.username} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
-    else:
-        user = db.query(Agent).filter(Agent.email == form_data.username).first()
-        logger.info(f"Searching for user {form_data.username} without workspace restriction: {'Found' if user else 'Not found'}")
+    
+    if not x_workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Workspace-ID header is required for login.",
+        )
+
+    try:
+        requested_workspace_id = int(x_workspace_id)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid X-Workspace-ID format provided: {x_workspace_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid X-Workspace-ID header format.",
+        )
+
+    user = db.query(Agent).filter(
+        Agent.email == form_data.username,
+        Agent.workspace_id == requested_workspace_id
+    ).first()
+    logger.info(f"Searching for user {form_data.username} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
     
     # Verificar contraseña con manejo robusto de errores
     password_valid = False
@@ -169,7 +172,9 @@ async def verify_token(request: Request, token: str = Header(..., description="J
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid token format: {str(e)}")
 
 @router.post("/request-password-reset")
+@limiter.limit("10/minute")
 async def request_password_reset(
+    request: Request,
     request_data: AgentPasswordResetRequest, 
     db: Session = Depends(get_db),
     x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID")
@@ -251,7 +256,8 @@ async def request_password_reset(
     return {"message": "If an account with that email exists, a password reset link has been sent."}
 
 @router.post("/reset-password", response_model=Token)
-async def reset_password(reset_data: AgentResetPassword, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def reset_password(request: Request, reset_data: AgentResetPassword, db: Session = Depends(get_db)):
     agent = db.query(Agent).filter(Agent.password_reset_token == reset_data.token).first()
     if not agent:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired password reset token.")
@@ -275,7 +281,9 @@ async def reset_password(reset_data: AgentResetPassword, db: Session = Depends(g
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/microsoft/login", response_model=Token)
+@limiter.limit("10/minute")
 async def microsoft_login(
+    request: Request,
     microsoft_data: AgentMicrosoftLogin, 
     db: Session = Depends(get_db)
 ) -> Any:
@@ -625,4 +633,3 @@ async def check_auth_methods(
         "workspace_id": user.workspace_id,
         "message": f"Authentication methods available for {email}"
     }
-

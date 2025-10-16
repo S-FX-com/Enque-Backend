@@ -321,10 +321,9 @@ class MicrosoftAuthService:
                 try: error_json = e.response.json()
                 except: pass
                 if error_json.get("error") == "invalid_grant":
-                    logger.warning(f"Refresh token for token ID {token.id} is invalid or expired. Marking as unusable.")
-                    token.refresh_token = None; token.access_token = None
-                    token.expires_at = datetime.utcnow() - timedelta(days=1)
-                    self.db.add(token); self.db.commit()
+                    logger.warning(f"Refresh token for token ID {token.id} is invalid or expired. Deleting it.")
+                    self.db.delete(token)
+                    self.db.commit()
                     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token invalid. Re-authentication required.")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to refresh token: {str(e)}")
         except Exception as e:
@@ -374,10 +373,9 @@ class MicrosoftAuthService:
                 try: error_json = e.response.json()
                 except: pass
                 if error_json.get("error") == "invalid_grant":
-                    logger.warning(f"Refresh token for token ID {token.id} is invalid or expired. Marking as unusable.")
-                    token.refresh_token = None; token.access_token = None
-                    token.expires_at = datetime.utcnow() - timedelta(days=1)
-                    self.db.add(token); self.db.commit()
+                    logger.warning(f"Refresh token for token ID {token.id} is invalid or expired. Deleting it.")
+                    self.db.delete(token)
+                    self.db.commit()
                     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token invalid. Re-authentication required.")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to refresh token: {str(e)}")
         except Exception as e:

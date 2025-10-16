@@ -14,6 +14,7 @@ from app.models.comment import Comment
 from app.schemas.workflow import WorkflowCreate, WorkflowUpdate, WorkflowTriggerOption, WorkflowActionOption, MessageAnalysisRule, MessageAnalysisResult
 from app.utils.logger import logger
 from app.services.message_analysis_service import MessageAnalysisService
+from app.core.exceptions import DatabaseException
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +366,11 @@ class WorkflowService:
                     logger.info(f"Executed workflow: {workflow.name} for trigger: {trigger}")
                     
             except Exception as e:
-                logger.error(f"Error executing workflow {workflow.name}: {str(e)}")
+                logger.error(
+                    f"Error executing workflow {workflow.name}: {e}",
+                    extra={"workflow_id": workflow.id, "workspace_id": workspace_id, "trigger": trigger},
+                    exc_info=True
+                )
                 continue
         
         return executed_workflows
@@ -443,7 +448,11 @@ class WorkflowService:
                     logger.warning(f"Unknown action type: {action_type}")
                     
             except Exception as e:
-                logger.error(f"Error executing action {action_type}: {str(e)}")
+                logger.error(
+                    f"Error executing action {action_type}: {e}",
+                    extra={"action_type": action_type, "context": str(context)},
+                    exc_info=True
+                )
                 continue
 
     @staticmethod
@@ -515,13 +524,21 @@ class WorkflowService:
                             logger.info(f"Executed workflow {workflow.id} ({workflow.name}) for message analysis")
                         
                 except Exception as e:
-                    logger.error(f"Error processing workflow {workflow.id}: {str(e)}")
+                    logger.error(
+                        f"Error processing workflow {workflow.id}: {e}",
+                        extra={"workflow_id": workflow.id, "workspace_id": workspace_id},
+                        exc_info=True
+                    )
                     continue
 
             return executed_workflows
             
         except Exception as e:
-            logger.error(f"Error processing message for workflows: {str(e)}")
+            logger.error(
+                f"Error processing message for workflows: {e}",
+                extra={"workspace_id": workspace_id},
+                exc_info=True
+            )
             return []
 
     def _check_workflow_conditions(self, workflow: Workflow, context: Dict[str, Any], analysis: MessageAnalysisResult) -> bool:
@@ -545,7 +562,11 @@ class WorkflowService:
             return True
             
         except Exception as e:
-            logger.error(f"Error checking workflow conditions: {str(e)}")
+            logger.error(
+                f"Error checking workflow conditions: {e}",
+                extra={"workflow_id": workflow.id, "context": str(context)},
+                exc_info=True
+            )
             return False
 
     def _get_condition_value(self, field: str, context: Dict[str, Any], analysis: MessageAnalysisResult) -> Any:
@@ -596,8 +617,15 @@ class WorkflowService:
                 
             return False
             
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Could not evaluate condition due to type mismatch: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Error evaluating condition: {str(e)}")
+            logger.error(
+                f"Error evaluating condition: {e}",
+                extra={"actual_value": actual_value, "operator": operator, "expected_value": expected_value},
+                exc_info=True
+            )
             return False
 
     def _execute_workflow_actions(self, workflow: Workflow, context: Dict[str, Any], analysis: MessageAnalysisResult) -> Dict[str, Any]:
@@ -635,7 +663,11 @@ class WorkflowService:
             }
             
         except Exception as e:
-            logger.error(f"Error executing workflow actions: {str(e)}")
+            logger.error(
+                f"Error executing workflow actions: {e}",
+                extra={"workflow_id": workflow.id},
+                exc_info=True
+            )
             return {'status': 'error', 'error': str(e)}
 
     def _execute_single_action(self, action_type: str, config: Dict[str, Any], context: Dict[str, Any], analysis: MessageAnalysisResult) -> Dict[str, Any]:
@@ -670,4 +702,4 @@ class WorkflowService:
             self.db.commit()
             logger.info(f"Updated ticket {ticket.id} priority to {priority}")
             
-        return {'priority': priority, 'urgency_detected': analysis.urgency_level} 
+        return {'priority': priority, 'urgency_detected': analysis.urgency_level}

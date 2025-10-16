@@ -26,6 +26,7 @@ from app.services.microsoft_graph_client import MicrosoftGraphClient
 from app.services.utils import get_or_create_user
 from app.utils.image_processor import extract_base64_images
 from app.utils.logger import logger
+from app.core.exceptions import DatabaseException, MicrosoftAPIException
 
 
 class MicrosoftEmailService:
@@ -650,8 +651,30 @@ class MicrosoftEmailService:
                                 logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
                                 self.db.rollback()
                         else: logger.warning(f"[MAIL SYNC] Failed to create task from email ID {email.id}.")
-                except Exception as e: 
-                    logger.error(f"[MAIL SYNC] Error processing email ID {email_data.get('id', 'N/A')}: {str(e)}", exc_info=True)
+                except (DatabaseException, MicrosoftAPIException) as e:
+                    logger.error(
+                        f"[MAIL SYNC] Error processing email ID {email_data.get('id', 'N/A')}: {e}",
+                        extra={
+                            "email_id": email_data.get("id"),
+                            "subject": email_data.get("subject"),
+                            "sync_config_id": sync_config.id,
+                            "workspace_id": sync_config.workspace_id,
+                            "error_type": type(e).__name__
+                        },
+                        exc_info=True
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[MAIL SYNC] An unexpected error occurred while processing email ID {email_data.get('id', 'N/A')}: {e}",
+                        extra={
+                            "email_id": email_data.get("id"),
+                            "subject": email_data.get("subject"),
+                            "sync_config_id": sync_config.id,
+                            "workspace_id": sync_config.workspace_id,
+                            "error_type": type(e).__name__
+                        },
+                        exc_info=True
+                    )
                     
                     # Manejo mejorado de errores de sesión
                     try:
@@ -676,7 +699,30 @@ class MicrosoftEmailService:
             if created_tasks_count > 0 or added_comments_count > 0:
                 logger.info(f"📧 Config {sync_config.id}: {created_tasks_count} tickets, {added_comments_count} comments")
             return []
-        except Exception as e: logger.error(f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {str(e)}", exc_info=True); return []
+        except (DatabaseException, MicrosoftAPIException) as e:
+            logger.error(
+                f"[MAIL SYNC] Error during email synchronization for config ID {sync_config.id}: {e}",
+                extra={
+                    "sync_config_id": sync_config.id,
+                    "workspace_id": sync_config.workspace_id,
+                    "mailbox_connection_id": sync_config.mailbox_connection_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                f"[MAIL SYNC] An unexpected error occurred during email synchronization for config ID {sync_config.id}: {e}",
+                extra={
+                    "sync_config_id": sync_config.id,
+                    "workspace_id": sync_config.workspace_id,
+                    "mailbox_connection_id": sync_config.mailbox_connection_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            return []
 
     def _cleanup_orphaned_mappings(self):
         try:
@@ -949,25 +995,15 @@ class MicrosoftEmailService:
                     team_id = team_assignment.team_id
             to_recipients_str = None
             if email.to_recipients:
-                to_emails = []
-                for to in email.to_recipients:
-                    if to.address:
-                        if to.name and to.name.strip():
-                            to_emails.append(f"{to.name} <{to.address}>")
-                        else:
-                            to_emails.append(to.address)
+                # Store only email addresses, not the "Name <email>" format, for frontend compatibility
+                to_emails = [to.address for to in email.to_recipients if to.address]
                 if to_emails:
                     to_recipients_str = ", ".join(to_emails)
                     logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
             cc_recipients_str = None
             if email.cc_recipients:
-                cc_emails = []
-                for cc in email.cc_recipients:
-                    if cc.address:
-                        if cc.name and cc.name.strip():
-                            cc_emails.append(f"{cc.name} <{cc.address}>")
-                        else:
-                            cc_emails.append(cc.address)
+                # Store only email addresses for frontend compatibility
+                cc_emails = [cc.address for cc in email.cc_recipients if cc.address]
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
@@ -1288,7 +1324,34 @@ class MicrosoftEmailService:
                 logger.info(f"Notifications suppressed for ticket {task.id} to prevent notification loops")
                 
             return task
-        except Exception as e: logger.error(f"Error creating task from email ID {email.id}: {str(e)}", exc_info=True); self.db.rollback(); return None
+        except DatabaseException as e:
+            logger.error(
+                f"Database error creating task from email ID {email.id}: {e}",
+                extra={
+                    "email_id": email.id,
+                    "subject": email.subject,
+                    "sender": email.sender.address,
+                    "workspace_id": config.workspace_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            self.db.rollback()
+            return None
+        except Exception as e:
+            logger.error(
+                f"Unexpected error creating task from email ID {email.id}: {e}",
+                extra={
+                    "email_id": email.id,
+                    "subject": email.subject,
+                    "sender": email.sender.address,
+                    "workspace_id": config.workspace_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            self.db.rollback()
+            return None
 
     def _update_all_email_mappings_for_ticket(self, ticket_id: int, old_email_id: str, new_email_id: str) -> bool:
         """
@@ -1589,18 +1652,16 @@ class MicrosoftEmailService:
         # If contact hasn't changed, proceed with normal reply logic
         logger.info(f"[REPLY EMAIL] 📧 Contact unchanged, sending normal reply to {original_sender_email}")
         
-        # Process additional TO recipients
-        all_to_recipients = [original_sender_email]  # Start with original sender
+        # Process TO recipients
+        all_to_recipients = []
         if to_recipients:
-            logger.info(f"[REPLY EMAIL] 🔍 DEBUG: Received to_recipients parameter: {to_recipients}")
-            for to_email in to_recipients:
-                if to_email and to_email.strip() and to_email.strip() not in all_to_recipients:
-                    all_to_recipients.append(to_email.strip())
-            logger.info(f"[REPLY EMAIL] ✅ Adding {len(to_recipients)} additional TO recipients: {to_recipients}")
+            logger.info(f"[REPLY EMAIL] ✅ Using provided TO recipients from frontend: {to_recipients}")
+            all_to_recipients = to_recipients
         else:
-            logger.info(f"[REPLY EMAIL] ℹ️ No additional TO recipients provided")
+            logger.warning(f"[REPLY EMAIL] ⚠️ No TO recipients provided from frontend, falling back to original sender: {original_sender_email}")
+            all_to_recipients = [original_sender_email]
         
-        logger.info(f"[REPLY EMAIL] 📧 Total TO recipients: {all_to_recipients}")
+        logger.info(f"[REPLY EMAIL] 📧 Total TO recipients for this reply: {all_to_recipients}")
         
         # 🔧 NOTA: CC recipients se procesarán después de obtener original_message_id
         
@@ -1641,14 +1702,51 @@ class MicrosoftEmailService:
             # Usar el token del usuario específico del mailbox
             app_token = mailbox_token.access_token
             
-        except Exception as e: 
-            logger.error(f"Failed to get user token for mailbox {mailbox_connection.email}: {e}"); 
+        except (DatabaseException, MicrosoftAPIException) as e:
+            logger.error(
+                f"Error getting user token for mailbox {mailbox_connection.email}: {e}",
+                extra={
+                    "mailbox_email": mailbox_connection.email,
+                    "task_id": task_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                f"Unexpected error getting user token for mailbox {mailbox_connection.email}: {e}",
+                extra={
+                    "mailbox_email": mailbox_connection.email,
+                    "task_id": task_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
             return False
 
         original_message_id = email_mapping.email_id
         
-        if not cc_recipients:
-            original_cc_recipients = []
+        # 🔧 ROBUST FIX: Combine all available CC sources to prevent data loss.
+        final_cc_recipients = set()
+
+        # 1. Use CCs provided by the frontend in this specific reply.
+        if cc_recipients:
+            logger.info(f"✅ Using provided CC recipients from frontend: {cc_recipients}")
+            for email in cc_recipients:
+                final_cc_recipients.add(email.strip())
+        
+        # 2. Also include CCs stored with the ticket in the database.
+        if task.cc_recipients:
+            ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
+            if ticket_cc_recipients:
+                logger.info(f"Loaded {len(ticket_cc_recipients)} CC recipients from database: {ticket_cc_recipients}")
+                for email in ticket_cc_recipients:
+                    final_cc_recipients.add(email)
+
+        # 3. As a last resort, if no CCs found yet, try fetching from the original email.
+        if not final_cc_recipients:
+            logger.info("No CCs from frontend or DB, attempting to fetch from original email as a fallback.")
             try:
                 message_data = self.graph_client.get_mailbox_email_content(app_token, mailbox_connection.email, original_message_id)
                 if message_data:
@@ -1656,28 +1754,19 @@ class MicrosoftEmailService:
                     for cc_recipient in cc_recipients_data:
                         email_address = cc_recipient.get("emailAddress", {}).get("address")
                         if email_address:
-                            original_cc_recipients.append(email_address)
-                    
-                    if original_cc_recipients:
-                        logger.info(f"Found {len(original_cc_recipients)} CC recipients from original email: {original_cc_recipients}")
+                            final_cc_recipients.add(email_address.strip())
+                    if final_cc_recipients:
+                        logger.info(f"Found {len(final_cc_recipients)} CC recipients from original email (fallback).")
                 else:
-                    logger.warning(f"Could not fetch original message for CC recipients.")
+                    logger.warning(f"Could not fetch original message for CC recipients (fallback).")
             except Exception as cc_error:
-                logger.error(f"Error fetching original CC recipients: {str(cc_error)}")
-            cc_recipients = original_cc_recipients.copy()
-            if task.cc_recipients:
-                ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
-                for ticket_cc in ticket_cc_recipients:
-                    if ticket_cc not in cc_recipients:
-                        cc_recipients.append(ticket_cc)
-                logger.info(f"Added {len(ticket_cc_recipients)} CC recipients from ticket: {ticket_cc_recipients}")
-            
-            if cc_recipients:
-                logger.info(f"Final CC recipients list ({len(cc_recipients)}): {cc_recipients}")
-            else:
-                logger.info("No CC recipients found for this reply")
+                logger.error(f"Error fetching original CC recipients (fallback): {str(cc_error)}")
+
+        cc_recipients = list(final_cc_recipients)
+        if cc_recipients:
+            logger.info(f"Final combined CC recipients list ({len(cc_recipients)}): {cc_recipients}")
         else:
-            logger.info(f"✅ Using provided CC recipients: {cc_recipients}")
+            logger.info("No CC recipients found for this reply")
         if cc_recipients:
             cleaned_cc_recipients = []
             for cc_email in cc_recipients:
@@ -1903,7 +1992,16 @@ class MicrosoftEmailService:
             logger.error(f"Failed to send new email from {mailbox_email} to {recipient_email}. Status Code: {status_code}. Details: {error_details}. Error: {str(e)}")
             return False
         except Exception as e:
-            logger.error(f"An unexpected error occurred while sending new email from {mailbox_email} to {recipient_email}. Error: {str(e)}", exc_info=True)
+            logger.error(
+                f"An unexpected error occurred while sending new email from {mailbox_email} to {recipient_email}. Error: {str(e)}",
+                extra={
+                    "mailbox_email": mailbox_email,
+                    "recipient_email": recipient_email,
+                    "task_id": task_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
             return False
 
     def send_new_email_multiple_recipients(self, mailbox_email: str, recipient_emails: List[str], subject: str, html_body: str, attachment_ids: List[int] = None, task_id: Optional[int] = None, cc_recipients: List[str] = None, bcc_recipients: List[str] = None, conversation_id: Optional[str] = None) -> bool:
@@ -2054,7 +2152,16 @@ class MicrosoftEmailService:
                 logger.error(f"Failed to send multiple recipient email from {mailbox_email} to {recipient_emails}. Status Code: {status_code}. Details: {error_details}. Error: {str(e)}")
                 return False
         except Exception as e:
-            logger.error(f"An unexpected error occurred while sending multiple recipient email from {mailbox_email} to {recipient_emails}. Error: {str(e)}", exc_info=True)
+            logger.error(
+                f"An unexpected error occurred while sending multiple recipient email from {mailbox_email} to {recipient_emails}. Error: {str(e)}",
+                extra={
+                    "mailbox_email": mailbox_email,
+                    "recipient_emails": recipient_emails,
+                    "task_id": task_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
             return False
 
     async def send_email_with_user_token(
@@ -2117,7 +2224,16 @@ class MicrosoftEmailService:
             logger.error(f"Timeout error sending email from {sender_mailbox_email}: {str(e)}")
             return False
         except Exception as e:
-            logger.error(f"Error sending email from {sender_mailbox_email} using user token: {e}", exc_info=True)
+            logger.error(
+                f"Error sending email from {sender_mailbox_email} using user token: {e}",
+                extra={
+                    "sender_mailbox_email": sender_mailbox_email,
+                    "recipient_email": recipient_email,
+                    "task_id": task_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
             return False
 
     def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:

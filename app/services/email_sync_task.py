@@ -31,6 +31,7 @@ from app.models.microsoft import EmailSyncConfig, MicrosoftIntegration, Microsof
 from app.services.microsoft_service import MicrosoftGraphService
 from app.utils.logger import logger
 from app.core.config import settings
+from app.core.exceptions import DatabaseException, MicrosoftAPIException
 
 # 🔧 CIRCUIT BREAKER: Prevent email sync during DB issues
 class EmailSyncCircuitBreaker:
@@ -117,7 +118,7 @@ def sync_emails_job():
                     else:
                         failed_syncs += 1
                 except Exception as e:
-                    logger.error(f"❌ Error syncing config #{config.id}: {e}")
+                    logger.error(f"Error syncing config #{config.id}: {e}", extra={"config_id": config.id}, exc_info=True)
                     failed_syncs += 1
                     if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
                         logger.error(f"🚨 Database connection issue detected in email sync: {e}")
@@ -137,7 +138,7 @@ def sync_emails_job():
             logger.info(f"✅ Email sync completed successfully: {successful_syncs} configs processed")
                     
     except Exception as e:
-        logger.error(f"❌ Critical error in email sync job: {e}")
+        logger.error("Critical error in email sync job", extra={"error": str(e)}, exc_info=True)
         if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
             email_sync_circuit_breaker.record_failure()
     finally:
@@ -145,7 +146,7 @@ def sync_emails_job():
             try:
                 db.close()
             except Exception as close_error:
-                logger.error(f"❌ Error closing DB connection: {close_error}")
+                logger.error("Error closing DB connection in email sync job", extra={"error": str(close_error)}, exc_info=True)
 
 def sync_single_config(config: EmailSyncConfig) -> int:
     """Sync emails for a single configuration with optimizations and error handling"""
@@ -156,7 +157,7 @@ def sync_single_config(config: EmailSyncConfig) -> int:
             config_db.execute(text("SELECT 1"))
             config_db.commit()
         except Exception as db_test_error:
-            logger.error(f"❌ DB connection test failed for config #{config.id}: {db_test_error}")
+            logger.error(f"DB connection test failed for config #{config.id}: {db_test_error}", extra={"config_id": config.id}, exc_info=True)
             return -1
         
         integration = config_db.query(MicrosoftIntegration).filter(
@@ -185,13 +186,22 @@ def sync_single_config(config: EmailSyncConfig) -> int:
             created_tasks = service.sync_emails(config)
             if time.time() - start_time > max_sync_time:
                 logger.warning(f"⚠️ Email sync for config #{config.id} took longer than {max_sync_time}s")
-        except Exception as sync_error:
+        except (DatabaseException, MicrosoftAPIException) as sync_error:
+            logger.error(
+                f"API or DB error during email sync for config #{config.id}: {sync_error}",
+                extra={"config_id": config.id, "error_type": type(sync_error).__name__},
+                exc_info=True
+            )
             if "QueuePool limit" in str(sync_error) or "connection timed out" in str(sync_error):
-                logger.error(f"🚨 Database pool issue in sync_single_config #{config.id}: {sync_error}")
-                raise  
-            else:
-                logger.error(f"❌ Email sync error for config #{config.id}: {sync_error}")
-                return -1
+                raise
+            return -1
+        except Exception as sync_error:
+            logger.error(
+                f"Unexpected error during email sync for config #{config.id}: {sync_error}",
+                extra={"config_id": config.id},
+                exc_info=True
+            )
+            return -1
         
         tickets_created = created_tasks or 0
         if tickets_created > 0:
@@ -201,17 +211,17 @@ def sync_single_config(config: EmailSyncConfig) -> int:
         
     except Exception as e:
         if "QueuePool limit" in str(e) or "connection timed out" in str(e) or "Lost connection" in str(e):
-            logger.error(f"🚨 Database connection issue in config #{config.id}: {e}")
-            raise  
+            logger.error(f"Database connection issue in config #{config.id}: {e}", extra={"config_id": config.id}, exc_info=True)
+            raise
         else:
-            logger.error(f"❌ Error syncing emails for config #{config.id}: {e}")
+            logger.error(f"Error syncing emails for config #{config.id}: {e}", extra={"config_id": config.id}, exc_info=True)
             return -1
     finally:
         if config_db is not None:
             try:
                 config_db.close()
             except Exception as close_error:
-                logger.error(f"❌ Error closing config DB connection: {close_error}")
+                logger.error(f"Error closing config DB connection: {close_error}", extra={"config_id": config.id}, exc_info=True)
 
 def sync_emails_job_legacy():
     logger.info("Starting legacy email sync job")
@@ -252,12 +262,12 @@ def sync_emails_job_legacy():
                     service = MicrosoftGraphService(config_db)
                     created_tasks = service.sync_emails(config)
                 except Exception as e:
-                    logger.error(f"Error syncing emails for config #{config.id}: {e}")
+                    logger.error(f"Error syncing emails for config #{config.id}: {e}", extra={"config_id": config.id}, exc_info=True)
             finally:
                 config_db.close()
                 
     except Exception as e:
-        logger.error(f"Error in email sync job: {e}")
+        logger.error(f"Error in legacy email sync job: {e}", exc_info=True)
     finally:
         if db is not None:
             db.close()
@@ -282,7 +292,7 @@ def refresh_tokens_job():
         
         logger.info("Token refresh job completed")
     except Exception as e:
-        logger.error(f"Error refreshing tokens: {e}")
+        logger.error(f"Error in token refresh job: {e}", exc_info=True)
     finally:
         if db is not None:
             db.close()
@@ -339,7 +349,7 @@ def weekly_agent_summary_job():
             loop.close()
         
     except Exception as e:
-        logger.error(f"❌ Error in weekly agent summary job: {str(e)}", exc_info=True)
+        logger.error("Error in weekly agent summary job", extra={"error": str(e)}, exc_info=True)
     finally:
         if db is not None:
             db.close()
@@ -388,7 +398,7 @@ def daily_outstanding_tasks_job():
             loop.close()
         
     except Exception as e:
-        logger.error(f"❌ Error in daily outstanding tasks job: {str(e)}", exc_info=True)
+        logger.error("Error in daily outstanding tasks job", extra={"error": str(e)}, exc_info=True)
     finally:
         if db is not None:
             db.close()
@@ -421,7 +431,7 @@ def cleanup_orphaned_connections():
         log_pool_status()
         
     except Exception as e:
-        logger.error(f"❌ Error during orphaned connections cleanup: {e}")
+        logger.error("Error during orphaned connections cleanup", extra={"error": str(e)}, exc_info=True)
         if db:
             db.rollback()
     finally:
@@ -429,7 +439,7 @@ def cleanup_orphaned_connections():
             try:
                 db.close()
             except Exception as close_error:
-                logger.error(f"❌ Error closing cleanup DB connection: {close_error}")
+                logger.error("Error closing cleanup DB connection", extra={"error": str(close_error)}, exc_info=True)
 
 def monitor_database_health():
 
@@ -445,7 +455,7 @@ def monitor_database_health():
                 logger.warning("🧹 Pool utilization > 90%, triggering cleanup...")
                 cleanup_orphaned_connections()
     except Exception as e:
-        logger.error(f"❌ Error monitoring database health: {e}")
+        logger.error("Error monitoring database health", extra={"error": str(e)}, exc_info=True)
 
 def process_scheduled_comments_job():
     """
@@ -473,7 +483,7 @@ def process_scheduled_comments_job():
                     logger.error(f"❌ Scheduled comment error: {error}")
         
     except Exception as e:
-        logger.error(f"❌ Error in scheduled comments job: {e}")
+        logger.error("Error in scheduled comments job", extra={"error": str(e)}, exc_info=True)
         if db:
             db.rollback()
     finally:
@@ -481,7 +491,7 @@ def process_scheduled_comments_job():
             try:
                 db.close()
             except Exception as close_error:
-                logger.error(f"❌ Error closing scheduled comments DB connection: {close_error}")
+                logger.error("Error closing scheduled comments DB connection", extra={"error": str(close_error)}, exc_info=True)
 
 def start_scheduler():
     
@@ -506,7 +516,7 @@ def start_scheduler():
                 schedule.run_pending()
                 time.sleep(1)
             except Exception as e:
-                logger.error(f"❌ Scheduler error: {e}")
+                logger.error(f"Scheduler error: {e}", exc_info=True)
                 time.sleep(5)  # Wait before retrying
             
     scheduler_thread = threading.Thread(target=run_scheduler, name="EmailSyncScheduler")
@@ -561,7 +571,7 @@ def weekly_manager_summaries_job():
             logger.debug(f"Not time for weekly manager summaries. Current: {current_time.strftime('%A %I:%M %p ET')} (need Friday 4-5pm ET)")
             
     except Exception as e:
-        logger.error(f"❌ Error in weekly manager summaries job: {str(e)}", exc_info=True)
+        logger.error("Error in weekly manager summaries job", extra={"error": str(e)}, exc_info=True)
     finally:
         if db:
             db.close()

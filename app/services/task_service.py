@@ -11,7 +11,8 @@ from app.models.microsoft import EmailTicketMapping
 from app.schemas.task import TicketCreate, TicketUpdate
 from app.schemas.microsoft import EmailInfo
 from app.utils.logger import logger, log_important
-from app.database.session import SessionLocal 
+from app.database.session import SessionLocal
+from app.core.exceptions import DatabaseException, MicrosoftAPIException
 from app.models.agent import Agent
 from app.models.microsoft import MailboxConnection, MicrosoftToken
 from app.core.config import settings
@@ -81,27 +82,36 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
         if executed_workflows:
             logger.info(f"Executed workflows for ticket creation {task.id}: {executed_workflows}")
     except Exception as e:
-        logger.error(f"Error executing workflows for ticket creation {task.id}: {str(e)}")
-
+        logger.error(
+            f"Error executing workflows for ticket creation {task.id}: {e}",
+            extra={"task_id": task.id, "workspace_id": task.workspace_id, "trigger": "ticket.created"},
+            exc_info=True
+        )
     return task
 
-def _mark_email_read_bg(task_id: int): 
-    """Marcar email como leído en segundo plano usando una nueva sesión de DB."""
-    db: Session = None 
+def _mark_email_read_bg(task_id: int):
+    """Mark email as read in the background using a new DB session."""
+    db: Session = None
     try:
         db = SessionLocal()
         if db is None:
-             logger.error(f"Failed to create DB session for background task (ticket #{task_id})")
-             return
+            logger.error(f"Failed to create DB session for background task (ticket #{task_id})")
+            return
 
         from app.services.microsoft_service import mark_email_as_read_by_task_id
-        success = mark_email_as_read_by_task_id(db, task_id)
-        if success:
-            log_important(f"Email successfully marked as read in background for ticket #{task_id}")
-        else:
-            logger.error(f"Could not mark email as read in background for ticket #{task_id}")
+        mark_email_as_read_by_task_id(db, task_id)
+    except (DatabaseException, MicrosoftAPIException) as e:
+        logger.error(
+            f"Error in background email marking for ticket #{task_id}: {e}",
+            extra={"task_id": task_id, "error_type": type(e).__name__},
+            exc_info=True
+        )
     except Exception as e:
-        logger.error(f"Error in background email marking for ticket #{task_id}: {str(e)}")
+        logger.error(
+            f"Unexpected error in background email marking for ticket #{task_id}: {e}",
+            extra={"task_id": task_id},
+            exc_info=True
+        )
     finally:
         if db:
             db.close()
@@ -159,7 +169,11 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         logger.info(f"🚀 Background processes queued for ticket {task_id}")
             
     except Exception as e:
-        logger.error(f"Error iniciando procesos background para ticket {task_id}: {str(e)}")
+        logger.error(
+            f"Error starting background processes for ticket {task_id}: {e}",
+            extra={"task_id": task_id},
+            exc_info=True
+        )
     
     # ✅ RESPUESTA RÁPIDA: Procesar solo la información esencial para la respuesta
     email_mapping = db.query(EmailTicketMapping).filter(
@@ -249,7 +263,11 @@ def _execute_workflows_thread(task_id: int, workspace_id: int, old_assignee_id, 
             background_db.close()
             
     except Exception as e:
-        logger.error(f"❌ Error in background workflows for ticket {task_id}: {str(e)}")
+        logger.error(
+            f"Error in background workflows for ticket {task_id}: {e}",
+            extra={"task_id": task_id, "workspace_id": workspace_id},
+            exc_info=True
+        )
 
 
 def _send_closure_notification_thread(task_id: int):
@@ -294,7 +312,11 @@ def _send_closure_notification_thread(task_id: int):
             background_db.close()
             
     except Exception as e:
-        logger.error(f"❌ Error sending background notification for ticket {task_id}: {str(e)}", exc_info=True)
+        logger.error(
+            f"Error sending background closure notification for ticket {task_id}: {e}",
+            extra={"task_id": task_id},
+            exc_info=True
+        )
 
 
 def _send_assignment_notification_thread(task_id: int, request_origin: Optional[str] = None):
@@ -323,7 +345,11 @@ def _send_assignment_notification_thread(task_id: int, request_origin: Optional[
             background_db.close()
             
     except Exception as e:
-        logger.error(f"❌ Error sending background assignment notification for ticket {task_id}: {str(e)}", exc_info=True)
+        logger.error(
+            f"Error sending background assignment notification for ticket {task_id}: {e}",
+            extra={"task_id": task_id},
+            exc_info=True
+        )
 
 
 def _send_team_notification_thread(task_id: int, request_origin: Optional[str] = None):
@@ -352,7 +378,11 @@ def _send_team_notification_thread(task_id: int, request_origin: Optional[str] =
             background_db.close()
             
     except Exception as e:
-        logger.error(f"❌ Error sending background team notification for ticket {task_id}: {str(e)}", exc_info=True)
+        logger.error(
+            f"Error sending background team notification for ticket {task_id}: {e}",
+            extra={"task_id": task_id},
+            exc_info=True
+        )
 
 
 def delete_task(db: Session, task_id: int) -> Optional[Task]:
@@ -469,7 +499,11 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
                 refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
                 current_access_token = refreshed_ms_token.access_token
             except Exception as e:
-                logger.error(f"Error al refrescar token para enviar notificación: {e}")
+                logger.error(
+                    f"Error refreshing token for notification: {e}",
+                    extra={"task_id": task.id, "mailbox_email": preferred_mailbox.email},
+                    exc_info=True
+                )
                 return
 
         # Enviar la notificación usando el mailbox correcto
@@ -491,7 +525,11 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             logger.error(f"Error al enviar notificación para el ticket {task.id} al agente {task.assignee.email}")
             
     except Exception as e:
-        logger.error(f"Error inesperado al enviar notificación para el ticket {task.id}: {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error sending assignment notification for ticket {task.id}: {e}",
+            extra={"task_id": task.id, "assignee_id": task.assignee_id},
+            exc_info=True
+        )
 
 
 async def send_team_notification(db: Session, task: Task, request_origin: Optional[str] = None):
@@ -561,7 +599,11 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
                 refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
                 current_access_token = refreshed_ms_token.access_token
             except Exception as e:
-                logger.error(f"Error al refrescar token para enviar notificación de equipo: {e}")
+                logger.error(
+                    f"Error refreshing token for team notification: {e}",
+                    extra={"task_id": task.id, "mailbox_email": preferred_mailbox.email},
+                    exc_info=True
+                )
                 return
         
         # Enviar notificación a cada miembro del equipo
@@ -586,7 +628,15 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
                     logger.error(f"Failed to send team notification to {team_member.agent.email} for ticket {task.id}")
                     
             except Exception as e:
-                logger.error(f"Error sending team notification to {team_member.agent.email}: {str(e)}")
+                logger.error(
+                    f"Error sending team notification to {team_member.agent.email}: {e}",
+                    extra={"task_id": task.id, "team_id": task.team_id, "agent_email": team_member.agent.email},
+                    exc_info=True
+                )
                 
     except Exception as e:
-        logger.error(f"Error inesperado al enviar notificaciones de equipo para el ticket {task.id}: {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error sending team notifications for ticket {task.id}: {e}",
+            extra={"task_id": task.id, "team_id": task.team_id},
+            exc_info=True
+        )

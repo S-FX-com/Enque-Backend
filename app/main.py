@@ -9,9 +9,11 @@ from typing import Optional
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from app.core.rate_limiter import limiter
 
 from app.api.api import api_router
-from app.core.middleware import CacheMiddleware
 from app.core.config import settings
 from app.core.socketio import sio
 
@@ -42,10 +44,23 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json" if settings.API_V1_STR else "/openapi.json"
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Add CORS middleware
+# Construct a regex for allowed origins to handle wildcards
+origins = settings.BACKEND_CORS_ORIGINS
+regex_parts = []
+for origin in origins:
+    # Escape dots and replace wildcard * with a regex pattern for subdomains
+    part = origin.replace('.', r'\.').replace('*', r'[a-zA-Z0-9-]+')
+    regex_parts.append(part)
+origin_regex = r"|".join(regex_parts)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],  # Must be empty when using allow_origin_regex
+    allow_origin_regex=origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,7 +68,6 @@ app.add_middleware(
 
 # Add custom middlewares
 app.add_middleware(HealthMiddleware)
-app.add_middleware(CacheMiddleware)
 
 # Include API router
 app.include_router(api_router, prefix=settings.API_V1_STR)
@@ -105,14 +119,56 @@ async def health_check_detailed():
             "error": str(e)
         }
 
+async def warm_up_cache():
+    """Pre-loads frequently accessed data into the cache."""
+    logger.info("🔥 Starting cache warming process...")
+    try:
+        from app.services.cache_service import cache_service
+        from app.database.session import SessionLocal
+        from app.models.agent import Agent
+
+        await cache_service.connect()
+        if not cache_service.is_redis_connected:
+            logger.warning("Cache warming skipped: Redis is not connected.")
+            return
+
+        db = SessionLocal()
+        try:
+            active_agents = db.query(Agent).filter(Agent.is_active == True).all()
+            count = 0
+            for agent in active_agents:
+                cache_key = f"user_agent:{agent.id}"
+                user_data_for_cache = {
+                    "id": agent.id,
+                    "name": agent.name,
+                    "email": agent.email,
+                    "role": agent.role,
+                    "workspace_id": agent.workspace_id,
+                    "is_active": agent.is_active,
+                    "avatar_url": agent.avatar_url
+                }
+                await cache_service.set(cache_key, user_data_for_cache, ttl=3600)  # Cache for 1 hour
+                count += 1
+            logger.info(f"✅ Cache warming complete. {count} active agents cached.")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"❌ Failed to warm up cache: {e}", exc_info=True)
+
+
 @app.on_event("startup")
-def startup_event():
-    """Initialize email sync scheduler on startup"""
+async def startup_event():
+    """Initialize services on startup."""
+    # Start cache warming in the background
+    import asyncio
+    asyncio.create_task(warm_up_cache())
+
+    # Initialize email sync scheduler
     try:
         from app.services.email_sync_task import start_scheduler
         start_scheduler()
     except ImportError:
-        logger.warning("⚠️ Email sync scheduler not available (missing dependencies)")
+        logger.warning("⚠️ Email sync scheduler not available (missing dependencies).")
     except Exception as e:
         logger.error(f"❌ Failed to start email sync scheduler: {e}")
 

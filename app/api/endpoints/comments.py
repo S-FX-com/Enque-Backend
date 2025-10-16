@@ -23,6 +23,7 @@ from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
 from app.core.socketio import emit_comment_update_sync
 from app.core.config import settings
+from app.core.exceptions import MicrosoftAPIException, DatabaseException
 from app.services.workflow_service import WorkflowService
 from app.services.s3_service import get_s3_service
 from app.utils.image_processor import extract_base64_images
@@ -53,7 +54,7 @@ async def read_comments(
     start_time = time.time()
     pass
     permissions_start = time.time()
-    task = db.query(TaskModel).filter(
+    task = db.query(TaskModel).options(joinedload(TaskModel.user)).filter(
         TaskModel.id == task_id,
         TaskModel.workspace_id == current_user.workspace_id,
         TaskModel.is_deleted == False
@@ -267,55 +268,53 @@ async def create_comment(
     task.last_update = datetime.utcnow()  # Use import
     db.add(task)
 
+    # Check if primary contact needs to be updated based on the new "To" list
+    if not comment_in.is_private and comment_in.to_recipients is not None:
+        current_primary_email = task.user.email.lower() if task.user and task.user.email else None
+        new_to_emails_lower = [email.strip().lower() for email in to_recipients]
+
+        if current_primary_email and current_primary_email not in new_to_emails_lower:
+            logger.info(f"Primary contact {current_primary_email} was removed from TO list for ticket {task_id}.")
+            
+            if new_to_emails_lower:
+                # Set the first recipient as the new primary contact
+                new_primary_email = to_recipients[0] # Use original casing
+                
+                new_primary_user = db.query(User).filter(
+                    User.email.ilike(new_primary_email),
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+
+                if new_primary_user:
+                    task.user_id = new_primary_user.id
+                    logger.info(f"Changed primary contact for ticket {task_id} to {new_primary_email} (User ID: {new_primary_user.id})")
+                else:
+                    logger.warning(f"Could not find existing user for new primary contact: {new_primary_email}. Primary contact will not be changed automatically.")
+            else:
+                # TO list is empty, so remove primary contact
+                task.user_id = None
+                logger.info(f"Removed primary contact for ticket {task_id} as TO list is empty.")
+            db.add(task)
+
     # Update TO recipients on ticket
-    if to_recipients and not comment_in.is_private:
-        existing_to = []
-        if task.to_recipients:
-            existing_to = [email.strip() for email in task.to_recipients.split(",") if email.strip()]
-
-        all_to = existing_to.copy()
-        for new_to in to_recipients:
-            if new_to not in all_to:
-                all_to.append(new_to)
-
-        if all_to:
-            task.to_recipients = ", ".join(all_to)
-            logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
-
+    if comment_in.to_recipients is not None and not comment_in.is_private:
+        # Overwrite the existing to_recipients with the new list from the frontend
+        task.to_recipients = ", ".join(to_recipients)
+        logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
         db.add(task)
 
     # Update CC recipients on ticket
-    if cc_recipients and not comment_in.is_private:
-        existing_cc = []
-        if task.cc_recipients:
-            existing_cc = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
-
-        all_cc = existing_cc.copy()
-        for new_cc in cc_recipients:
-            if new_cc not in all_cc:
-                all_cc.append(new_cc)
-
-        if all_cc:
-            task.cc_recipients = ", ".join(all_cc)
-            logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
-
+    if comment_in.other_destinaries is not None and not comment_in.is_private:
+        # Overwrite the existing cc_recipients with the new list from the frontend
+        task.cc_recipients = ", ".join(cc_recipients)
+        logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
         db.add(task)
 
     # Update BCC recipients on ticket
-    if bcc_recipients and not comment_in.is_private:
-        existing_bcc = []
-        if task.bcc_recipients:
-            existing_bcc = [email.strip() for email in task.bcc_recipients.split(",") if email.strip()]
-
-        all_bcc = existing_bcc.copy()
-        for new_bcc in bcc_recipients:
-            if new_bcc not in all_bcc:
-                all_bcc.append(new_bcc)
-
-        if all_bcc:
-            task.bcc_recipients = ", ".join(all_bcc)
-            logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
-
+    if comment_in.bcc_recipients is not None and not comment_in.is_private:
+        # Overwrite the existing bcc_recipients with the new list from the frontend
+        task.bcc_recipients = ", ".join(bcc_recipients)
+        logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
         db.add(task)
 
     content_to_store = comment_in.content
@@ -881,42 +880,51 @@ def send_email_in_background(
     processed_attachment_ids: list,
     db_path: str
 ):
-    import time
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker, joinedload
     from app.models.task import Task as TaskModel
-    from app.models.scheduled_comment import ScheduledComment as ScheduledCommentModel
     from app.models.agent import Agent as AgentModel
     from app.models.microsoft import MailboxConnection
     from app.services.microsoft_service import get_microsoft_service
+
     engine = create_engine(db_path)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = SessionLocal()
+    task_with_user = None
 
     try:
         agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
         if not agent:
+            logger.warning(f"Background email task: Agent {agent_id} not found.")
             return
         if is_private:
+            logger.info(f"Background email task: Comment {comment_id} is private, skipping email.")
             return
+
         db.expire_all()
         task_with_user = db.query(TaskModel).options(
             joinedload(TaskModel.user)
         ).filter(TaskModel.id == task_id).first()
 
         if not task_with_user:
+            logger.warning(f"Background email task: Task {task_id} not found.")
             return
-        if task_with_user.user:
-            pass
-        else:
-            pass
 
         if task_with_user.mailbox_connection_id:
-            logger.info(f"🔍 DEBUG: Background task received to_recipients: {to_recipients}")
+            logger.info(f"Background email task: Sending reply for task {task_id} via connected mailbox {task_with_user.mailbox_connection_id}")
             microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_reply_email(task_id=task_id, reply_content=comment_content, agent=agent, attachment_ids=processed_attachment_ids, to_recipients=to_recipients, cc_recipients=cc_recipients, bcc_recipients=bcc_recipients)
+            microsoft_service.send_reply_email(
+                task_id=task_id,
+                reply_content=comment_content,
+                agent=agent,
+                attachment_ids=processed_attachment_ids,
+                to_recipients=to_recipients,
+                cc_recipients=cc_recipients,
+                bcc_recipients=bcc_recipients
+            )
         else:
             if not task_with_user.user or not task_with_user.user.email:
+                logger.warning(f"Background email task: No user or user email for task {task_id}. Cannot send new email.")
                 return
 
             recipient_email = task_with_user.user.email
@@ -926,6 +934,7 @@ def send_email_in_background(
             ).first()
 
             if not sender_mailbox_conn:
+                logger.warning(f"Background email task: No active mailbox for workspace {task_with_user.workspace_id}.")
                 return
 
             sender_mailbox = sender_mailbox_conn.email
@@ -933,7 +942,7 @@ def send_email_in_background(
             html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
 
             microsoft_service = get_microsoft_service(db)
-            email_sent = microsoft_service.send_new_email(
+            microsoft_service.send_new_email(
                 mailbox_email=sender_mailbox,
                 recipient_email=recipient_email,
                 subject=subject,
@@ -943,11 +952,32 @@ def send_email_in_background(
                 cc_recipients=cc_recipients,
                 bcc_recipients=bcc_recipients
             )
-            if not email_sent:
-                pass
+        logger.info(f"✅ Successfully sent email for comment {comment_id} on task {task_id}")
 
+    except (MicrosoftAPIException, DatabaseException) as e:
+        workspace_id = task_with_user.workspace_id if task_with_user else None
+        logger.error(
+            f"Error sending email in background for comment {comment_id}: {e}",
+            extra={
+                "comment_id": comment_id,
+                "task_id": task_id,
+                "workspace_id": workspace_id,
+                "error_type": type(e).__name__
+            },
+            exc_info=True
+        )
     except Exception as e:
-        pass
+        workspace_id = task_with_user.workspace_id if task_with_user else None
+        logger.error(
+            f"An unexpected error occurred in send_email_in_background for comment {comment_id}: {e}",
+            extra={
+                "comment_id": comment_id,
+                "task_id": task_id,
+                "workspace_id": workspace_id,
+                "error_type": type(e).__name__
+            },
+            exc_info=True
+        )
     finally:
         db.close()
 

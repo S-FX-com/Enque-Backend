@@ -3,32 +3,34 @@ from typing import Dict, Set
 import logging
 import json
 from app.utils.logger import logger
+from app.core.config import settings
+async_mgr = None
+sync_mgr = None
+if settings.REDIS_URL:
+    async_mgr = socketio.AsyncRedisManager(settings.REDIS_URL, channel='socketio')
+    sync_mgr = socketio.RedisManager(settings.REDIS_URL, channel='socketio', write_only=True)
+    logger.info("✅ Socket.IO configured with RedisManager for scaling.")
+else:
+    logger.warning("⚠️ REDIS_URL not set. Socket.IO will not scale across multiple workers.")
 
-# Configurar Socket.IO server con logging MÍNIMO
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins="*",
-    logger=False,  # Desactivar logging interno
-    engineio_logger=False,  # Desactivar engine logging
+    client_manager=async_mgr,
+    logger=False,
+    engineio_logger=False,
     ping_timeout=20,
     ping_interval=10
 )
 
-# Almacenar conexiones por workspace
-workspace_connections: Dict[int, Set[str]] = {}
-
 @sio.event
 async def connect(sid, environ, auth):
-    """Manejar nueva conexión"""
+    """Handle new connection and assign to workspace room."""
     try:
-        # Socket connection attempt
-        
-        # Obtener workspace_id del auth o query params
         workspace_id = None
         if auth and isinstance(auth, dict):
             workspace_id = auth.get('workspace_id')
         
-        # También intentar obtener del query string
         if not workspace_id and 'QUERY_STRING' in environ:
             query_string = environ['QUERY_STRING']
             if 'workspace_id=' in query_string:
@@ -38,38 +40,18 @@ async def connect(sid, environ, auth):
                     pass
         
         if workspace_id:
-            # Agregar conexión al workspace
-            if workspace_id not in workspace_connections:
-                workspace_connections[workspace_id] = set()
-            workspace_connections[workspace_id].add(sid)
-            
-            # Unir al room del workspace
             sio.enter_room(sid, f'workspace_{workspace_id}')
-            
-            # Socket connected successfully
+            logger.debug(f"Socket {sid} connected and joined workspace {workspace_id}")
         else:
-            logger.warning(f"⚠️ Socket {sid} connected without workspace_id")
+            logger.warning(f"Socket {sid} connected without a workspace_id.")
             
     except Exception as e:
-        logger.error(f"❌ Error in socket connect: {str(e)}")
+        logger.error(f"Error in socket connect: {e}", exc_info=True)
 
 @sio.event
 async def disconnect(sid):
-    """Manejar desconexión"""
-    try:
-        # Socket disconnect
-        
-        # Remover de todos los workspaces
-        for workspace_id, connections in workspace_connections.items():
-            if sid in connections:
-                connections.remove(sid)
-                sio.leave_room(sid, f'workspace_{workspace_id}')
-                break
-                
-    except Exception as e:
-        logger.error(f"❌ Error in socket disconnect: {str(e)}")
-
-# Funciones para emitir eventos
+    """Handle disconnection."""
+    logger.debug(f"Socket {sid} disconnected.")
 async def emit_new_ticket(workspace_id: int, ticket_data: dict):
     """Emitir evento de nuevo ticket"""
     try:
@@ -114,83 +96,43 @@ async def emit_team_update(workspace_id: int, team_data: dict):
         logger.info(f"📤 Emitted team_updated to workspace {workspace_id}")
     except Exception as e:
         logger.error(f"❌ Error emitting team_updated: {str(e)}")
-
-# Evento de debug para verificar conexión
 @sio.event
 async def ping(sid, data):
     """Responder a ping del cliente"""
     await sio.emit('pong', {'message': 'Connection is working!'}, room=sid)
 
-def get_workspace_connections_count(workspace_id: int) -> int:
-    """Obtener número de conexiones activas para un workspace"""
-    return len(workspace_connections.get(workspace_id, set()))
-
-# ✅ FUNCIÓN SÍNCRONA para usar en contextos como email sync
 def emit_comment_update_sync(workspace_id: int, comment_data: dict):
-    """Emitir evento de comentario de forma síncrona (para email sync)"""
+    """Emit comment update event from a synchronous context."""
+    if not sync_mgr:
+        logger.warning("Cannot emit sync event: RedisManager not configured.")
+        return
     try:
-        import asyncio
-        
-        # Intentar obtener el event loop actual
-        try:
-            loop = asyncio.get_running_loop()
-            # Si hay un loop corriendo, usar create_task
-            loop.create_task(emit_comment_update(workspace_id, comment_data))
-        except RuntimeError:
-            # No hay loop corriendo, crear uno nuevo
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(emit_comment_update(workspace_id, comment_data))
-            finally:
-                loop.close()
-                
-        # Comment update queued
+        room = f'workspace_{workspace_id}'
+        sync_mgr.emit('comment_updated', comment_data, room=room)
+        logger.info(f"📤 Queued sync emit 'comment_updated' to workspace {workspace_id}")
     except Exception as e:
-        logger.error(f"❌ Error in sync emit comment_updated: {str(e)}")
+        logger.error(f"Error in sync emit comment_updated: {e}", exc_info=True)
 
 def emit_new_ticket_sync(workspace_id: int, ticket_data: dict):
-    """Emitir evento de nuevo ticket de forma síncrona (para email sync)"""
+    """Emit new ticket event from a synchronous context."""
+    if not sync_mgr:
+        logger.warning("Cannot emit sync event: RedisManager not configured.")
+        return
     try:
-        import asyncio
-        
-        # Intentar obtener el event loop actual
-        try:
-            loop = asyncio.get_running_loop()
-            # Si hay un loop corriendo, usar create_task
-            loop.create_task(emit_new_ticket(workspace_id, ticket_data))
-        except RuntimeError:
-            # No hay loop corriendo, crear uno nuevo
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(emit_new_ticket(workspace_id, ticket_data))
-            finally:
-                loop.close()
-                
-        # New ticket queued
+        room = f'workspace_{workspace_id}'
+        sync_mgr.emit('new_ticket', ticket_data, room=room)
+        logger.info(f"📤 Queued sync emit 'new_ticket' to workspace {workspace_id}")
     except Exception as e:
-        logger.error(f"❌ Error in sync emit new_ticket: {str(e)}")
+        logger.error(f"Error in sync emit new_ticket: {e}", exc_info=True)
 
 def emit_ticket_update_sync(workspace_id: int, ticket_data: dict):
-    """Emitir evento de actualización de ticket de forma síncrona (para mejor rendimiento)"""
+    """Emit ticket update event from a synchronous context."""
+    if not sync_mgr:
+        logger.warning("Cannot emit sync event: RedisManager not configured.")
+        return
     try:
-        import asyncio
-        
-        # Intentar obtener el event loop actual
-        try:
-            loop = asyncio.get_running_loop()
-            # Si hay un loop corriendo, usar create_task
-            loop.create_task(emit_ticket_update(workspace_id, ticket_data))
-        except RuntimeError:
-            # No hay loop corriendo, crear uno nuevo
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(emit_ticket_update(workspace_id, ticket_data))
-            finally:
-                loop.close()
-                
-        # Ticket update queued
+        room = f'workspace_{workspace_id}'
+        sync_mgr.emit('ticket_updated', ticket_data, room=room)
+        logger.info(f"📤 Queued sync emit 'ticket_updated' to workspace {workspace_id}")
     except Exception as e:
-        logger.error(f"❌ Error in sync emit ticket_updated: {str(e)}") 
+        logger.error(f"Error in sync emit ticket_updated: {e}", exc_info=True)

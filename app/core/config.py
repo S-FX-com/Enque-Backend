@@ -23,7 +23,8 @@ class Settings(BaseSettings):
         raise ValueError(v)
 
     # JWT Configuration
-    JWT_SECRET: str = "temporarysecret"  # Valor predeterminado temporal
+    JWT_SECRET: str  # This is now a required environment variable
+    ENCRYPTION_KEY: str  # Required for encrypting sensitive data in the DB
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     AGENT_INVITATION_TOKEN_EXPIRE_HOURS: int = 72 # Agent invitation token validity in hours

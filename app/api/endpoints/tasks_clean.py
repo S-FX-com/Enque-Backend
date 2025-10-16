@@ -19,6 +19,7 @@ from app.services.automation_service import execute_automations_for_ticket
 from datetime import datetime
 from app.core.config import settings
 from app.core.socketio import emit_new_ticket, emit_ticket_update, emit_ticket_deleted, emit_comment_update
+from app.services.cache_service import cache_service
 router = APIRouter()
 @router.get("/", response_model=List[TaskWithDetails])
 async def read_tasks(
@@ -320,13 +321,26 @@ async def update_task_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
         )
+    
+    workspace_id = task.workspace_id
     origin = request.headers.get("origin") or settings.FRONTEND_URL
     updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
+    
     if not updated_task_dict:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task update failed",
         )
+
+    # --- Cache Invalidation ---
+    try:
+        await cache_service.invalidate_ticket_cache(task_id, workspace_id)
+        await cache_service.delete_pattern(f"tasks:workspace:{workspace_id}*") # Invalidate list caches
+        logger.info(f"Cache invalidated for ticket {task_id} in workspace {workspace_id}")
+    except Exception as e:
+        logger.error(f"Failed to invalidate cache for ticket {task_id}: {str(e)}")
+    # --- End Cache Invalidation ---
+
     updated_task_obj = db.query(Task).options(
         selectinload(Task.workspace),
         selectinload(Task.team),
