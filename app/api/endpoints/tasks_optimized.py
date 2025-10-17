@@ -2,20 +2,226 @@ from typing import Any, List, Optional
 import time
 import logging
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
-from sqlalchemy.orm import Session, noload
+from sqlalchemy.orm import Session, noload, joinedload
 from sqlalchemy import or_, and_, func, String
 
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
-from app.models.task import Task
+from app.models.task import Task, TicketBody
 from app.models.agent import Agent
-from app.schemas.task import Task as TaskSchema, TaskWithDetails, TicketUpdate
+from app.models.user import User
+from app.models.comment import Comment as CommentModel
+from app.schemas.task import Task as TaskSchema, TaskWithDetails, TicketUpdate, TicketCreate, TicketMergeRequest, TicketMergeResponse
 from app.models.microsoft import mailbox_team_assignments
+from app.models.activity import Activity
+from app.utils.logger import logger
+from app.services.ticket_merge_service import TicketMergeService
+from app.services.automation_service import execute_automations_for_ticket
+from app.core.socketio import emit_new_ticket, emit_ticket_deleted
+from app.services.s3_service import get_s3_service
+from app.services.microsoft_service import MicrosoftGraphService
+from app.utils.image_processor import extract_base64_images
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+@router.post("/", response_model=TaskSchema)
+async def create_task(
+    task_in: TicketCreate, # Use the renamed schema TicketCreate
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Create a new task. All roles can create tasks.
+    """
+    # Create the task
+    task = Task(
+        title=task_in.title,
+        description=task_in.description,
+        status=task_in.status,
+        priority=task_in.priority,
+        assignee_id=task_in.assignee_id,
+        team_id=task_in.team_id,
+        due_date=task_in.due_date,
+        sent_from_id=current_user.id, # Automatically set the current user as the sender
+        sent_to_id=task_in.sent_to_id,
+        user_id=task_in.user_id,
+        company_id=task_in.company_id,
+        workspace_id=current_user.workspace_id, # Use the workspace from current user
+        category_id=task_in.category_id # Use the category from input
+    )
+    
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    # --- Execute Automations ---
+    try:
+        # Load the task with all relationships needed for automation conditions
+        task_with_relations = db.query(Task).options(
+            joinedload(Task.user),
+            joinedload(Task.assignee),
+            joinedload(Task.company),
+            joinedload(Task.category),
+            joinedload(Task.team)
+        ).filter(Task.id == task.id).first()
+        
+        if task_with_relations:
+            executed_actions = execute_automations_for_ticket(db, task_with_relations)
+            if executed_actions:
+                logger.info(f"Automations executed for ticket {task.id}: {executed_actions}")
+                # Refresh the task to get updated values from automations
+                db.refresh(task)
+        
+    except Exception as automation_error:
+        logger.error(f"Error executing automations for ticket {task.id}: {str(automation_error)}", exc_info=True)
+        # Don't fail ticket creation if automations fail
+    # --- End Execute Automations ---
+
+    # --- Log Activity ---
+    try:
+        activity = Activity(
+            agent_id=current_user.id, # Use the ID of the authenticated agent/admin
+            action="created", # Consistent action string for creation
+            source_type="Ticket",
+            source_id=task.id,
+            workspace_id=task.workspace_id # Get workspace_id from the created task
+        )
+        db.add(activity)
+        db.commit()
+        logger.info(f"Activity logged for ticket creation: {task.id} by agent {current_user.id}")
+    except Exception as e:
+        logger.error(f"Failed to log activity for ticket creation {task.id}: {str(e)}")
+        db.rollback() # Rollback activity commit if it failed
+    # --- End Activity Log ---
+
+    # --- Assignment Notification ---
+    if task.assignee_id:
+        try:
+            # Load the assignee
+            task.assignee = db.query(Agent).filter(Agent.id == task.assignee_id).first()
+
+            request_origin = None
+            if request:
+                # Get the origin of the request (Frontend URL)
+                request_origin = str(request.headers.get("origin", ""))
+                logger.info(f"Request origin detected for notification: {request_origin}")
+            
+            # Send notification email to the assigned agent
+            from app.services.task_service import send_assignment_notification
+            await send_assignment_notification(db, task, request_origin)
+        except Exception as e:
+            logger.error(f"Failed to send assignment notification for task {task.id}: {str(e)}")
+    # --- End Assignment Notification ---
+
+    # --- Socket.IO Event ---
+    try:
+        # Emit new ticket event to all workspace clients
+        task_data = {
+            'id': task.id,
+            'title': task.title,
+            'status': task.status,
+            'priority': task.priority,
+            'workspace_id': task.workspace_id,
+            'assignee_id': task.assignee_id,
+            'team_id': task.team_id,
+            'user_id': task.user_id,
+            'created_at': task.created_at.isoformat() if task.created_at else None
+        }
+        await emit_new_ticket(task.workspace_id, task_data)
+    except Exception as e:
+        logger.error(f"Failed to emit new_ticket event for task {task.id}: {str(e)}")
+    # --- End Socket.IO Event ---
+
+    # --- Email Sending Logic ---
+    try:
+        # Get the user associated with the task
+        user = db.query(User).filter(User.id == task.user_id).first()
+        if user and user.email:
+            recipient_email = user.email
+            logger.info(f"Recipient email found: {recipient_email}")
+            
+            # Get the mailbox connections associated with the current workspace
+            from app.models.microsoft import MailboxConnection
+            mailbox = db.query(MailboxConnection).filter(
+                MailboxConnection.workspace_id == current_user.workspace_id
+            ).first()
+            
+            if not mailbox:
+                logger.warning(f"No mailbox connection found for workspace {current_user.workspace_id}. Cannot send email.")
+            else:
+                sender_mailbox = mailbox.email
+                # Prepare email content - Use only the task title as the subject
+                subject = task.title
+                # Use the description as the HTML body (assuming it's HTML from Tiptap)
+                html_body = task.description
+
+                # Get Microsoft Service instance
+                from app.services.microsoft_service import MicrosoftGraphService
+                microsoft_service = MicrosoftGraphService(db=db)
+
+                # Send the email
+                logger.info(f"Attempting to send new ticket email for task {task.id} from {sender_mailbox} to {recipient_email}")
+                email_sent = microsoft_service.send_new_email(
+                    mailbox_email=sender_mailbox,
+                    recipient_email=recipient_email,
+                    subject=subject,
+                    html_body=html_body,
+                    task_id=task.id  # Pass the task ID to include in the subject
+                )
+                if not email_sent:
+                    logger.error(f"Failed to send new ticket email for task {task.id}")
+                else:
+                    logger.info(f"Successfully sent new ticket email for task {task.id}")
+
+    except Exception as email_error:
+        logger.error(f"Error trying to send email for newly created ticket {task.id}: {str(email_error)}", exc_info=True)
+        # Do not raise an exception here, ticket creation succeeded, email is secondary
+    # --- End Email Logic ---
+
+    return task
+
+@router.delete("/{task_id}")
+async def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Delete a task. All roles can delete tasks.
+    """
+    task = db.query(Task).filter(
+        Task.id == task_id,
+        Task.workspace_id == current_user.workspace_id
+    ).first()
+    
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+
+    workspace_id = task.workspace_id  # Store workspace_id before deletion
+    
+    # Mark as deleted instead of actual deletion
+    task.is_deleted = True
+    db.commit()
+
+    # --- Socket.IO Event ---
+    try:
+        # Emit ticket deleted event to all workspace clients
+        await emit_ticket_deleted(workspace_id, task_id)
+    except Exception as e:
+        logger.error(f"Failed to emit ticket_deleted event for task {task_id}: {str(e)}")
+    # --- End Socket.IO Event ---
+
+    return {"message": "Task deleted successfully"}
+
 @router.get("/", response_model=List[TaskSchema])
 async def read_tasks_optimized_default(
     db: Session = Depends(get_db),
@@ -229,44 +435,67 @@ async def read_team_tasks_optimized(
     return tasks
 
 
-@router.get("/search", response_model=List[TaskSchema])
-async def search_tasks_optimized(
-    q: str = Query(..., description="Término de búsqueda"),
+@router.get("/search", response_model=List[TaskWithDetails])
+async def search_tickets(
+    q: str = Query(..., description="Search term to find in ticket title, description, body, or ticket ID"),
     db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 30,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
-
-    start_time = time.time()
-    
-    # Consulta optimizada de búsqueda
-    query = db.query(Task).filter(
+    """
+    Search for tickets containing the search term in title, description, body, or by ticket ID.
+    If the search query is numeric, it will search by ticket ID first, then by text.
+    """
+    base_query = db.query(Task).filter(
         Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False,
-        or_(
-            Task.title.ilike(f"%{q}%"),
-            Task.description.ilike(f"%{q}%"),
-            Task.body.ilike(f"%{q}%"),
-            func.cast(Task.id, String).ilike(f"%{q}%")
+        Task.is_deleted == False
+    )
+    
+    # Check if query is numeric (ticket ID search)
+    if q.strip().isdigit():
+        ticket_id = int(q.strip())
+        # Search by exact ticket ID first
+        id_query = base_query.filter(Task.id == ticket_id)
+        id_query = id_query.options(
+            joinedload(Task.sent_from),
+            joinedload(Task.sent_to),
+            joinedload(Task.assignee),
+            joinedload(Task.user),
+            joinedload(Task.team),
+            joinedload(Task.company),
+            joinedload(Task.category),
+            joinedload(Task.body)
         )
-    ).options(
-        noload(Task.workspace),
-        noload(Task.assignee),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.user),
-        noload(Task.category),
-        noload(Task.comments),
-    ).offset(skip).limit(limit)
+        tickets = id_query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+        
+        # If found by ID, return immediately
+        if tickets:
+            return tickets
     
-    query_start = time.time()
-    tasks = query.all()
-    query_time = time.time() - query_start
+    # Text search (original logic)
+    search_term = f"%{q}%"
+    query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
+        or_(
+            Task.title.ilike(search_term),
+            Task.description.ilike(search_term),
+            TicketBody.email_body.ilike(search_term)
+        )
+    )
     
-    total_time = time.time() - start_time
+    query = query.options(
+        joinedload(Task.sent_from),
+        joinedload(Task.sent_to),
+        joinedload(Task.assignee),
+        joinedload(Task.user),
+        joinedload(Task.team),
+        joinedload(Task.company),
+        joinedload(Task.category),
+        joinedload(Task.body)
+    )
     
-    return tasks
+    tickets = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    return tickets
 
 
 @router.get("/count")
@@ -400,604 +629,16 @@ async def get_tasks_stats(
     return {**result, "query_time_ms": round(query_time * 1000, 2)}
 
 
-@router.get("/{task_id}/fast", response_model=TaskWithDetails)
-async def read_single_task_optimized(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-
-    start_time = time.time()
-    
-    exists_start = time.time()
-    from sqlalchemy import exists as sql_exists
-    
-    ticket_exists = db.query(
-        sql_exists().where(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        )
-    ).scalar()
-    
-    exists_time = time.time() - exists_start
-
-    if exists_time > 0.005:  
-        pass
-    
-    if not ticket_exists:
-        total_time = time.time() - start_time
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    query_start = time.time()
-    
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).options(
-
-        noload(Task.workspace),
-        noload(Task.assignee),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.team),
-        noload(Task.user),
-        noload(Task.company),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection),
-        noload(Task.category),
-        noload(Task.merged_by_agent)
-    ).first()
-    
-    query_time = time.time() - query_start
-    
-    if not task:
-        total_time = time.time() - start_time
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    content_analysis_start = time.time()
-    title_size = len(task.title) if task.title else 0
-    description_size = len(task.description) if task.description else 0
-    content_analysis_time = time.time() - content_analysis_start
-    
-    total_time = time.time() - start_time
-    
-    return TaskWithDetails.from_orm(task)
-
-
-@router.get("/{task_id}/cached", response_model=TaskWithDetails)
-async def read_single_task_with_cache(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-    force_refresh: bool = False
-) -> Any:
-
-    start_time = time.time()
-    logger.info(f"🎯 CACHED: Iniciando carga con caché para ticket {task_id} (force_refresh={force_refresh})")
-
-    cached_data = None
-    if not force_refresh:
-        try:
-            from app.services.cache_service import cache_service
-            cache_start = time.time()
-            cached_data = await cache_service.get_cached_ticket_data(task_id, current_user.workspace_id)
-            cache_time = time.time() - cache_start
-            
-            if cached_data:
-                total_time = time.time() - start_time
-                pass
-                
-                task = Task(**cached_data)
-
-                return TaskWithDetails.from_orm(task)
-                
-        except Exception as e:
-            logger.warning(f"Error accediendo caché para ticket {task_id}: {e}")
-
-    logger.info(f"💫 CACHE MISS: Consultando base de datos para ticket {task_id}")
-    
-    db_start = time.time()
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).options(
-
-        noload(Task.workspace),
-        noload(Task.assignee),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.team),
-        noload(Task.user),
-        noload(Task.company),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection),
-        noload(Task.category),
-        noload(Task.merged_by_agent)
-    ).first()
-    
-    db_time = time.time() - db_start
-    
-    if not task:
-        total_time = time.time() - start_time
-        logger.warning(f"❌ CACHED: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    try:
-        from app.services.cache_service import cache_service
-        cache_start = time.time()
-
-        task_dict = {
-            'id': task.id,
-            'title': task.title,
-            'description': task.description,
-            'status': task.status,
-            'priority': task.priority,
-            'assignee_id': task.assignee_id,
-            'team_id': task.team_id,
-            'due_date': task.due_date,
-            'created_at': task.created_at,
-            'updated_at': task.updated_at,
-            'last_update': task.last_update,
-            'sent_from_id': task.sent_from_id,
-            'sent_to_id': task.sent_to_id,
-            'user_id': task.user_id,
-            'company_id': task.company_id,
-            'workspace_id': task.workspace_id,
-            'is_deleted': task.is_deleted,
-            'deleted_at': task.deleted_at,
-            'is_read': task.is_read,
-            'mailbox_connection_id': task.mailbox_connection_id,
-            'category_id': task.category_id,
-            'email_message_id': task.email_message_id,
-            'email_conversation_id': task.email_conversation_id,
-            'email_sender': task.email_sender
-        }
-        
-        await cache_service.cache_ticket_data(task_id, current_user.workspace_id, task_dict, ttl=300)
-        cache_time = time.time() - cache_start
-        
-        logger.info(f"💾 CACHED: Ticket {task_id} almacenado en caché")
-        
-    except Exception as e:
-        logger.warning(f"Error cacheando ticket {task_id}: {e}")
-        cache_time = 0
-
-    total_time = time.time() - start_time
-    pass
-
-    return TaskWithDetails.from_orm(task)
-
-
-@router.get("/{task_id}/essential", response_model=TaskWithDetails)
-async def read_single_task_essential_relations(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-
-    start_time = time.time()
-    exists_start = time.time()
-    ticket_exists = db.query(Task.id).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first() is not None
-    exists_time = time.time() - exists_start
-    
-    if not ticket_exists:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    from sqlalchemy.orm import joinedload
-    
-    task = db.query(Task).options(
-        joinedload(Task.assignee),  
-        joinedload(Task.user),      
-        joinedload(Task.category),  
-        noload(Task.workspace),
-        noload(Task.sent_from),
-        noload(Task.sent_to),
-        noload(Task.team),
-        noload(Task.company),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection),
-        noload(Task.merged_by_agent)
-    ).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first()
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return TaskWithDetails.from_orm(task)
-
-
-@router.put("/{task_id}/refresh", response_model=TaskWithDetails)
-async def update_task_optimized_for_refresh(
-    task_id: int,
-    task_in: TicketUpdate, 
-    request: Request,  
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-
-    from fastapi import Request as FastAPIRequest
-    from app.core.config import settings
-    from sqlalchemy.orm import joinedload
-    
-    refresh_start_time = time.time()
-
-    update_fields = [field for field, value in task_in.dict(exclude_unset=True).items() if value is not None]
-
-    fetch_start = time.time()
-    task = db.query(Task).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first()
-    fetch_time = time.time() - fetch_start
-    
-    if not task:
-        total_time = time.time() - refresh_start_time
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    service_start = time.time()
-    origin = request.headers.get("origin") or settings.FRONTEND_URL
-    from app.services.task_service import update_task
-    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
-    service_time = time.time() - service_start
-    
-    if not updated_task_dict:
-        total_time = time.time() - refresh_start_time
-        raise HTTPException(status_code=400, detail="Task update failed")
-
-    reload_start = time.time()
-    updated_task = db.query(Task).filter(Task.id == task_id).options(
-
-        joinedload(Task.assignee),  
-        joinedload(Task.user),      
-        joinedload(Task.sent_from), 
-        joinedload(Task.category),  
-
-        noload(Task.workspace),
-        noload(Task.sent_to),
-        noload(Task.team),
-        noload(Task.company),
-        noload(Task.comments),
-        noload(Task.email_mappings),
-        noload(Task.body),
-        noload(Task.mailbox_connection),
-        noload(Task.merged_by_agent)
-    ).first()
-    reload_time = time.time() - reload_start
-    
-    # 4. Socket.IO (más rápido)
-    socketio_start = time.time()
-    try:
-        task_data = {
-            'id': updated_task.id,
-            'title': updated_task.title,
-            'status': updated_task.status,
-            'priority': updated_task.priority,
-            'workspace_id': updated_task.workspace_id,
-            'assignee_id': updated_task.assignee_id,
-            'team_id': updated_task.team_id,
-            'user_id': updated_task.user_id,
-            'updated_at': updated_task.updated_at.isoformat() if updated_task.updated_at else None
-        }
-        
-        from app.core.socketio import emit_ticket_update_sync
-        emit_ticket_update_sync(updated_task.workspace_id, task_data)
-        socketio_time = time.time() - socketio_start
-        
-    except Exception as e:
-        socketio_time = time.time() - socketio_start
-        logger.warning(f"Socket.IO error en refresh optimizado: {e}")
-    
-    # 5. 📊 Performance summary
-    total_time = time.time() - refresh_start_time
-    
-    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas para mostrar contacto
-    return TaskWithDetails.from_orm(updated_task)
-
-
-@router.get("/{task_id}/performance-test")
-async def performance_comparison_test(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-
-    results = {}
-    
-    # Verificar que el ticket existe primero
-    exists_start = time.time()
-    ticket_exists = db.query(Task.id).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first() is not None
-    exists_time = time.time() - exists_start
-    
-    if not ticket_exists:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-
-    try:
-        method1_start = time.time()
-        task_fast = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            noload(Task.workspace), noload(Task.assignee), noload(Task.sent_from),
-            noload(Task.sent_to), noload(Task.team), noload(Task.user),
-            noload(Task.company), noload(Task.comments), noload(Task.email_mappings),
-            noload(Task.body), noload(Task.mailbox_connection), noload(Task.category),
-            noload(Task.merged_by_agent)
-        ).first()
-        method1_time = time.time() - method1_start
-        results['fast_no_relations'] = {
-            'time_ms': round(method1_time * 1000, 2),
-            'relations_loaded': 0,
-            'method': 'SIN relaciones (máxima velocidad)'
-        }
-        logger.info(f"✅ MÉTODO 1 (FAST): {method1_time*1000:.2f}ms - Sin relaciones")
-    except Exception as e:
-        logger.error(f"❌ MÉTODO 1 falló: {e}")
-        results['fast_no_relations'] = {'error': str(e)}
-
-    try:
-        method2_start = time.time()
-        task_essential = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            joinedload(Task.assignee), joinedload(Task.user), joinedload(Task.category),
-            noload(Task.workspace), noload(Task.sent_from), noload(Task.sent_to),
-            noload(Task.team), noload(Task.company), noload(Task.comments),
-            noload(Task.email_mappings), noload(Task.body), noload(Task.mailbox_connection),
-            noload(Task.merged_by_agent)
-        ).first()
-        method2_time = time.time() - method2_start
-        results['essential_relations'] = {
-            'time_ms': round(method2_time * 1000, 2),
-            'relations_loaded': 3,
-            'method': '3 relaciones esenciales (híbrido)'
-        }
-        logger.info(f"✅ MÉTODO 2 (ESSENTIAL): {method2_time*1000:.2f}ms - 3 relaciones")
-    except Exception as e:
-        logger.error(f"❌ MÉTODO 2 falló: {e}")
-        results['essential_relations'] = {'error': str(e)}
-
-    try:
-        method3_start = time.time()
-        task_full = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            joinedload(Task.workspace), joinedload(Task.sent_from), 
-            joinedload(Task.sent_to), joinedload(Task.assignee),
-            joinedload(Task.user), joinedload(Task.team),
-            joinedload(Task.company), joinedload(Task.category),
-            joinedload(Task.body), joinedload(Task.merged_by_agent)
-        ).first()
-        method3_time = time.time() - method3_start
-        results['full_relations'] = {
-            'time_ms': round(method3_time * 1000, 2),
-            'relations_loaded': 10,
-            'method': 'TODAS las relaciones (completo)'
-        }
-        logger.info(f"✅ MÉTODO 3 (FULL): {method3_time*1000:.2f}ms - 10 relaciones")
-    except Exception as e:
-        logger.error(f"❌ MÉTODO 3 falló: {e}")
-        results['full_relations'] = {'error': str(e)}
-
-    test_total_time = time.time() - exists_start
-    
-    pass
-    
-    valid_results = {k: v for k, v in results.items() if 'error' not in v}
-    if valid_results:
-        sorted_methods = sorted(valid_results.items(), key=lambda x: x[1]['time_ms'])
-        fastest_method, fastest_data = sorted_methods[0]
-        slowest_method, slowest_data = sorted_methods[-1]
-        
-        logger.info(f"🏆 FASTEST: {fastest_method} = {fastest_data['time_ms']}ms ({fastest_data['method']})")
-        logger.info(f"🐌 SLOWEST: {slowest_method} = {slowest_data['time_ms']}ms ({slowest_data['method']})")
-        
-        if len(sorted_methods) > 1:
-            improvement = ((slowest_data['time_ms'] - fastest_data['time_ms']) / slowest_data['time_ms']) * 100
-        
-        # Recomendaciones
-        if fastest_data['time_ms'] < 30:
-            pass
-        if slowest_data['time_ms'] > 150:
-            pass
-        
-        results['comparison_summary'] = {
-            'fastest_method': fastest_method,
-            'fastest_time_ms': fastest_data['time_ms'],
-            'slowest_method': slowest_method,
-            'slowest_time_ms': slowest_data['time_ms'],
-            'performance_improvement_percent': round(improvement, 1) if len(sorted_methods) > 1 else 0,
-            'recommendation': fastest_method
-        }
-    
-    results['test_metadata'] = {
-        'ticket_id': task_id,
-        'user_id': current_user.id,
-        'workspace_id': current_user.workspace_id,
-        'test_duration_ms': round(test_total_time * 1000, 2),
-        'timestamp': datetime.utcnow().isoformat()
-    }
-    
-    return {
-        'status': 'completed',
-        'ticket_id': task_id,
-        'results': results,
-        'message': 'Performance comparison test completed successfully'
-    } 
-
-
-@router.get("/{task_id}/smart")
-async def read_task_smart_optimization(
-    task_id: int,
-    db: Session = Depends(get_db),
-    current_user: Agent = Depends(get_current_active_user),
-) -> Any:
-
-    smart_start = time.time()
-    logger.info(f"🧠 SMART OPTIMIZATION: Iniciando análisis inteligente para ticket {task_id}")
-
-    analysis_start = time.time()
-    
-    # Verificar existencia con EXISTS optimizado
-    from sqlalchemy import exists as sql_exists
-    ticket_exists = db.query(
-        sql_exists().where(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        )
-    ).scalar()
-    
-    if not ticket_exists:
-        total_time = time.time() - smart_start
-        logger.warning(f"❌ SMART: Ticket {task_id} no encontrado en {total_time*1000:.2f}ms")
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    basic_data = db.query(
-        Task.id, Task.title, Task.description, 
-        Task.assignee_id, Task.user_id, Task.category_id,
-        Task.created_at
-    ).filter(
-        Task.id == task_id,
-        Task.workspace_id == current_user.workspace_id,
-        Task.is_deleted == False
-    ).first()
-    
-    analysis_time = time.time() - analysis_start
-    
-    # 2. 🧠 DECISIÓN INTELIGENTE basada en análisis
-    decision_start = time.time()
-    
-    # Calcular métricas para decisión
-    title_size = len(basic_data.title) if basic_data.title else 0
-    desc_size = len(basic_data.description) if basic_data.description else 0
-    total_content = title_size + desc_size
-    
-    has_assignee = basic_data.assignee_id is not None
-    has_user = basic_data.user_id is not None  
-    has_category = basic_data.category_id is not None
-    
-    relations_needed = sum([has_assignee, has_user, has_category])
-    
-    # 🎯 ALGORITMO DE DECISIÓN INTELIGENTE
-    if total_content < 100 and relations_needed == 0:
-        strategy = "ULTRA_FAST"
-        method = "Sin relaciones (contenido mínimo, sin datos relacionados)"
-    elif total_content < 500 and relations_needed <= 1:
-        strategy = "FAST"  
-        method = "Sin relaciones (contenido pequeño, pocas relaciones)"
-    elif relations_needed <= 3:
-        strategy = "ESSENTIAL"
-        method = "Relaciones esenciales (balance óptimo)"
-    else:
-        strategy = "SELECTIVE"
-        method = "Relaciones selectivas (muchas relaciones detectadas)"
-    
-    decision_time = time.time() - decision_start
-    
-    pass
-
-    execution_start = time.time()
-    
-    if strategy == "ULTRA_FAST":
-        # Máxima velocidad - sin relaciones
-        task = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            noload(Task.workspace), noload(Task.assignee), noload(Task.sent_from),
-            noload(Task.sent_to), noload(Task.team), noload(Task.user),
-            noload(Task.company), noload(Task.comments), noload(Task.email_mappings),
-            noload(Task.body), noload(Task.mailbox_connection), noload(Task.category),
-            noload(Task.merged_by_agent)
-        ).first()
-        
-    elif strategy == "FAST":
-        task = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            noload(Task.workspace), noload(Task.assignee), noload(Task.sent_from),
-            noload(Task.sent_to), noload(Task.team), noload(Task.user),
-            noload(Task.company), noload(Task.comments), noload(Task.email_mappings),
-            noload(Task.body), noload(Task.mailbox_connection), noload(Task.category),
-            noload(Task.merged_by_agent)
-        ).first()
-        
-    elif strategy == "ESSENTIAL":
-        from sqlalchemy.orm import joinedload
-        task = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            joinedload(Task.assignee) if has_assignee else noload(Task.assignee),
-            joinedload(Task.user) if has_user else noload(Task.user),
-            joinedload(Task.category) if has_category else noload(Task.category),
-            noload(Task.workspace), noload(Task.sent_from), noload(Task.sent_to),
-            noload(Task.team), noload(Task.company), noload(Task.comments),
-            noload(Task.email_mappings), noload(Task.body), noload(Task.mailbox_connection),
-            noload(Task.merged_by_agent)
-        ).first()
-        
-    else:  
-        from sqlalchemy.orm import joinedload
-        task = db.query(Task).filter(
-            Task.id == task_id,
-            Task.workspace_id == current_user.workspace_id,
-            Task.is_deleted == False
-        ).options(
-            joinedload(Task.assignee), joinedload(Task.user), joinedload(Task.category),
-            noload(Task.workspace), noload(Task.sent_from), noload(Task.sent_to),
-            noload(Task.team), noload(Task.company), noload(Task.comments),
-            noload(Task.email_mappings), noload(Task.body), noload(Task.mailbox_connection),
-            noload(Task.merged_by_agent)
-        ).first()
-    
-    execution_time = time.time() - execution_start
-    
-    total_time = time.time() - smart_start
-    
-    pass
-    
-    return TaskWithDetails.from_orm(task) 
-
-
-@router.get("/{task_id}/ultra-smart", response_model=TaskWithDetails)
-async def get_task_ultra_smart_optimized(
+@router.get("/{task_id}", response_model=TaskWithDetails)
+async def read_task(
     task_id: int,
     current_user: Agent = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ) -> Any:
-
+    """
+    Get a single ticket with ultra-smart optimization.
+    This endpoint intelligently decides the best fetching strategy.
+    """
     import time
     from app.services.cache_service import cached_ticket_exists_check
     from sqlalchemy.orm import joinedload, noload
@@ -1117,7 +758,7 @@ async def get_task_ultra_smart_optimized(
             noload(Task.body), noload(Task.merged_by_agent)
         ).first()
         
-    else:  
+    else:  # COMPLETE
         task = base_query.options(
             joinedload(Task.assignee),
             joinedload(Task.user), 
@@ -1129,4 +770,570 @@ async def get_task_ultra_smart_optimized(
         ).first()
     
     execution_time = time.time() - execution_start
-    return TaskWithDetails.from_orm(task) 
+    return TaskWithDetails.from_orm(task)
+
+
+@router.put("/{task_id}/refresh", response_model=TaskWithDetails)
+async def update_task_optimized_for_refresh(
+    task_id: int,
+    task_in: TicketUpdate, 
+    request: Request,  
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+
+    from fastapi import Request as FastAPIRequest
+    from app.core.config import settings
+    from sqlalchemy.orm import joinedload
+    
+    refresh_start_time = time.time()
+
+    update_fields = [field for field, value in task_in.dict(exclude_unset=True).items() if value is not None]
+
+    fetch_start = time.time()
+    task = db.query(Task).filter(
+        Task.id == task_id,
+        Task.workspace_id == current_user.workspace_id,
+        Task.is_deleted == False
+    ).first()
+    fetch_time = time.time() - fetch_start
+    
+    if not task:
+        total_time = time.time() - refresh_start_time
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    service_start = time.time()
+    origin = request.headers.get("origin") or settings.FRONTEND_URL
+    from app.services.task_service import update_task
+    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
+    service_time = time.time() - service_start
+    
+    if not updated_task_dict:
+        total_time = time.time() - refresh_start_time
+        raise HTTPException(status_code=400, detail="Task update failed")
+
+    reload_start = time.time()
+    updated_task = db.query(Task).filter(Task.id == task_id).options(
+
+        joinedload(Task.assignee),  
+        joinedload(Task.user),      
+        joinedload(Task.sent_from), 
+        joinedload(Task.category),  
+
+        noload(Task.workspace),
+        noload(Task.sent_to),
+        noload(Task.team),
+        noload(Task.company),
+        noload(Task.comments),
+        noload(Task.email_mappings),
+        noload(Task.body),
+        noload(Task.mailbox_connection),
+        noload(Task.merged_by_agent)
+    ).first()
+    reload_time = time.time() - reload_start
+    
+    # 4. Socket.IO (más rápido)
+    socketio_start = time.time()
+    try:
+        task_data = {
+            'id': updated_task.id,
+            'title': updated_task.title,
+            'status': updated_task.status,
+            'priority': updated_task.priority,
+            'workspace_id': updated_task.workspace_id,
+            'assignee_id': updated_task.assignee_id,
+            'team_id': updated_task.team_id,
+            'user_id': updated_task.user_id,
+            'updated_at': updated_task.updated_at.isoformat() if updated_task.updated_at else None
+        }
+        
+        from app.core.socketio import emit_ticket_update_sync
+        emit_ticket_update_sync(updated_task.workspace_id, task_data)
+        socketio_time = time.time() - socketio_start
+        
+    except Exception as e:
+        socketio_time = time.time() - socketio_start
+        logger.warning(f"Socket.IO error en refresh optimizado: {e}")
+    
+    # 5. 📊 Performance summary
+    total_time = time.time() - refresh_start_time
+    
+    # 🔧 CORREGIDO: Retornar schema con relaciones expandidas para mostrar contacto
+    return TaskWithDetails.from_orm(updated_task)
+
+
+@router.get("/{task_id}/initial-content")
+def get_task_initial_content(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user)
+):
+    try:
+        task = db.query(Task).filter(
+            Task.id == task_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Ticket not found"
+            )
+        if task.description and not task.description.startswith('[MIGRATED_TO_S3]'):
+            return {
+                "status": "content_in_database",
+                "content": task.description,
+                "message": "Content loaded from ticket description"
+            }
+        if task.body and task.body.email_body:
+            if not task.body.email_body.startswith('[MIGRATED_TO_S3]'):
+                return {
+                    "status": "content_in_database", 
+                    "content": task.body.email_body,
+                    "message": "Content loaded from ticket body"
+                }
+        from app.models.comment import Comment as CommentModel
+        initial_comment = db.query(CommentModel).filter(
+            CommentModel.ticket_id == task_id
+        ).order_by(CommentModel.created_at.asc()).first()
+
+        if not initial_comment:
+            fallback_content = task.description or task.body.email_body if task.body else ""
+            if fallback_content and fallback_content.startswith('[MIGRATED_TO_S3]'):
+                clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
+                import re
+                clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
+                fallback_content = clean_content or "Content not available"
+            
+            return {
+                "status": "no_initial_comment",
+                "content": fallback_content or "No initial content found",
+                "message": "No initial comment found for this ticket"
+            }
+        if not initial_comment.s3_html_url:
+            return {
+                "status": "content_in_database",
+                "content": initial_comment.content or "",
+                "message": "Initial content loaded from comment in database"
+            }
+
+        # Get content from S3
+        from app.services.s3_service import get_s3_service
+        s3_service = get_s3_service()
+        s3_content = s3_service.get_comment_html(initial_comment.s3_html_url)
+
+        if not s3_content:
+            logger.warning(f"Failed to retrieve initial content from S3 for ticket {task_id}, falling back to database")
+            fallback_content = initial_comment.content or ""
+            if fallback_content.startswith('[MIGRATED_TO_S3]'):
+                # Clean the migrated message
+                clean_content = fallback_content.replace('[MIGRATED_TO_S3]', '').strip()
+                import re
+                clean_content = re.sub(r'Content moved to S3: https://[^\s]*', '', clean_content).strip()
+                fallback_content = clean_content or "Content temporarily unavailable"
+            
+            return {
+                "status": "s3_error_fallback",
+                "content": fallback_content,
+                "message": "Failed to retrieve from S3, showing database content"
+            }
+        try:
+            from app.services.microsoft_service import MicrosoftGraphService
+            from app.utils.image_processor import extract_base64_images
+            
+            ms_service = MicrosoftGraphService(db)
+            processed_content = s3_content
+
+            final_content, extracted_images = extract_base64_images(processed_content, task.id)
+            
+            if extracted_images:
+                logger.info(f"Extracted {len(extracted_images)} base64 images from initial S3 content for ticket {task_id}")
+                processed_content = final_content
+                
+        except Exception as img_process_error:
+            logger.warning(f"Error processing images in initial S3 content for ticket {task_id}: {str(img_process_error)}")
+            processed_content = s3_content
+
+        return {
+            "status": "loaded_from_s3",
+            "content": processed_content,
+            "s3_url": initial_comment.s3_html_url,
+            "message": "Initial content loaded from S3"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting initial content for ticket {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get initial ticket content: {str(e)}")
+
+
+@router.get("/{task_id}/html-content")
+def get_ticket_html_content(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user)
+):
+
+    try:
+        task = db.query(Task).options(
+            joinedload(Task.user).joinedload(User.company)
+        ).filter(
+            Task.id == task_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Ticket not found"
+            )
+
+        from app.models.comment import Comment as CommentModel
+        from app.services.s3_service import get_s3_service
+
+        
+        def get_avatar_url(sender_type: str, agent=None, user=None):
+            if sender_type == "agent" and agent and agent.avatar_url:
+                return agent.avatar_url
+            elif sender_type == "user":
+                if user and user.avatar_url:
+                    return user.avatar_url
+                elif user and user.company and user.company.logo_url:
+                    return user.company.logo_url
+            return None
+        
+        s3_service = get_s3_service()
+
+        comments = db.query(CommentModel).options(
+            joinedload(CommentModel.agent),
+            joinedload(CommentModel.attachments)
+        ).filter(
+            CommentModel.ticket_id == task_id
+        ).order_by(CommentModel.created_at.asc()).all()
+
+        html_contents = []
+
+        initial_content = None
+        initial_sender = None
+
+        if comments and comments[0].s3_html_url:
+            try:
+                s3_content = s3_service.get_comment_html(comments[0].s3_html_url)
+                if s3_content:
+                    initial_content = s3_content
+                    import re
+                    original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', s3_content)
+                    
+                    if original_sender_match:
+                        user_name = original_sender_match.group(1).strip()
+                        user_email = original_sender_match.group(2).strip()
+
+                        user = db.query(User).options(
+                            joinedload(User.company)
+                        ).filter(
+                            User.email == user_email,
+                            User.workspace_id == current_user.workspace_id
+                        ).first()
+                        
+                        initial_sender = {
+                            "type": "user", 
+                            "name": user_name,
+                            "email": user_email,
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("user", user=user)
+                        }
+                    elif comments[0].agent:
+                        initial_sender = {
+                            "type": "agent", 
+                            "name": comments[0].agent.name,
+                            "email": comments[0].agent.email,
+                            "created_at": comments[0].created_at,
+                            "avatar_url": get_avatar_url("agent", agent=comments[0].agent)
+                        }
+            except Exception as e:
+                logger.warning(f"Failed to get initial S3 content: {e}")
+        
+        if not initial_content:
+            if task.description:
+                initial_content = task.description
+            elif task.body and task.body.email_body:
+                initial_content = task.body.email_body
+            
+            if initial_content:
+                initial_sender = {
+                    "type": "user",
+                    "name": task.user.name if task.user else "Unknown User",
+                    "email": task.user.email if task.user else "unknown",
+                    "created_at": task.created_at,
+                    "avatar_url": get_avatar_url("user", user=task.user)
+                }
+
+        if initial_content:
+            initial_attachments = []
+            if comments and comments[0].attachments:
+                for att in comments[0].attachments:
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
+                    initial_attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": download_url
+                    })
+            
+            html_contents.append({
+                "id": "initial",
+                "content": initial_content,
+                "sender": initial_sender,
+                "is_private": False,
+                "attachments": initial_attachments,
+                "created_at": comments[0].created_at if comments else task.created_at
+            })
+        s3_urls_needed = []
+        comment_mapping = {}
+        
+        for comment in comments:
+            if comment.s3_html_url:
+                s3_urls_needed.append(comment.s3_html_url)
+                comment_mapping[comment.s3_html_url] = comment
+        s3_content_cache = {}
+        if s3_urls_needed:
+            from concurrent.futures import as_completed
+            
+            def fetch_s3_content(s3_url):
+                try:
+                    content = s3_service.get_comment_html(s3_url)
+                    return s3_url, content
+                except Exception as e:
+                    logger.warning(f"Failed to fetch S3 content from {s3_url}: {e}")
+                    return s3_url, None
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_url = {executor.submit(fetch_s3_content, url): url for url in s3_urls_needed}
+                
+                for future in as_completed(future_to_url):
+                    s3_url, content = future.result()
+                    s3_content_cache[s3_url] = content
+        for comment in comments:
+            content = None  
+            if (initial_content and comments and comment.id == comments[0].id and 
+                comments[0].s3_html_url and initial_content != "Content not available"):
+                continue
+            if comment.s3_html_url and comment.s3_html_url in s3_content_cache:
+                content = s3_content_cache[comment.s3_html_url]
+                if content and 'data:image/' in content:
+                    try:
+                        from app.utils.image_processor import extract_base64_images
+                        processed_content, extracted_images = extract_base64_images(content, task.id)
+                        content = processed_content
+                    except Exception as e:
+                        logger.warning(f"Error processing images in comment {comment.id}: {e}")
+            if not content:
+                content = comment.content or "Content not available"
+
+            import re
+            original_sender_match = re.search(r'<original-sender>(.*?)\|(.*?)</original-sender>', content) if content else None
+            
+            if original_sender_match:
+                user_name = original_sender_match.group(1).strip()
+                user_email = original_sender_match.group(2).strip()
+                user = db.query(User).options(
+                    joinedload(User.company)
+                ).filter(
+                    User.email == user_email,
+                    User.workspace_id == current_user.workspace_id
+                ).first()
+                
+                sender = {
+                    "type": "user",
+                    "name": user_name,
+                    "email": user_email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("user", user=user)
+                }
+            elif comment.agent:
+                sender = {
+                    "type": "agent",
+                    "name": comment.agent.name,
+                    "email": comment.agent.email,
+                    "created_at": comment.created_at,
+                    "avatar_url": get_avatar_url("agent", agent=comment.agent)
+                }
+            else:
+                sender = {
+                    "type": "unknown",
+                    "name": "Unknown",
+                    "email": "unknown",
+                    "created_at": comment.created_at,
+                    "avatar_url": None
+                }
+
+            attachments = []
+            if comment.attachments:
+                for att in comment.attachments:
+                    download_url = att.s3_url if att.s3_url else f"/api/v1/attachments/{att.id}"
+                    
+                    attachments.append({
+                        "id": att.id,
+                        "file_name": att.file_name,
+                        "content_type": att.content_type,
+                        "file_size": att.file_size,
+                        "s3_url": getattr(att, 's3_url', None),
+                        "download_url": download_url
+                    })
+
+            html_contents.append({
+                "id": comment.id,
+                "content": content,
+                "sender": sender,
+                "is_private": comment.is_private,
+                "attachments": attachments,
+                "created_at": comment.created_at
+            })        
+        return {
+            "status": "success",
+            "ticket_id": task_id,
+            "ticket_title": task.title,
+            "total_items": len(html_contents),
+            "contents": html_contents,
+            "message": f"Ticket HTML content retrieved with {len(html_contents)} items"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting HTML content for ticket {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get ticket HTML content: {str(e)}")
+
+@router.post("/merge", response_model=TicketMergeResponse)
+async def merge_tickets(
+    merge_request: TicketMergeRequest,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    try:
+        result = TicketMergeService.merge_tickets(
+            db=db,
+            target_ticket_id=merge_request.target_ticket_id,
+            ticket_ids_to_merge=merge_request.ticket_ids_to_merge,
+            current_user=current_user
+        )
+        
+        if result["success"]:
+            logger.info(f"Successful merge: ticket {merge_request.target_ticket_id} with {result['merged_ticket_ids']}")
+            return TicketMergeResponse(
+                success=True,
+                target_ticket_id=result["target_ticket_id"],
+                merged_ticket_ids=result["merged_ticket_ids"],
+                comments_transferred=result["comments_transferred"],
+                message=result["message"]
+            )
+        else:
+            logger.error(f"Merge error: {result.get('errors', [])}")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Error merging tickets",
+                    "errors": result.get("errors", [])
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in merge_tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@router.get("/mergeable", response_model=List[TaskSchema])
+async def get_mergeable_tickets(
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+    exclude_ticket_id: Optional[int] = Query(None, description="Ticket ID to exclude from search"),
+    search: Optional[str] = Query(None, description="Search term to filter tickets"),
+    limit: int = Query(50, le=100, description="Results limit")
+) -> Any:
+    """
+    Get list of tickets that can be merged.
+    Excludes already merged tickets, deleted tickets, and optionally a specific ticket.
+    """
+    try:
+        tickets = TicketMergeService.get_mergeable_tickets(
+            db=db,
+            workspace_id=current_user.workspace_id,
+            exclude_ticket_id=exclude_ticket_id,
+            search_term=search,
+            limit=limit
+        )
+        
+        return tickets
+        
+    except Exception as e:
+        logger.error(f"Error getting mergeable tickets: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting tickets: {str(e)}")
+
+
+@router.get("/{ticket_id}/merge-info")
+async def get_ticket_merge_info(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: Agent = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get merge information for a specific ticket.
+    Includes if it's merged, with which ticket, and which tickets were merged into it.
+    """
+    try:
+        ticket = db.query(Task).filter(
+            Task.id == ticket_id,
+            Task.workspace_id == current_user.workspace_id,
+            Task.is_deleted == False
+        ).first()
+        
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        
+        merge_info = {
+            "ticket_id": ticket_id,
+            "is_merged": ticket.is_merged,
+            "merged_to_ticket_id": ticket.merged_to_ticket_id,
+            "merged_at": ticket.merged_at,
+            "merged_by_agent_id": ticket.merged_by_agent_id,
+            "merged_by_agent_name": None,
+            "merged_tickets": [],
+            "merged_to_ticket_title": None
+        }
+        
+        if ticket.is_merged and ticket.merged_to_ticket_id:
+            target_ticket = db.query(Task).filter(Task.id == ticket.merged_to_ticket_id).first()
+            if target_ticket:
+                merge_info["merged_to_ticket_title"] = target_ticket.title
+        
+        if ticket.merged_by_agent_id:
+            agent = db.query(Agent).filter(Agent.id == ticket.merged_by_agent_id).first()
+            if agent:
+                merge_info["merged_by_agent_name"] = agent.name
+        
+        merged_tickets = TicketMergeService.get_merged_tickets_for_ticket(
+            db=db,
+            ticket_id=ticket_id,
+            workspace_id=current_user.workspace_id
+        )
+        
+        merge_info["merged_tickets"] = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "merged_at": t.merged_at,
+                "status": t.status
+            }
+            for t in merged_tickets
+        ]
+        
+        return merge_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting merge info for {ticket_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting merge information: {str(e)}")
