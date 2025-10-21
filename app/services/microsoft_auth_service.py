@@ -171,34 +171,39 @@ class MicrosoftAuthService:
                 elif flow_type == 'auth':
                     microsoft_id = user_info.get("id")
                     microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+
+                    # New Strategy: Prioritize finding the user in the target workspace and handle multi-workspace scenarios.
                     
-                    # Strategy 1: Find agent by microsoft_id in the target workspace
+                    # 1. Find agent by microsoft_id in the target workspace.
                     agent = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id, Agent.workspace_id == workspace_id).first()
-                    
+
+                    # 2. If not found, find by email in the target workspace.
                     if not agent:
-                        # Strategy 2: Find by email in the target workspace (to link existing account)
                         agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
 
+                    # 3. If still not found, it might be a new agent for this workspace.
                     if not agent:
-                        # Strategy 3: Check if this Microsoft user exists in OTHER workspaces
-                        existing_agent_other_workspace = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first()
-                        if existing_agent_other_workspace:
-                            # Check if there's an agent with the same email in the target workspace that we can link
-                            same_email_agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
-                            if same_email_agent:
-                                agent = same_email_agent
-
-                    if not agent:
-                        # Strategy 4: Create a new agent in the target workspace
+                        # Before creating, check if this Microsoft account is linked to an agent in another workspace.
+                        # This is to avoid the IntegrityError, as microsoft_id must be unique.
+                        is_ms_id_already_used = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first() is not None
+                        
                         logger.info(f"Creating new Microsoft agent: {microsoft_email} in workspace {workspace_id}")
                         display_name = user_info.get("displayName", microsoft_email.split("@")[0])
                         agent = Agent(
-                            name=display_name, email=microsoft_email, role="agent", auth_method="microsoft",
-                            workspace_id=workspace_id, is_active=True
+                            name=display_name,
+                            email=microsoft_email,
+                            role="agent",
+                            auth_method="microsoft",
+                            workspace_id=workspace_id,
+                            is_active=True
                         )
+                        # Only set microsoft_id on the new agent if it's not already in use in another workspace.
+                        if not is_ms_id_already_used:
+                            agent.microsoft_id = microsoft_id
+
                         self.db.add(agent)
-                        self.db.flush() # Flush to get the agent ID before commit
-                    
+                        self.db.flush()  # Flush to get the agent ID
+
                     current_agent = agent
 
                 if current_agent and flow_type in ['profile_link', 'auth']:

@@ -145,29 +145,16 @@ class MicrosoftUserService:
             
             # Check if this Microsoft ID is already used by another agent
             existing_agent_with_ms_id = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first()
-            if existing_agent_with_ms_id and existing_agent_with_ms_id.id != agent_to_update.id:
-                # If it's the same email, we might want to unlink from the old agent
-                if existing_agent_with_ms_id.email == microsoft_email:
-                    # Clear Microsoft data from the old agent
-                    existing_agent_with_ms_id.microsoft_id = None
-                    existing_agent_with_ms_id.microsoft_email = None
-                    existing_agent_with_ms_id.microsoft_tenant_id = None
-                    existing_agent_with_ms_id.microsoft_profile_data = None
-                    existing_agent_with_ms_id.microsoft_refresh_token = None
-                    # Update auth method if it was Microsoft-only
-                    if existing_agent_with_ms_id.auth_method == "microsoft":
-                        existing_agent_with_ms_id.auth_method = "password"
-                    elif existing_agent_with_ms_id.auth_method == "both":
-                        existing_agent_with_ms_id.auth_method = "password"
-                else:
-                    # Different email - this should not happen, but handle it gracefully
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT, 
-                        detail=f"Microsoft account {microsoft_email} is already linked to a different user ({existing_agent_with_ms_id.email})"
-                    )
+            
+            # Only assign the microsoft_id if it's not already in use by another agent.
+            # This is the key to allowing a single Microsoft user to exist in multiple workspaces.
+            if not existing_agent_with_ms_id:
+                agent_to_update.microsoft_id = microsoft_id
+            elif existing_agent_with_ms_id.id != agent_to_update.id:
+                logger.info(f"Microsoft ID {microsoft_id} is already linked to agent {existing_agent_with_ms_id.id}. "
+                            f"The current agent {agent_to_update.id} will be authenticated without altering the existing link.")
 
-            # 2. Assign all Microsoft-related data to the current agent
-            agent_to_update.microsoft_id = microsoft_id
+            # 2. Assign all other Microsoft-related data to the current agent
             agent_to_update.microsoft_email = microsoft_email
             agent_to_update.microsoft_tenant_id = settings.MICROSOFT_TENANT_ID
             agent_to_update.microsoft_profile_data = json.dumps(user_info)

@@ -55,7 +55,6 @@ async def login_access_token(
         Agent.email == form_data.username,
         Agent.workspace_id == requested_workspace_id
     ).first()
-    logger.info(f"Searching for user {form_data.username} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
     
     # Verificar contraseña con manejo robusto de errores
     password_valid = False
