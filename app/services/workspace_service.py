@@ -1,5 +1,6 @@
 from typing import List, Optional, Dict, Any
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException, status
 
@@ -9,52 +10,50 @@ from app.schemas.workspace import WorkspaceCreate, WorkspaceUpdate, WorkspaceSet
 from app.core.security import get_password_hash, create_access_token
 from app.core.config import settings
 
-
-def create_workspace(db: Session, workspace_in: WorkspaceCreate) -> Workspace:
+async def create_workspace(db: AsyncSession, workspace_in: WorkspaceCreate) -> Workspace:
     """
     Create a new workspace
     """
     db_workspace = Workspace(**workspace_in.dict())
     db.add(db_workspace)
-    db.commit()
-    db.refresh(db_workspace)
+    await db.commit()
+    await db.refresh(db_workspace)
     return db_workspace
 
-
-def get_workspace(db: Session, workspace_id: int) -> Optional[Workspace]:
+async def get_workspace(db: AsyncSession, workspace_id: int) -> Optional[Workspace]:
     """
     Get a workspace by its ID
     """
-    return db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    result = await db.execute(select(Workspace).filter(Workspace.id == workspace_id))
+    return result.scalars().first()
 
-
-def get_workspace_by_subdomain(db: Session, subdomain: str) -> Optional[Workspace]:
+async def get_workspace_by_subdomain(db: AsyncSession, subdomain: str) -> Optional[Workspace]:
     """
     Get a workspace by its subdomain
     """
-    return db.query(Workspace).filter(Workspace.subdomain == subdomain).first()
+    result = await db.execute(select(Workspace).filter(Workspace.subdomain == subdomain))
+    return result.scalars().first()
 
-
-def get_workspaces(
-    db: Session, 
+async def get_workspaces(
+    db: AsyncSession, 
     skip: int = 0, 
     limit: int = 100
 ) -> List[Workspace]:
     """
     Get a list of workspaces
     """
-    return db.query(Workspace).order_by(Workspace.subdomain).offset(skip).limit(limit).all()
+    result = await db.execute(select(Workspace).order_by(Workspace.subdomain).offset(skip).limit(limit))
+    return result.scalars().all()
 
-
-def update_workspace(
-    db: Session, 
+async def update_workspace(
+    db: AsyncSession, 
     workspace_id: int, 
     workspace_in: WorkspaceUpdate
 ) -> Optional[Workspace]:
     """
     Update an existing workspace
     """
-    db_workspace = get_workspace(db, workspace_id)
+    db_workspace = await get_workspace(db, workspace_id)
     if not db_workspace:
         return None
     
@@ -62,54 +61,40 @@ def update_workspace(
     for field, value in update_data.items():
         setattr(db_workspace, field, value)
     
-    db.commit()
-    db.refresh(db_workspace)
+    await db.commit()
+    await db.refresh(db_workspace)
     return db_workspace
 
-
-def delete_workspace(db: Session, workspace_id: int) -> bool:
+async def delete_workspace(db: AsyncSession, workspace_id: int) -> bool:
     """
     Delete a workspace
     
     Returns True if successfully deleted, False if not found
     """
-    db_workspace = get_workspace(db, workspace_id)
+    db_workspace = await get_workspace(db, workspace_id)
     if not db_workspace:
         return False
     
-    db.delete(db_workspace)
-    db.commit()
+    await db.delete(db_workspace)
+    await db.commit()
     return True
 
-
-def setup_workspace(db: Session, setup_data: WorkspaceSetupCreate) -> WorkspaceSetupResponse:
+async def setup_workspace(db: AsyncSession, setup_data: WorkspaceSetupCreate) -> WorkspaceSetupResponse:
     """
     Create a new workspace with the first admin user.
     This is a public endpoint for initial setup.
     """
     try:
-        # Verificar que el subdomain no exista
-        existing_workspace = get_workspace_by_subdomain(db, setup_data.subdomain)
+        existing_workspace = await get_workspace_by_subdomain(db, setup_data.subdomain)
         if existing_workspace:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="A workspace with this subdomain already exists"
             )
         
-        # Con múltiples workspaces, el mismo email puede existir en diferentes workspaces
-        # Solo verificamos que el subdomain sea único
-        # existing_agent = db.query(Agent).filter(Agent.email == setup_data.admin_email).first()
-        # if existing_agent:
-        #     raise HTTPException(
-        #         status_code=status.HTTP_400_BAD_REQUEST,
-        #         detail="An agent with this email already exists"
-        #     )
-        
-        # Crear workspace
         workspace_data = WorkspaceCreate(subdomain=setup_data.subdomain)
-        workspace = create_workspace(db, workspace_data)
+        workspace = await create_workspace(db, workspace_data)
         
-        # Crear primer admin
         admin = Agent(
             name=setup_data.admin_name,
             email=setup_data.admin_email,
@@ -120,16 +105,14 @@ def setup_workspace(db: Session, setup_data: WorkspaceSetupCreate) -> WorkspaceS
         )
         
         db.add(admin)
-        db.commit()
-        db.refresh(admin)
+        await db.commit()
+        await db.refresh(admin)
         
-        # Crear token de acceso
         access_token = create_access_token(
             subject=str(admin.id),
             extra_data={"workspace_id": workspace.id}
         )
         
-        # Preparar response
         admin_dict = {
             "id": admin.id,
             "name": admin.name,
@@ -148,15 +131,15 @@ def setup_workspace(db: Session, setup_data: WorkspaceSetupCreate) -> WorkspaceS
             token_type="bearer"
         )
         
-    except IntegrityError as e:
-        db.rollback()
+    except IntegrityError:
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Database error: subdomain or email already exists"
         )
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error creating workspace: {str(e)}"
-        ) 
+        )

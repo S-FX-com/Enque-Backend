@@ -14,7 +14,6 @@ from app.models.task import Task as TaskModel
 from app.models.agent import Agent as AgentModel
 from app.models.user import User
 from app.utils.logger import logger
-from app.core.socketio import emit_comment_update_sync
 from app.services.microsoft_service import get_microsoft_service
 
 
@@ -263,7 +262,8 @@ async def emit_scheduled_comment_sent_event(
         }
         
         # Emit the event
-        emit_comment_update_sync(
+        from app.core.socketio import emit_comment_update
+        await emit_comment_update(
             workspace_id=scheduled_comment.workspace_id,
             comment_data=comment_data
         )

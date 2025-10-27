@@ -10,6 +10,12 @@ logging.basicConfig(
     format="%(levelname)s - %(message)s"
 )
 
+# Reduce noise from HTTP client libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpcore.connection").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
+
 # Pre-configured loggers for backwards compatibility
 logger = logging.getLogger("enque")
 ms_logger = logging.getLogger("enque.microsoft")

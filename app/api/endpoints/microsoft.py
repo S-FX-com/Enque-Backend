@@ -2,7 +2,9 @@ from typing import Any, List, Optional
 from datetime import datetime, timedelta 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Request 
 from fastapi.responses import RedirectResponse 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_db, get_current_active_user
 from app.models.agent import Agent
 from app.core.config import settings 
@@ -34,7 +36,7 @@ async def get_microsoft_signin_auth_url(
     request: Request,
     workspace_id: Optional[int] = Query(None, description="Workspace ID for signin authentication"),
     origin_url: Optional[str] = Query(None, description="Frontend origin URL for redirect"),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Generate Microsoft 365 auth URL for signin (unified login)
@@ -63,7 +65,9 @@ async def get_microsoft_signin_auth_url(
             # Extract subdomain from hostname (e.g., "sfx" from "sfx.enque.cc")
             if original_hostname.endswith('.enque.cc'):
                 subdomain = original_hostname.replace('.enque.cc', '')
-                workspace = db.query(Workspace).filter(Workspace.subdomain == subdomain).first()
+                stmt = select(Workspace).filter(Workspace.subdomain == subdomain)
+                result = await db.execute(stmt)
+                workspace = result.scalars().first()
                 if workspace:
                     workspace_id = workspace.id
                     logger.info(f"🎯 Found workspace {workspace_id} for subdomain '{subdomain}' from hostname '{original_hostname}'")
@@ -72,7 +76,9 @@ async def get_microsoft_signin_auth_url(
             
         # Default workspace if still not found
         if not workspace_id:
-            workspace = db.query(Workspace).first()
+            stmt = select(Workspace)
+            result = await db.execute(stmt)
+            workspace = result.scalars().first()
             if not workspace:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -82,7 +88,9 @@ async def get_microsoft_signin_auth_url(
             logger.warning(f"🔄 Using default workspace {workspace_id} as fallback")
             
         # Validate workspace exists
-        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        stmt = select(Workspace).filter(Workspace.id == workspace_id)
+        result = await db.execute(stmt)
+        workspace = result.scalars().first()
         if not workspace:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -131,14 +139,17 @@ async def get_microsoft_signin_auth_url(
 @router.get("/profile/test")
 async def test_microsoft_profile_endpoint(
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         agent_id = current_agent.id
-        fresh_agent = db.query(Agent).filter(Agent.id == agent_id).first()
-        microsoft_tokens = db.query(MicrosoftToken).filter(
-            MicrosoftToken.agent_id == agent_id
-        ).all()
+        stmt = select(Agent).filter(Agent.id == agent_id)
+        result = await db.execute(stmt)
+        fresh_agent = result.scalars().first()
+        
+        stmt = select(MicrosoftToken).filter(MicrosoftToken.agent_id == agent_id)
+        result = await db.execute(stmt)
+        microsoft_tokens = result.scalars().all()
         
         return {
             "message": "Microsoft profile endpoint is working", 
@@ -170,7 +181,7 @@ async def get_microsoft_profile_auth_url(
     request: Request,
     origin_url: Optional[str] = Query(None, description="Frontend origin URL for redirect"),
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     logger.info(f"🔗 Microsoft profile auth URL endpoint called with origin_url: {origin_url}")
     logger.info(f"🔗 Current agent: {current_agent.id if current_agent else 'None'} - {current_agent.email if current_agent else 'No email'}")
@@ -233,10 +244,12 @@ async def get_microsoft_profile_auth_url(
 @router.post("/auth/unlink")
 async def unlink_microsoft_account(
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
-        fresh_agent = db.query(Agent).filter(Agent.id == current_agent.id).first()
+        stmt = select(Agent).filter(Agent.id == current_agent.id)
+        result = await db.execute(stmt)
+        fresh_agent = result.scalars().first()
         if not fresh_agent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
         
@@ -256,14 +269,15 @@ async def unlink_microsoft_account(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot unlink Microsoft account without setting a password first"
             )
-        microsoft_tokens = db.query(MicrosoftToken).filter(
-            MicrosoftToken.agent_id == fresh_agent.id
-        ).all()
+        
+        stmt = select(MicrosoftToken).filter(MicrosoftToken.agent_id == fresh_agent.id)
+        result = await db.execute(stmt)
+        microsoft_tokens = result.scalars().all()
         
         for token in microsoft_tokens:
-            db.delete(token)
+            await db.delete(token)
         
-        db.commit()
+        await db.commit()
         from app.core.cache import user_cache
         user_cache.delete(fresh_agent.id)
         
@@ -276,7 +290,7 @@ async def unlink_microsoft_account(
         }
         
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error unlinking Microsoft account: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -286,7 +300,7 @@ async def unlink_microsoft_account(
 @router.post("/auth/sync-avatar")
 async def sync_microsoft_avatar(
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Sincroniza manualmente el avatar desde Microsoft 365.
@@ -294,7 +308,9 @@ async def sync_microsoft_avatar(
     """
     try:
         # Verificar que el agente tenga cuenta Microsoft vinculada
-        fresh_agent = db.query(Agent).filter(Agent.id == current_agent.id).first()
+        stmt = select(Agent).filter(Agent.id == current_agent.id)
+        result = await db.execute(stmt)
+        fresh_agent = result.scalars().first()
         if not fresh_agent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
         
@@ -305,10 +321,12 @@ async def sync_microsoft_avatar(
             )
         
         # Obtener token válido para la sincronización
-        microsoft_token = db.query(MicrosoftToken).filter(
+        stmt = select(MicrosoftToken).filter(
             MicrosoftToken.agent_id == fresh_agent.id,
             MicrosoftToken.mailbox_connection_id.is_(None)  # Token de perfil, no de mailbox
-        ).order_by(MicrosoftToken.created_at.desc()).first()
+        ).order_by(MicrosoftToken.created_at.desc())
+        result = await db.execute(stmt)
+        microsoft_token = result.scalars().first()
         
         if not microsoft_token:
             raise HTTPException(
@@ -339,7 +357,7 @@ async def sync_microsoft_avatar(
                     # Actualizar avatar_url del agente
                     old_avatar_url = fresh_agent.avatar_url
                     fresh_agent.avatar_url = avatar_url
-                    db.commit()
+                    await db.commit()
                     
                     # Invalidar caché
                     from app.core.cache import user_cache
@@ -375,7 +393,7 @@ async def sync_microsoft_avatar(
     except HTTPException:
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error in sync avatar endpoint: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -385,10 +403,12 @@ async def sync_microsoft_avatar(
 @router.get("/auth/profile")
 async def get_microsoft_profile(
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
-        fresh_agent = db.query(Agent).filter(Agent.id == current_agent.id).first()
+        stmt = select(Agent).filter(Agent.id == current_agent.id)
+        result = await db.execute(stmt)
+        fresh_agent = result.scalars().first()
         if not fresh_agent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
         
@@ -425,11 +445,13 @@ async def get_microsoft_profile(
 @router.get("/auth/status")
 async def get_microsoft_auth_status(
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         agent_id = current_agent.id
-        current_agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        stmt = select(Agent).filter(Agent.id == agent_id)
+        result = await db.execute(stmt)
+        current_agent = result.scalars().first()
         if not current_agent:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -480,18 +502,21 @@ def get_frontend_redirect_url(path: str, original_hostname: Optional[str] = None
         logger.warning(f"Original hostname not provided or invalid in state, falling back to: {base_url}")
     return f"{base_url}{path}"
 @router.get("/connections", response_model=List[MailboxConnectionSchema])
-def get_connections( 
-    db: Session = Depends(get_db),
+async def get_connections( 
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     if not current_agent or not current_agent.workspace_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    connections = db.query(MailboxConnection).options(
+    
+    stmt = select(MailboxConnection).options(
         joinedload(MailboxConnection.teams)
     ).filter(
         MailboxConnection.workspace_id == current_agent.workspace_id,
         MailboxConnection.is_active == True
-    ).all()
+    )
+    db_result = await db.execute(stmt)
+    connections = db_result.unique().scalars().all()
 
     # Convert to response format with team_ids
     result = []
@@ -514,9 +539,9 @@ def get_connections(
     logger.info(f"Found {len(connections)} active connections for workspace {current_agent.workspace_id}")
     return result
 @router.delete("/connection/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
-def disconnect_mailbox(
+async def disconnect_mailbox(
     connection_id: int, # Added path parameter
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     if not current_agent or not current_agent.workspace_id:
@@ -524,57 +549,75 @@ def disconnect_mailbox(
 
     workspace_id = current_agent.workspace_id
     logger.info(f"Attempting to disconnect mailbox connection ID {connection_id} for workspace {workspace_id}")
-    connection = db.query(MailboxConnection).filter(
+
+    stmt = select(MailboxConnection).where(
         MailboxConnection.id == connection_id,
         MailboxConnection.workspace_id == workspace_id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    connection = result.scalar_one_or_none()
 
     if not connection:
         logger.warning(f"Mailbox connection ID {connection_id} not found or does not belong to workspace {workspace_id}.")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox connection not found.")
     if not connection.is_active:
         logger.info(f"Mailbox connection ID {connection_id} is already inactive.")
-        return None 
+        return None
 
     try:
-        token = db.query(MicrosoftToken).filter(MicrosoftToken.mailbox_connection_id == connection.id).order_by(MicrosoftToken.created_at.desc()).first()
-        sync_config = db.query(EmailSyncConfig).filter(EmailSyncConfig.mailbox_connection_id == connection.id).first()
+        # Get token
+        token_stmt = select(MicrosoftToken).where(
+            MicrosoftToken.mailbox_connection_id == connection.id
+        ).order_by(MicrosoftToken.created_at.desc())
+        token_result = await db.execute(token_stmt)
+        token = token_result.scalar_one_or_none()
+
+        # Get sync config
+        sync_config_stmt = select(EmailSyncConfig).where(
+            EmailSyncConfig.mailbox_connection_id == connection.id
+        )
+        sync_config_result = await db.execute(sync_config_stmt)
+        sync_config = sync_config_result.scalar_one_or_none()
+
         if sync_config:
-            db.delete(sync_config)
+            await db.delete(sync_config)
             logger.info(f"Deleting EmailSyncConfig ID: {sync_config.id}")
         if token:
-            db.delete(token)
+            await db.delete(token)
             logger.info(f"Deleting MicrosoftToken ID: {token.id}")
-        db.delete(connection)
+        await db.delete(connection)
         logger.info(f"Deleting MailboxConnection ID: {connection.id}")
 
-        db.commit()
+        await db.commit()
         logger.info(f"Successfully deleted mailbox connection {connection.email} (ID: {connection_id}) for workspace {workspace_id}")
-        return None 
+        return None
 
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error disconnecting mailbox for workspace {workspace_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to disconnect mailbox.")
 class ReconnectMailboxRequest(BaseModel):
     state: Optional[str] = Field(None, description="Base64 encoded state from frontend containing workspace_id, agent_id, and original_hostname")
 @router.post("/connection/{connection_id}/reconnect", response_model=dict)
-def reconnect_mailbox(
+async def reconnect_mailbox(
     connection_id: int,
     request_data: ReconnectMailboxRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     if not current_agent or not current_agent.workspace_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    
+
     workspace_id = current_agent.workspace_id
     logger.info(f"Attempting to reconnect mailbox connection ID {connection_id} for workspace {workspace_id}")
-    connection = db.query(MailboxConnection).filter(
+
+    stmt = select(MailboxConnection).where(
         MailboxConnection.id == connection_id,
         MailboxConnection.workspace_id == workspace_id
-    ).first()
-    
+    )
+    result = await db.execute(stmt)
+    connection = result.scalar_one_or_none()
+
     if not connection:
         logger.warning(f"Mailbox connection ID {connection_id} not found or does not belong to workspace {workspace_id}.")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mailbox connection not found.")
@@ -629,9 +672,9 @@ def reconnect_mailbox(
             detail=f"Failed to generate reconnection URL: {str(e)}"
         )
 @router.get("/auth/authorize", response_model=dict)
-def get_microsoft_auth_url(
+async def get_microsoft_auth_url(
     state: Optional[str] = Query(None, description="State parameter received from frontend, includes workspace_id, agent_id, and original_hostname"), # Added state query param
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user) # Keep for validation if needed, but don't use for state generation
 ):
     try:
@@ -668,13 +711,13 @@ def get_microsoft_auth_url(
         )
 @router.get("/auth/callback")
 async def microsoft_auth_callback_get(
-    request: Request, 
+    request: Request,
     code: Optional[str] = None,
     state: Optional[str] = None, # State now includes workspace_id, agent_id, original_hostname
     error: Optional[str] = None,
     error_description: Optional[str] = None,
     admin_consent: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     if state == "admin_flow":
         if admin_consent == "True" or (not error and not code):
@@ -744,10 +787,11 @@ async def microsoft_auth_callback_get(
         # --- UNIFIED FLOW START ---
         if flow_type in ['auth', 'profile_link']:
             redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
-            
+
             microsoft_service = MicrosoftGraphService(db)
+            await microsoft_service.initialize()
             # This now calls the service that correctly saves the refresh token
-            token_response = microsoft_service.exchange_code_for_token(
+            token_response = await microsoft_service.exchange_code_for_token(
                 code=code,
                 redirect_uri=redirect_uri,
                 state=state
@@ -755,7 +799,9 @@ async def microsoft_auth_callback_get(
 
             if flow_type == 'auth':
                 # If it's a login flow, we need to generate a session token and redirect
-                agent = db.query(Agent).filter(Agent.id == token_response.agent_id).first()
+                stmt = select(Agent).where(Agent.id == token_response.agent_id)
+                result = await db.execute(stmt)
+                agent = result.scalar_one_or_none()
                 if not agent:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found after Microsoft auth.")
 
@@ -786,14 +832,15 @@ async def microsoft_auth_callback_get(
             # Profile linking flow - use exchange_code_for_token with profile linking
             redirect_uri = "https://enque-backend-production.up.railway.app/v1/microsoft/auth/callback"
             logger.info(f"Profile linking callback using redirect_uri: {redirect_uri}")
-            
+
             microsoft_service = MicrosoftGraphService(db)
-            microsoft_service.exchange_code_for_token(
+            await microsoft_service.initialize()
+            await microsoft_service.exchange_code_for_token(
                 code=code,
                 redirect_uri=redirect_uri,
                 state=state
             )
-            
+
             success_message = urllib.parse.quote("Microsoft account linked successfully!")
             redirect_url = get_frontend_redirect_url(f"/settings/profile?microsoft_link=true&status=success&message={success_message}", original_hostname)
         elif state_data and state_data.get('flow') == 'mailbox_reconnect':
@@ -805,30 +852,37 @@ async def microsoft_auth_callback_get(
             logger.info(f"Mailbox reconnect callback for mailbox {mailbox_id} using redirect_uri: {redirect_uri}")
             
             microsoft_service = MicrosoftGraphService(db)
-            
+            await microsoft_service.initialize()
+
             # Verify mailbox exists
-            mailbox = db.query(MailboxConnection).filter(MailboxConnection.id == mailbox_id).first()
+            stmt = select(MailboxConnection).where(MailboxConnection.id == mailbox_id)
+            result = await db.execute(stmt)
+            mailbox = result.scalar_one_or_none()
             if not mailbox:
                 logger.error(f"Mailbox {mailbox_id} not found for token regeneration")
                 error_message = urllib.parse.quote(f"Mailbox not found")
                 redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=error&message={error_message}", original_hostname)
                 return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
-            
+
             try:
                 # Para el flow de regeneración, necesitamos actualizar el state con información del agente
                 # Obtener workspace del mailbox para determinar el agente
                 workspace_id = mailbox.workspace_id
-                
+
                 # Obtener el agente que creó este mailbox o cualquier admin del workspace
-                agent = db.query(Agent).filter(
+                stmt = select(Agent).where(
                     Agent.workspace_id == workspace_id,
                     Agent.role.in_(['admin', 'manager']),
                     Agent.is_active == True
-                ).first()
-                
+                )
+                result = await db.execute(stmt)
+                agent = result.scalar_one_or_none()
+
                 if not agent:
                     # Si no hay admin, usar el agente que creó el mailbox
-                    agent = db.query(Agent).filter(Agent.id == mailbox.created_by_agent_id).first()
+                    stmt = select(Agent).where(Agent.id == mailbox.created_by_agent_id)
+                    result = await db.execute(stmt)
+                    agent = result.scalar_one_or_none()
                 
                 if not agent:
                     logger.error(f"No suitable agent found for mailbox {mailbox_id} token regeneration")
@@ -847,9 +901,9 @@ async def microsoft_auth_callback_get(
                 
                 updated_state_json = json.dumps(updated_state_data)
                 updated_state = base64.b64encode(updated_state_json.encode()).decode()
-                
+
                 # Exchange code for token and update the existing mailbox
-                new_token = microsoft_service.exchange_code_for_token(
+                new_token = await microsoft_service.exchange_code_for_token(
                     code=code,
                     redirect_uri=redirect_uri,
                     state=updated_state
@@ -870,12 +924,13 @@ async def microsoft_auth_callback_get(
             logger.info(f"Mailbox configuration callback using redirect_uri: {redirect_uri}")
 
             microsoft_service = MicrosoftGraphService(db)
-            microsoft_service.exchange_code_for_token(
+            await microsoft_service.initialize()
+            await microsoft_service.exchange_code_for_token(
                 code=code,
                 redirect_uri=redirect_uri,
                 state=state
             )
-            
+
             success_message = urllib.parse.quote("Microsoft account connected successfully!")
             redirect_url = get_frontend_redirect_url(f"/configuration/mailbox?status=success&message={success_message}", original_hostname)
         
@@ -896,10 +951,12 @@ async def microsoft_auth_callback_get(
 
 
 @router.get("/integration", response_model=Optional[MicrosoftIntegrationSchema])
-def get_microsoft_integration(
-    db: Session = Depends(get_db)
+async def get_microsoft_integration(
+    db: AsyncSession = Depends(get_db)
 ):
-    integration = db.query(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True).first()
+    stmt = select(MicrosoftIntegration).filter(MicrosoftIntegration.is_active == True)
+    result = await db.execute(stmt)
+    integration = result.scalars().first()
     if not integration:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -909,11 +966,13 @@ def get_microsoft_integration(
 
 
 @router.post("/integration", response_model=MicrosoftIntegrationSchema)
-def create_microsoft_integration(
+async def create_microsoft_integration(
     integration: MicrosoftIntegrationCreate,
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
-    existing = db.query(MicrosoftIntegration).first()
+    stmt = select(MicrosoftIntegration)
+    result = await db.execute(stmt)
+    existing = result.scalars().first()
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -931,19 +990,21 @@ def create_microsoft_integration(
     )
     
     db.add(new_integration)
-    db.commit()
-    db.refresh(new_integration)
+    await db.commit()
+    await db.refresh(new_integration)
     
     return new_integration
 
 
 @router.put("/integration/{integration_id}", response_model=MicrosoftIntegrationSchema)
-def update_microsoft_integration(
+async def update_microsoft_integration(
     integration_id: int,
     integration: MicrosoftIntegrationUpdate,
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
-    existing = db.query(MicrosoftIntegration).filter(MicrosoftIntegration.id == integration_id).first()
+    stmt = select(MicrosoftIntegration).filter(MicrosoftIntegration.id == integration_id)
+    result = await db.execute(stmt)
+    existing = result.scalars().first()
     if not existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -958,18 +1019,20 @@ def update_microsoft_integration(
     for key, value in update_data.items():
         setattr(existing, key, value)
     
-    db.commit()
-    db.refresh(existing)
+    await db.commit()
+    await db.refresh(existing)
     
     return existing
 
 
 @router.post("/sync/{config_id}", response_model=List[EmailTicketMappingSchema])
-def sync_emails(
+async def sync_emails(
     config_id: int,
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
-    config = db.query(EmailSyncConfig).filter(EmailSyncConfig.id == config_id).first()
+    stmt = select(EmailSyncConfig).filter(EmailSyncConfig.id == config_id)
+    result = await db.execute(stmt)
+    config = result.scalars().first()
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -978,9 +1041,12 @@ def sync_emails(
     
     try:
         microsoft_service = MicrosoftGraphService(db)
-        tasks = microsoft_service.sync_emails(config)
+        tasks = await microsoft_service.sync_emails(config)
         task_ids = [task.id for task in tasks]
-        mappings = db.query(EmailTicketMapping).filter(EmailTicketMapping.task_id.in_(task_ids)).all()
+        
+        stmt = select(EmailTicketMapping).filter(EmailTicketMapping.task_id.in_(task_ids))
+        result = await db.execute(stmt)
+        mappings = result.scalars().all()
         
         return mappings
     except Exception as e:
@@ -991,27 +1057,31 @@ def sync_emails(
 
 
 @router.get("/mailboxes", response_model=List[MailboxConnectionSchema])
-def get_mailbox_connections(
-    db: Session = Depends(get_db),
+async def get_mailbox_connections(
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ) -> Any:
-    mailboxes = db.query(MailboxConnection).filter(
+    stmt = select(MailboxConnection).filter(
         MailboxConnection.workspace_id == current_agent.workspace_id
-    ).all()
+    )
+    result = await db.execute(stmt)
+    mailboxes = result.scalars().all()
     return mailboxes
 
 
 @router.get("/email-config", response_model=List[EmailSyncConfigSchema])
-def get_email_sync_configs(
-    db: Session = Depends(get_db)
+async def get_email_sync_configs(
+    db: AsyncSession = Depends(get_db)
 ):
-    configs = db.query(EmailSyncConfig).all()
+    stmt = select(EmailSyncConfig)
+    result = await db.execute(stmt)
+    configs = result.scalars().all()
     return configs
 
 
 @router.get("/auth/admin-consent")
-def get_admin_consent_url(
-    db: Session = Depends(get_db)
+async def get_admin_consent_url(
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         microsoft_service = MicrosoftGraphService(db)
@@ -1045,52 +1115,57 @@ def get_admin_consent_url(
 
 
 @router.put("/connection/{connection_id}", response_model=MailboxConnectionSchema)
-def update_mailbox_connection(
+async def update_mailbox_connection(
     connection_id: int,
     connection_update: MailboxConnectionUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     if not current_agent or not current_agent.workspace_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    connection = db.query(MailboxConnection).options(
+
+    stmt = select(MailboxConnection).options(
         joinedload(MailboxConnection.teams)
-    ).filter(
+    ).where(
         MailboxConnection.id == connection_id,
         MailboxConnection.workspace_id == current_agent.workspace_id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    connection = result.unique().scalar_one_or_none()
 
     if not connection:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Mailbox connection not found"
         )
 
     try:
         # Update basic fields
         update_data = connection_update.dict(exclude_unset=True, exclude={'team_ids'})
-        
+
         for field, value in update_data.items():
             setattr(connection, field, value)
         if connection_update.team_ids is not None:
             connection.teams.clear()
             if not connection_update.is_global and connection_update.team_ids:
                 from app.models.team import Team
-                teams = db.query(Team).filter(
+                stmt = select(Team).where(
                     Team.id.in_(connection_update.team_ids),
                     Team.workspace_id == current_agent.workspace_id
-                ).all()
-                
+                )
+                result = await db.execute(stmt)
+                teams = result.scalars().all()
+
                 if len(teams) != len(connection_update.team_ids):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="One or more team IDs are invalid"
                     )
-                
+
                 connection.teams.extend(teams)
 
-        db.commit()
-        db.refresh(connection)
+        await db.commit()
+        await db.refresh(connection)
         result = {
             "id": connection.id,
             "email": connection.email,
@@ -1104,12 +1179,12 @@ def update_mailbox_connection(
             "team_ids": [team.id for team in connection.teams],
             "teams": [{"id": team.id, "name": team.name, "icon_name": team.icon_name} for team in connection.teams]
         }
-        
+
         logger.info(f"Updated mailbox connection {connection_id}: global={connection.is_global}, teams={[t.id for t in connection.teams]}")
         return result
-        
+
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error updating mailbox connection {connection_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1119,7 +1194,7 @@ def update_mailbox_connection(
 @router.post("/mailboxes/{mailbox_id}/auto-regenerate-token")
 async def auto_regenerate_mailbox_token(
     mailbox_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     """
@@ -1128,10 +1203,12 @@ async def auto_regenerate_mailbox_token(
     """
     try:
         # Verificar que el mailbox existe y el agente tiene acceso
-        mailbox = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.id == mailbox_id,
             MailboxConnection.workspace_id == current_agent.workspace_id
-        ).first()
+        )
+        result = await db.execute(stmt)
+        mailbox = result.scalars().first()
         
         if not mailbox:
             raise HTTPException(
@@ -1140,9 +1217,9 @@ async def auto_regenerate_mailbox_token(
             )
         
         # Buscar un token existente para este mailbox
-        existing_token = db.query(MicrosoftToken).filter(
-            MicrosoftToken.mailbox_connection_id == mailbox_id
-        ).first()
+        stmt = select(MicrosoftToken).filter(MicrosoftToken.mailbox_connection_id == mailbox_id)
+        result = await db.execute(stmt)
+        existing_token = result.scalars().first()
         
         microsoft_service = MicrosoftGraphService(db)
         
@@ -1168,14 +1245,16 @@ async def auto_regenerate_mailbox_token(
         logger.info(f"Attempting to clone token from workspace agents for mailbox {mailbox.email}")
         
         # Buscar tokens válidos de agentes en el mismo workspace
-        valid_agent_tokens = db.query(Agent, MicrosoftToken)\
+        stmt = select(Agent, MicrosoftToken)\
             .join(MicrosoftToken, MicrosoftToken.agent_id == Agent.id)\
             .filter(
                 Agent.workspace_id == current_agent.workspace_id,
                 Agent.microsoft_id.isnot(None),
                 MicrosoftToken.access_token.isnot(None),
                 MicrosoftToken.expires_at > datetime.utcnow()
-            ).all()
+            )
+        result = await db.execute(stmt)
+        valid_agent_tokens = result.all()
         
         if valid_agent_tokens:
             # Usar el primer token válido encontrado
@@ -1183,7 +1262,9 @@ async def auto_regenerate_mailbox_token(
             logger.info(f"Cloning token from agent {source_agent.email} to mailbox {mailbox.email}")
             
             # Obtener o crear integración
-            integration = db.query(MicrosoftIntegration).first()
+            stmt = select(MicrosoftIntegration)
+            result = await db.execute(stmt)
+            integration = result.scalars().first()
             if not integration:
                 integration = MicrosoftIntegration(
                     tenant_id=settings.MICROSOFT_TENANT_ID,
@@ -1191,8 +1272,8 @@ async def auto_regenerate_mailbox_token(
                     client_secret=settings.MICROSOFT_CLIENT_SECRET
                 )
                 db.add(integration)
-                db.commit()
-                db.refresh(integration)
+                await db.commit()
+                await db.refresh(integration)
             
             # Crear/actualizar token para el mailbox basado en el token del agente
             if existing_token:
@@ -1215,7 +1296,7 @@ async def auto_regenerate_mailbox_token(
                 db.add(new_token)
                 logger.info(f"Created new token for mailbox {mailbox.email}")
             
-            db.commit()
+            await db.commit()
             
             return {
                 "success": True,
@@ -1246,7 +1327,7 @@ async def auto_regenerate_mailbox_token(
 
 @router.post("/mailboxes/auto-regenerate-all")
 async def auto_regenerate_all_missing_tokens(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     """
@@ -1256,18 +1337,20 @@ async def auto_regenerate_all_missing_tokens(
         from datetime import datetime
         
         # Obtener todos los mailboxes del workspace que necesitan tokens
-        mailboxes = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.workspace_id == current_agent.workspace_id,
             MailboxConnection.is_active == True
-        ).all()
+        )
+        result = await db.execute(stmt)
+        mailboxes = result.scalars().all()
         
         results = []
         
         for mailbox in mailboxes:
             # Verificar si necesita token
-            token = db.query(MicrosoftToken).filter(
-                MicrosoftToken.mailbox_connection_id == mailbox.id
-            ).first()
+            stmt = select(MicrosoftToken).filter(MicrosoftToken.mailbox_connection_id == mailbox.id)
+            result = await db.execute(stmt)
+            token = result.scalars().first()
             
             needs_regeneration = not token or token.expires_at < datetime.utcnow()
             
@@ -1319,7 +1402,7 @@ async def auto_regenerate_all_missing_tokens(
 @router.post("/mailboxes/{mailbox_id}/regenerate-token")
 async def regenerate_mailbox_token(
     mailbox_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     """
@@ -1328,10 +1411,12 @@ async def regenerate_mailbox_token(
     """
     try:
         # Verificar que el mailbox existe y el agente tiene acceso
-        mailbox = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.id == mailbox_id,
             MailboxConnection.workspace_id == current_agent.workspace_id
-        ).first()
+        )
+        result = await db.execute(stmt)
+        mailbox = result.scalars().first()
         
         if not mailbox:
             raise HTTPException(
@@ -1379,7 +1464,7 @@ async def regenerate_mailbox_token(
 
 @router.get("/mailboxes/missing-tokens")
 async def get_mailboxes_missing_tokens(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_agent: Agent = Depends(get_current_active_user)
 ):
     """
@@ -1389,18 +1474,20 @@ async def get_mailboxes_missing_tokens(
         from datetime import datetime
         
         # Obtener todos los mailboxes del workspace
-        mailboxes = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.workspace_id == current_agent.workspace_id,
             MailboxConnection.is_active == True
-        ).all()
+        )
+        result = await db.execute(stmt)
+        mailboxes = result.scalars().all()
         
         missing_tokens = []
         
         for mailbox in mailboxes:
             # Verificar si tiene token válido
-            token = db.query(MicrosoftToken).filter(
-                MicrosoftToken.mailbox_connection_id == mailbox.id
-            ).first()
+            stmt = select(MicrosoftToken).filter(MicrosoftToken.mailbox_connection_id == mailbox.id)
+            result = await db.execute(stmt)
+            token = result.scalars().first()
             
             status_info = {
                 "mailbox_id": mailbox.id,

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Type
-
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 
 
 class BaseService:
@@ -19,30 +19,31 @@ class BaseService:
     # --------------------------------------------------------------------- #
     # Basic getters
     # --------------------------------------------------------------------- #
-    def get_by_id(self, db: Session, *, id: int):
+    async def get_by_id(self, db: AsyncSession, *, id: int):
         """Fetch a single record by primary key."""
-        return db.query(self.model).filter(self.model.id == id).first()
+        result = await db.execute(select(self.model).filter(self.model.id == id))
+        return result.scalars().first()
 
-    def get_by_workspace_id(
+    async def get_by_workspace_id(
         self,
-        db: Session,
+        db: AsyncSession,
         *,
         workspace_id: int,
         skip: int = 0,
         limit: int = 100,
     ):
         """Return records for a given workspace with pagination."""
-        return (
-            db.query(self.model)
+        result = await db.execute(
+            select(self.model)
             .filter(self.model.workspace_id == workspace_id)
             .offset(skip)
             .limit(limit)
-            .all()
         )
+        return result.scalars().all()
 
-    def get_enabled_by_workspace_id(
+    async def get_enabled_by_workspace_id(
         self,
-        db: Session,
+        db: AsyncSession,
         *,
         workspace_id: int,
         skip: int = 0,
@@ -54,58 +55,56 @@ class BaseService:
         """
         column = getattr(self.model, self.enabled_field, None)
         if column is None:
-            # Model has no enabled flag – return all
-            return self.get_by_workspace_id(
+            return await self.get_by_workspace_id(
                 db,
                 workspace_id=workspace_id,
                 skip=skip,
                 limit=limit,
             )
 
-        return (
-            db.query(self.model)
+        result = await db.execute(
+            select(self.model)
             .filter(
                 self.model.workspace_id == workspace_id,
                 column.is_(True),
             )
             .offset(skip)
             .limit(limit)
-            .all()
         )
+        return result.scalars().all()
 
     # --------------------------------------------------------------------- #
     # Mutations
     # --------------------------------------------------------------------- #
-    def update(self, db: Session, *, db_obj, obj_in) -> Any:
+    async def update(self, db: AsyncSession, *, db_obj, obj_in) -> Any:
         """Patch an existing DB model with fields from a Pydantic schema."""
-        update_data = obj_in.model_dump(exclude_unset=True)  # type: ignore
+        update_data = obj_in.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             setattr(db_obj, field, value)
 
         db.add(db_obj)
-        db.commit()
-        db.refresh(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
         return db_obj
 
-    def delete(self, db: Session, *, db_obj) -> None:
+    async def delete(self, db: AsyncSession, *, db_obj) -> None:
         """Delete a record from the database."""
-        db.delete(db_obj)
-        db.commit()
+        await db.delete(db_obj)
+        await db.commit()
 
     # --------------------------------------------------------------------- #
     # Statistics helpers
     # --------------------------------------------------------------------- #
-    def count_by_workspace_id(self, db: Session, *, workspace_id: int) -> int:
+    async def count_by_workspace_id(self, db: AsyncSession, *, workspace_id: int) -> int:
         """Count total records for a workspace."""
-        return (
-            db.query(self.model)
-            .filter(self.model.workspace_id == workspace_id)
-            .count()
+        result = await db.execute(
+            select(func.count()).select_from(self.model).filter(self.model.workspace_id == workspace_id)
         )
+        return result.scalar()
 
-    def count_enabled_by_workspace_id(
+    async def count_enabled_by_workspace_id(
         self,
-        db: Session,
+        db: AsyncSession,
         *,
         workspace_id: int,
     ) -> int:
@@ -114,20 +113,19 @@ class BaseService:
         if column is None:
             return 0
 
-        return (
-            db.query(self.model)
-            .filter(
+        result = await db.execute(
+            select(func.count()).select_from(self.model).filter(
                 self.model.workspace_id == workspace_id,
                 column.is_(True),
             )
-            .count()
         )
+        return result.scalar()
 
-    def get_stats(self, db: Session, *, workspace_id: int) -> Dict[str, int]:
+    async def get_stats(self, db: AsyncSession, *, workspace_id: int) -> Dict[str, int]:
         """Return {'total_count': X, 'enabled_count': Y} dictionary."""
         return {
-            "total_count": self.count_by_workspace_id(db, workspace_id=workspace_id),
-            "enabled_count": self.count_enabled_by_workspace_id(
+            "total_count": await self.count_by_workspace_id(db, workspace_id=workspace_id),
+            "enabled_count": await self.count_enabled_by_workspace_id(
                 db, workspace_id=workspace_id
             ),
         }

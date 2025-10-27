@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form
 from fastapi.responses import RedirectResponse # Para redireccionar a S3 URLs
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 import urllib.parse # Para codificar el nombre del archivo para Content-Disposition
 import unicodedata # Para normalizar y crear un nombre de archivo ASCII
 from typing import List
@@ -16,13 +17,15 @@ router = APIRouter()
 @router.get("/attachments/{attachment_id}")
 async def download_attachment(
     attachment_id: int,
-    db: Session = Depends(dependencies.get_db)
+    db: AsyncSession = Depends(dependencies.get_db)
 ):
     """
     Downloads a ticket attachment by its ID by redirecting to S3 URL.
     """
     logger.info(f"Attempting to download attachment with ID: {attachment_id}")
-    db_attachment = db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+    stmt = select(TicketAttachment).where(TicketAttachment.id == attachment_id)
+    result = await db.execute(stmt)
+    db_attachment = result.scalar_one_or_none()
 
     if not db_attachment:
         logger.warning(f"Attachment with ID: {attachment_id} not found.")
@@ -72,7 +75,7 @@ async def download_attachment(
 @router.post("/attachments/upload-multiple", response_model=List[TicketAttachmentSchema])
 async def upload_multiple_attachments(
     files: List[UploadFile] = File(...),
-    db: Session = Depends(dependencies.get_db),
+    db: AsyncSession = Depends(dependencies.get_db),
     current_agent = Depends(dependencies.get_current_active_user),
     s3_service: S3Service = Depends(get_s3_service)
 ):
@@ -106,17 +109,21 @@ async def upload_multiple_attachments(
             # Use a placeholder comment_id (will be updated when comment is created)
             from app.models.comment import Comment
             # Find or create a placeholder comment for temporary attachments
-            placeholder_comment = db.query(Comment).filter(
+            stmt = select(Comment).where(
                 Comment.agent_id == current_agent.id,
                 Comment.is_private == True,
                 Comment.content == "TEMP_ATTACHMENT_PLACEHOLDER"
-            ).first()
+            )
+            query_result = await db.execute(stmt)
+            placeholder_comment = query_result.scalar_one_or_none()
             
             if not placeholder_comment:
                 from app.models.task import Task
                 # Find any task to associate with this placeholder (it doesn't matter which one)
                 # This is just to satisfy the database constraints
-                any_task = db.query(Task).first()
+                stmt = select(Task)
+                query_result = await db.execute(stmt)
+                any_task = query_result.scalars().first()
                 if not any_task:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
@@ -131,7 +138,7 @@ async def upload_multiple_attachments(
                     is_private=True
                 )
                 db.add(placeholder_comment)
-                db.flush()  # Get the ID before creating attachments
+                await db.flush()  # Get the ID before creating attachments
             
             # Create attachment record with S3 URL
             db_attachment = TicketAttachment(
@@ -142,10 +149,11 @@ async def upload_multiple_attachments(
                 s3_url=s3_url  # Store S3 URL instead of content_bytes
             )
             db.add(db_attachment)
-            db.flush()  # To get ID
-            
+            await db.flush()  # To get ID
+            await db.refresh(db_attachment)  # Load all attributes including created_at
+
             logger.info(f"Created attachment record: ID={db_attachment.id}, size={db_attachment.file_size}, s3_url={db_attachment.s3_url}")
-            
+
             # Add to result
             result.append(TicketAttachmentSchema.model_validate(db_attachment))
             
@@ -155,21 +163,23 @@ async def upload_multiple_attachments(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Error uploading file: {str(e)}"
             )
-    
-    db.commit()
+
+    await db.commit()
     return result
 
 @router.delete("/attachments/{attachment_id}")
 async def delete_attachment(
     attachment_id: int,
-    db: Session = Depends(dependencies.get_db),
+    db: AsyncSession = Depends(dependencies.get_db),
     current_agent = Depends(dependencies.get_current_active_user),
     s3_service: S3Service = Depends(get_s3_service)
 ):
     """
     Delete a temporary attachment by ID (both from database and S3).
     """
-    db_attachment = db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+    stmt = select(TicketAttachment).where(TicketAttachment.id == attachment_id)
+    result = await db.execute(stmt)
+    db_attachment = result.scalar_one_or_none()
     
     if not db_attachment:
         raise HTTPException(
@@ -179,7 +189,9 @@ async def delete_attachment(
     
     # Check if the attachment is in a temporary state
     from app.models.comment import Comment
-    comment = db.query(Comment).filter(Comment.id == db_attachment.comment_id).first()
+    stmt = select(Comment).where(Comment.id == db_attachment.comment_id)
+    result = await db.execute(stmt)
+    comment = result.scalar_one_or_none()
     if not comment or comment.content != "TEMP_ATTACHMENT_PLACEHOLDER":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -197,7 +209,7 @@ async def delete_attachment(
             logger.warning(f"Failed to delete attachment from S3: {e}")
     
     # Delete attachment from database
-    db.delete(db_attachment)
-    db.commit()
-    
+    await db.delete(db_attachment)
+    await db.commit()
+
     return {"success": True, "message": "Attachment deleted"} 

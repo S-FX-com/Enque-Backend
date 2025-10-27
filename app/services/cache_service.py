@@ -8,6 +8,7 @@ import hashlib
 from typing import Any, Optional, Dict, List, Union
 from datetime import datetime, timedelta
 import asyncio
+import threading
 import logging
 from functools import wraps
 import orjson  # Ultra-fast JSON
@@ -42,41 +43,16 @@ class CacheService:
         self.redis_client: Optional[Redis] = None
         self.memory_cache = TTLCache(maxsize=1000, ttl=300)  # 5 min fallback cache
         self.is_redis_connected = False
-        self._connection_lock = asyncio.Lock()
-        
-    async def connect(self) -> bool:
-        """Initialize Redis connection with fallback to memory cache"""
-        if not REDIS_AVAILABLE or not settings.REDIS_URL:
-            logger.warning("Redis not available or configured. Using memory cache only.")
-            return False
-            
-        async with self._connection_lock:
-            if self.is_redis_connected:
-                return True
-                
-            try:
-                self.redis_client = redis.from_url(
-                    settings.REDIS_URL,
-                    encoding="utf-8",
-                    decode_responses=True,
-                    socket_timeout=5,
-                    socket_connect_timeout=5,
-                    health_check_interval=30,
-                    retry_on_timeout=True,
-                    max_connections=20
-                )
-                
-                # Test connection
-                await self.redis_client.ping()
-                self.is_redis_connected = True
-                logger.info("✅ Redis cache connected successfully")
-                return True
-                
-            except Exception as e:
-                logger.warning(f"⚠️ Redis connection failed: {e}. Using memory cache only.")
-                self.redis_client = None
-                self.is_redis_connected = False
-                return False
+
+    def set_redis_client(self, client: Redis):
+        """Sets the Redis client from an external connection manager."""
+        self.redis_client = client
+        self.is_redis_connected = True
+
+    def disconnect(self):
+        """Marks the service as disconnected from Redis."""
+        self.redis_client = None
+        self.is_redis_connected = False
     
     def _generate_cache_key(self, prefix: str, **kwargs) -> str:
         """Generate deterministic cache key from parameters"""
@@ -93,38 +69,33 @@ class CacheService:
     
     async def get(self, key: str) -> Optional[Any]:
         """Get value from cache (Redis first, then memory)"""
-        try:
-            # Try Redis first
-            if self.is_redis_connected and self.redis_client:
+        if self.is_redis_connected and self.redis_client:
+            try:
                 value = await self.redis_client.get(key)
                 if value:
                     return orjson.loads(value)
-            
-            # Fallback to memory cache
-            return self.memory_cache.get(key)
-            
-        except Exception as e:
-            logger.warning(f"Cache get error for key {key}: {e}")
-            return self.memory_cache.get(key)
+            except Exception as e:
+                logger.warning(f"Redis GET error for key {key}: {e}. Falling back to memory cache.")
+                self.is_redis_connected = False # Assume connection is lost
+        
+        # Fallback to memory cache
+        return self.memory_cache.get(key)
     
     async def set(self, key: str, value: Any, ttl: int = 300) -> bool:
         """Set value in cache (both Redis and memory)"""
-        try:
-            serialized = orjson.dumps(value).decode()
-            
-            # Set in Redis
-            if self.is_redis_connected and self.redis_client:
+        # Always set in memory cache as backup
+        self.memory_cache[key] = value
+        
+        if self.is_redis_connected and self.redis_client:
+            try:
+                serialized = orjson.dumps(value).decode()
                 await self.redis_client.setex(key, ttl, serialized)
-            
-            # Set in memory cache as backup
-            self.memory_cache[key] = value
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Cache set error for key {key}: {e}")
-            # Fallback to memory only
-            self.memory_cache[key] = value
-            return False
+                return True
+            except Exception as e:
+                logger.warning(f"Redis SET error for key {key}: {e}. Value is in memory cache only.")
+                self.is_redis_connected = False # Assume connection is lost
+                return False
+        return False
     
     async def delete(self, key: str) -> bool:
         """Delete from both caches"""
@@ -411,7 +382,35 @@ async def cached_ticket_exists_check(db, task_id: int, workspace_id: int, user_i
     
     return ticket_exists
 
-# Initialize cache on module import
-async def init_cache():
-    """Initialize cache service"""
-    await cache_service.connect() 
+# Functions to manage Redis connection lifecycle, to be used with FastAPI's lifespan events
+async def init_redis_pool():
+    """Initializes the Redis connection pool and attaches it to the global cache_service."""
+    if not REDIS_AVAILABLE or not settings.REDIS_URL:
+        logger.warning("Redis not available or configured. Cache will be in-memory only.")
+        return
+
+    try:
+        client = redis.from_url(
+            settings.REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            health_check_interval=30
+        )
+        await client.ping()
+        cache_service.set_redis_client(client)
+        logger.info("✅ Redis connection pool initialized and attached to cache service.")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Redis connection pool: {e}. Cache will be in-memory only.")
+        cache_service.disconnect()
+
+async def close_redis_pool():
+    """Closes the Redis connection pool."""
+    if cache_service.is_redis_connected and cache_service.redis_client:
+        try:
+            await cache_service.redis_client.close()
+            cache_service.disconnect()
+            logger.info("✅ Redis connection pool closed.")
+        except Exception as e:
+            logger.error(f"❌ Error closing Redis connection pool: {e}")

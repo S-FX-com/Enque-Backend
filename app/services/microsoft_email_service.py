@@ -1,15 +1,13 @@
-import asyncio
 import base64
 import re
 import httpx
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session, joinedload
-
-from app.core.socketio import emit_comment_update_sync
+from sqlalchemy import select
 from app.models.activity import Activity
 from app.models.agent import Agent
 from app.models.comment import Comment
@@ -19,6 +17,7 @@ from app.models.microsoft import (EmailSyncConfig, EmailTicketMapping,
 from app.models.task import Task, TicketBody
 from app.models.ticket_attachment import TicketAttachment
 from app.models.user import User
+from app.models.workspace import Workspace
 from app.schemas.task import TaskStatus
 from app.models.workspace import Workspace
 from app.schemas.microsoft import EmailAddress, EmailAttachment, EmailData
@@ -78,7 +77,7 @@ class MicrosoftEmailService:
             logger.error(f"Error processing HTML for {context}: {e}", exc_info=True)
             return html_content
 
-    def _is_mailbox_reply_loop(self, email_content: Dict, mailbox_email: str) -> bool:
+    async def _is_mailbox_reply_loop(self, email_content: Dict, mailbox_email: str) -> bool:
         """
         Detecta si el mailbox está procesando una respuesta interna del sistema.
         
@@ -115,7 +114,7 @@ class MicrosoftEmailService:
                     break
             
             # 3. Verificar si el sender es un agente del workspace
-            is_sender_agent = self._is_sender_internal_agent(sender_email, mailbox_email)
+            is_sender_agent = await self._is_sender_internal_agent(sender_email, mailbox_email)
             
             # 4. DETECCIÓN PRINCIPAL: Si mailbox está en CC y sender es agente interno
             if is_in_cc and is_sender_agent:
@@ -139,7 +138,7 @@ class MicrosoftEmailService:
             logger.error(f"Error checking mailbox reply loop: {e}")
             return False
 
-    def _is_sender_internal_agent(self, sender_email: str, mailbox_email: str) -> bool:
+    async def _is_sender_internal_agent(self, sender_email: str, mailbox_email: str) -> bool:
         """
         Verifica si el sender del email es un agente interno del workspace
         """
@@ -152,27 +151,31 @@ class MicrosoftEmailService:
             # 1. Obtener el workspace_id del mailbox para buscar agentes
             from app.models.microsoft import MailboxConnection
             from app.models.agent import Agent
-            
-            mailbox = self.db.query(MailboxConnection).filter(
+
+            mailbox_stmt = select(MailboxConnection).filter(
                 MailboxConnection.email.ilike(mailbox_email),
                 MailboxConnection.is_active == True
-            ).first()
-            
+            )
+            mailbox_result = await self.db.execute(mailbox_stmt)
+            mailbox = mailbox_result.scalar_one_or_none()
+
             if not mailbox:
                 logger.warning(f"[AGENT CHECK] Could not find active mailbox: {mailbox_email}")
                 return False
-            
+
             # 2. Buscar si el sender es un agente en el workspace
-            agent = self.db.query(Agent).filter(
+            agent_stmt = select(Agent).filter(
                 Agent.email.ilike(sender_email),
                 Agent.workspace_id == mailbox.workspace_id,
                 Agent.is_active == True
-            ).first()
-            
+            )
+            agent_result = await self.db.execute(agent_stmt)
+            agent = agent_result.scalar_one_or_none()
+
             if agent:
                 logger.info(f"[AGENT CHECK] ✅ Sender {sender_email} is internal agent: {agent.name}")
                 return True
-            
+
             logger.info(f"[AGENT CHECK] ❌ Sender {sender_email} is not an internal agent")
             return False
             
@@ -225,68 +228,70 @@ class MicrosoftEmailService:
             logger.error(f"Error checking internal domain reply: {e}")
             return False
 
-    def _determine_primary_contact_for_reply(self, email: EmailData, mailbox_email: str, workspace_id: int) -> Optional['User']:
+    async def _determine_primary_contact_for_reply(self, email: EmailData, mailbox_email: str, workspace_id: int) -> Optional['User']:
         """
         Determina el contacto primario correcto para un reply, priorizando usuarios reales sobre mailboxes
-        
-        Cuando un reply tiene múltiples destinatarios TO (ej: usuario + mailbox), 
+
+        Cuando un reply tiene múltiples destinatarios TO (ej: usuario + mailbox),
         debemos priorizar al usuario real como primary contact, no al mailbox.
         """
         from app.models.user import User
-        
+
         # 1. Verificar si el sender es el usuario real (caso más común)
         sender_email = email.sender.address.lower()
-        
+
         # 2. Obtener todos los destinatarios TO para analizar
         to_recipients_emails = [r.address.lower() for r in email.to_recipients if r.address]
-        
+
         logger.info(f"[REPLY CONTACT] Analyzing reply from: {sender_email}")
         logger.info(f"[REPLY CONTACT] TO recipients: {to_recipients_emails}")
-        
+
         # 3. Obtener mailboxes activos del workspace para identificarlos
         mailbox_emails = set()
         try:
             from app.models.microsoft import MailboxConnection
-            mailboxes = self.db.query(MailboxConnection).filter(
+            mailboxes_stmt = select(MailboxConnection).filter(
                 MailboxConnection.workspace_id == workspace_id,
                 MailboxConnection.is_active == True
-            ).all()
+            )
+            mailboxes_result = await self.db.execute(mailboxes_stmt)
+            mailboxes = mailboxes_result.scalars().all()
             mailbox_emails = {mb.email.lower() for mb in mailboxes if mb.email}
             logger.info(f"[REPLY CONTACT] Known mailboxes: {mailbox_emails}")
         except Exception as e:
             logger.warning(f"[REPLY CONTACT] Could not get mailbox emails: {e}")
-        
+
         # 4. Si el sender NO es un mailbox, usar el sender como primary contact
         if sender_email not in mailbox_emails:
             logger.info(f"[REPLY CONTACT] Sender {sender_email} is not a mailbox - using as primary contact")
-            return get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
-        
+            return await get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+
         # 5. Si el sender ES un mailbox, buscar en los TO recipients un usuario real
         logger.info(f"[REPLY CONTACT] Sender {sender_email} is a mailbox - looking for real user in TO recipients")
-        
+
         for to_recipient in email.to_recipients:
             to_email = to_recipient.address.lower()
-            
+
             # Skip si es un mailbox conocido
             if to_email in mailbox_emails:
                 logger.info(f"[REPLY CONTACT] Skipping mailbox in TO: {to_email}")
                 continue
-                
+
             # Skip si es el mismo mailbox que está enviando
             if to_email == mailbox_email.lower():
                 logger.info(f"[REPLY CONTACT] Skipping same mailbox: {to_email}")
                 continue
-            
+
             # Este debería ser el usuario real
             logger.info(f"[REPLY CONTACT] Found real user in TO recipients: {to_email} - using as primary contact")
-            return get_or_create_user(self.db, to_recipient.address, to_recipient.name or "Unknown", workspace_id=workspace_id)
-        
+            return await get_or_create_user(self.db, to_recipient.address, to_recipient.name or "Unknown", workspace_id=workspace_id)
+
         # 6. Fallback: usar el sender original si no encontramos nada mejor
         logger.warning(f"[REPLY CONTACT] Could not find real user, falling back to sender: {sender_email}")
-        return get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+        return await get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
 
-    def sync_emails(self, sync_config: EmailSyncConfig, get_user_email_for_sync_func):
-        user_email, token = get_user_email_for_sync_func(sync_config) # This calls the sync check_and_refresh_all_tokens
+    async def sync_emails(self, sync_config: EmailSyncConfig, get_user_email_for_sync_func):
+        user_email, token = await get_user_email_for_sync_func(sync_config) # This calls the sync check_and_refresh_all_tokens
         if not user_email or not token:
             logger.warning(f"[MAIL SYNC] No valid email or token found for sync config ID: {sync_config.id}. Skipping sync.")
             return []
@@ -295,14 +300,25 @@ class MicrosoftEmailService:
             emails = self.graph_client.get_mailbox_emails(user_access_token, user_email, sync_config.folder_name, top=50, filter_unread=True)
             
             if not emails:
-                sync_config.last_sync_time = datetime.utcnow(); self.db.commit(); return []
+                sync_config.last_sync_time = datetime.utcnow()
+                await self.db.commit()
+                return []
             created_tasks_count = 0; added_comments_count = 0
             processed_folder_id = self.graph_client.get_or_create_processed_folder(user_access_token, user_email, "Enque Processed")
             if not processed_folder_id: 
                 logger.error(f"[MAIL SYNC] Could not get or create 'Enque Processed' folder for {user_email}. Emails will not be moved.")
             else:
                 pass  
-            system_agent = self.db.query(Agent).filter(Agent.email == "system@enque.cc").first() or self.db.query(Agent).order_by(Agent.id.asc()).first()
+            system_agent_result = await self.db.execute(
+                select(Agent).filter(Agent.email == "system@enque.cc")
+            )
+            system_agent = system_agent_result.scalar_one_or_none()
+            
+            if not system_agent:
+                all_agents_result = await self.db.execute(
+                    select(Agent).order_by(Agent.id.asc()).limit(1)
+                )
+                system_agent = all_agents_result.scalar_one_or_none()
             if not system_agent: logger.error("No system agent found. Cannot process emails."); return []
             
             notification_subject_patterns = [
@@ -313,8 +329,9 @@ class MicrosoftEmailService:
                 "[ID:",      
                 "has been assigned"
             ]
-            
-            system_domains = self._get_system_domains_for_workspace(sync_config.workspace_id)
+
+
+            system_domains = await self._get_system_domains_for_workspace(sync_config.workspace_id)
             
             for email_data in emails:
                 email_id = email_data.get("id")
@@ -323,13 +340,19 @@ class MicrosoftEmailService:
                 
                 if not email_id: logger.warning("[MAIL SYNC] Skipping email with missing ID."); continue
                 try:
-                    existing_mapping = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id).first()
+                    existing_mapping_result = await self.db.execute(
+                        select(EmailTicketMapping).filter(EmailTicketMapping.email_id == email_id)
+                    )
+                    existing_mapping = existing_mapping_result.scalar_one_or_none()
                     if existing_mapping:
-                        ticket_exists = self.db.query(Task).filter(Task.id == existing_mapping.ticket_id).first()
+                        ticket_exists_result = await self.db.execute(
+                            select(Task).filter(Task.id == existing_mapping.ticket_id)
+                        )
+                        ticket_exists = ticket_exists_result.scalar_one_or_none()
                         if not ticket_exists:
                             logger.warning(f"🚨 ORPHANED MAPPING: Email {email_id} maps to non-existent ticket #{existing_mapping.ticket_id}. Cleaning up...")
-                            self.db.delete(existing_mapping)
-                            self.db.commit()
+                            await self.db.delete(existing_mapping)
+                            await self.db.commit()
                             logger.info(f"✅ Cleaned orphaned mapping for email {email_id}")
                         else:
                             mapping_subject = existing_mapping.email_subject or ""
@@ -338,8 +361,8 @@ class MicrosoftEmailService:
                             if mapping_subject and current_subject and mapping_subject.lower() != current_subject.lower():
                                 logger.warning(f"🚨 INCONSISTENT MAPPING: Email {email_id} mapped to ticket #{existing_mapping.ticket_id}")
                                 logger.warning(f"   Removing inconsistent mapping...")
-                                self.db.delete(existing_mapping)
-                                self.db.commit()
+                                await self.db.delete(existing_mapping)
+                                await self.db.commit()
                                 logger.info(f"✅ Cleaned inconsistent mapping for email {email_id}")
                                 # Continue processing as if it's a new email
                             else:
@@ -349,7 +372,7 @@ class MicrosoftEmailService:
                     if not email_content: logger.warning(f"[MAIL SYNC] Could not retrieve full content for email ID {email_id}. Skipping."); continue
                     
                     # 🔧 ANTI-LOOP: Verificar si el mailbox está procesando su propia respuesta
-                    if self._is_mailbox_reply_loop(email_content, user_email):
+                    if await self._is_mailbox_reply_loop(email_content, user_email):
                         logger.info(f"[MAIL SYNC] 🔄 Skipping internal reply loop for email {email_id}: {email_subject}")
                         # Marcar como leído y mover a procesados para evitar reprocesamiento
                         self.graph_client.mark_email_as_read(user_access_token, user_email, email_id)
@@ -361,26 +384,39 @@ class MicrosoftEmailService:
                     
                     existing_mapping_by_conv = None
                     if conversation_id:
-                        existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.email_conversation_id == conversation_id).order_by(EmailTicketMapping.created_at.asc()).first()
+                        existing_mapping_by_conv_result = await self.db.execute(
+                            select(EmailTicketMapping)
+                            .filter(EmailTicketMapping.email_conversation_id == conversation_id)
+                            .order_by(EmailTicketMapping.created_at.asc())
+                        )
+                        existing_mapping_by_conv = existing_mapping_by_conv_result.scalars().first()
                     
                     if not existing_mapping_by_conv and email_subject:
                         id_match = re.search(r'\[ID:(\d+)\]', email_subject, re.IGNORECASE)
                         if id_match:
                             ticket_id_from_subject = int(id_match.group(1))
-                            existing_mapping_by_conv = self.db.query(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == ticket_id_from_subject).order_by(EmailTicketMapping.created_at.asc()).first()
+                            existing_mapping_by_subject_result = await self.db.execute(
+                                select(EmailTicketMapping)
+                                .filter(EmailTicketMapping.ticket_id == ticket_id_from_subject)
+                                .order_by(EmailTicketMapping.created_at.asc())
+                            )
+                            existing_mapping_by_conv = existing_mapping_by_subject_result.scalars().first()
                             if existing_mapping_by_conv:
                                 logger.info(f"[MAIL SYNC] Found existing ticket {ticket_id_from_subject} by subject ID for email {email_id}")
                         
                     if existing_mapping_by_conv:
-                        email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
+                        email = await self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: logger.warning(f"[MAIL SYNC] Could not parse reply email data for email ID {email_id}. Skipping comment creation."); continue
                         
                         # 🔧 MEJORA: Determinar el usuario correcto para el reply
                         # Si hay múltiples destinatarios TO, priorizar usuario real sobre mailbox
-                        reply_user = self._determine_primary_contact_for_reply(email, user_email, sync_config.workspace_id)
-                        
+                        reply_user = await self._determine_primary_contact_for_reply(email, user_email, sync_config.workspace_id)
+
                         if not reply_user: logger.error(f"Could not determine primary contact for reply email: {email_id}"); continue
-                        workspace = self.db.query(Workspace).filter(Workspace.id == sync_config.workspace_id).first()
+                        workspace_result = await self.db.execute(
+                            select(Workspace).filter(Workspace.id == sync_config.workspace_id)
+                        )
+                        workspace = workspace_result.scalar_one_or_none()
                         if not workspace: logger.error(f"Workspace ID {sync_config.workspace_id} not found for reply. Skipping comment creation."); continue
                         processed_reply_html = self._process_html_body(email.body_content, email.attachments, f"reply email {email.id}")
                         
@@ -471,7 +507,7 @@ class MicrosoftEmailService:
 
                         if s3_html_url and not s3_html_url.endswith(f"comment-{new_comment.id}.html"):
                             try:
-                                self.db.flush()
+                                await self.db.flush()
                                 
                                 from app.services.s3_service import get_s3_service
                                 s3_service = get_s3_service()
@@ -485,7 +521,10 @@ class MicrosoftEmailService:
                             except Exception as e:
                                 logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for comment {new_comment.id}: {str(e)}")
 
-                        ticket_to_update = self.db.query(Task).filter(Task.id == existing_mapping_by_conv.ticket_id).first()
+                        ticket_to_update_result = await self.db.execute(
+                            select(Task).filter(Task.id == existing_mapping_by_conv.ticket_id)
+                        )
+                        ticket_to_update = ticket_to_update_result.scalar_one_or_none()
                         
                         try:
                             from app.services.workflow_service import WorkflowService
@@ -505,8 +544,8 @@ class MicrosoftEmailService:
                                     'email_sender': reply_user.email,
                                     'email_sender_name': reply_user.name
                                 }
-                                
-                                workflow_results = workflow_service.process_message_for_workflows(
+
+                                workflow_results = await workflow_service.process_message_for_workflows(
                                     email.body_content,
                                     workspace.id,
                                     workflow_context
@@ -548,18 +587,29 @@ class MicrosoftEmailService:
                             self.db.add(ticket_to_update)
                             logger.info(f"[MAIL SYNC] Updated last_update for ticket {existing_mapping_by_conv.ticket_id} after user reply")
                         
-                        self.db.commit(); added_comments_count += 1
-                        
+                        await self.db.commit()
+                        added_comments_count += 1
+
+                        comment_with_attachments = None
                         try:
-                            self.db.flush()
-                            
+                            # Refresh comment with attachments loaded to avoid lazy loading issues
+                            comment_with_attachments_result = await self.db.execute(
+                                select(Comment).options(joinedload(Comment.attachments))
+                                .filter(Comment.id == new_comment.id)
+                            )
+                            comment_with_attachments = comment_with_attachments_result.unique().scalar_one_or_none()
+
+                            if not comment_with_attachments:
+                                logger.warning(f"[MAIL SYNC] Could not reload comment {new_comment.id} for Socket.IO event")
+                                comment_with_attachments = new_comment
+
                             full_content = ""
-                            if new_comment.s3_html_url:
+                            if comment_with_attachments.s3_html_url:
                                 full_content = special_metadata + processed_reply_html
                             else:
-                                full_content = new_comment.content or ""
+                                full_content = comment_with_attachments.content or ""
                             attachments_data = []
-                            for attachment in new_comment.attachments:
+                            for attachment in (comment_with_attachments.attachments if hasattr(comment_with_attachments, 'attachments') else []):
                                 attachments_data.append({
                                     'id': attachment.id,
                                     'file_name': attachment.file_name,
@@ -569,16 +619,17 @@ class MicrosoftEmailService:
                                 })
                             
                             comment_data = {
-                                'id': new_comment.id,
+                                'id': comment_with_attachments.id,
                                 'ticket_id': existing_mapping_by_conv.ticket_id,
-                                'agent_id': None,  
-                                'user_id': reply_user.id,  
+                                'agent_id': None,
+                                'user_id': reply_user.id,
                                 'user_name': reply_user.name,
-                                'content': full_content, 
+                                'content': full_content,
                                 'is_private': False,
-                                'created_at': new_comment.created_at.isoformat() if new_comment.created_at else None,
-                                'attachments': attachments_data  
+                                'created_at': comment_with_attachments.created_at.isoformat() if comment_with_attachments.created_at else None,
+                                'attachments': attachments_data
                             }
+                            from app.core.socketio import emit_comment_update_sync
                             emit_comment_update_sync(
                                 workspace_id=workspace.id,
                                 comment_data=comment_data
@@ -586,13 +637,13 @@ class MicrosoftEmailService:
                             
                             logger.info(f"📤 [MAIL SYNC] Socket.IO comment_updated event queued for workspace {workspace.id}")
                         except Exception as e:
-                            logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for comment {new_comment.id}: {str(e)}")
+                            logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for comment {comment_with_attachments.id if comment_with_attachments else new_comment.id}: {str(e)}")
                         
                         if processed_folder_id: 
                             new_reply_id = self.graph_client.move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                             if new_reply_id and new_reply_id != email_id:
                                 logger.info(f"📧 Reply email moved - ID changed from {email_id[:50]}... to {new_reply_id[:50]}...")
-                                self._update_all_email_mappings_for_ticket(existing_mapping_by_conv.ticket_id, email_id, new_reply_id)
+                                await self._update_all_email_mappings_for_ticket(existing_mapping_by_conv.ticket_id, email_id, new_reply_id)
                         continue
                     else:
                         
@@ -618,7 +669,7 @@ class MicrosoftEmailService:
                             continue
                         
                         logger.info(f"[MAIL SYNC] Email ID {email_id} is a new conversation. Creating new ticket.")
-                        email = self._parse_email_data(email_content, user_email, sync_config.workspace_id)
+                        email = await self._parse_email_data(email_content, user_email, sync_config.workspace_id)
                         if not email: 
                             logger.warning(f"[MAIL SYNC] Could not parse new email data for email ID {email_id}. Skipping ticket creation.")
                             continue
@@ -630,8 +681,8 @@ class MicrosoftEmailService:
                             if processed_folder_id:
                                 self.graph_client.move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                             continue
-                        
-                        task = self._create_task_from_email(email, sync_config, system_agent)
+
+                        task = await self._create_task_from_email(email, sync_config, system_agent)
                         if task:
                             created_tasks_count += 1; logger.info(f"[MAIL SYNC] Created Task ID {task.id} from Email ID {email.id}.")
                             email_mapping = EmailTicketMapping(
@@ -640,16 +691,16 @@ class MicrosoftEmailService:
                                 email_received_at=email.received_at, is_processed=True)
                             self.db.add(email_mapping)
                             try:
-                                self.db.commit()
+                                await self.db.commit()
                                 if processed_folder_id:
                                     new_id = self.graph_client.move_email_to_folder(user_access_token, user_email, email_id, processed_folder_id)
                                     if new_id and new_id != email_id:
                                         # 🔧 MEJORADO: Email ID changed after move, updating ALL related mappings
                                         logger.info(f"📧 Email moved - ID changed from {email_id[:50]}... to {new_id[:50]}...")
-                                        self._update_all_email_mappings_for_ticket(task.id, email_id, new_id)
+                                        await self._update_all_email_mappings_for_ticket(task.id, email_id, new_id)
                             except Exception as commit_err:
                                 logger.error(f"[MAIL SYNC] Error committing email mapping for task {task.id}: {str(commit_err)}")
-                                self.db.rollback()
+                                await self.db.rollback()
                         else: logger.warning(f"[MAIL SYNC] Failed to create task from email ID {email.id}.")
                 except (DatabaseException, MicrosoftAPIException) as e:
                     logger.error(
@@ -692,7 +743,8 @@ class MicrosoftEmailService:
                             logger.error(f"[MAIL SYNC] Error creating new session: {str(session_error)}")
                     
                     continue
-            sync_config.last_sync_time = datetime.utcnow(); self.db.commit()
+            sync_config.last_sync_time = datetime.utcnow()
+            await self.db.commit()
             if sync_config.id % 10 == 0:
                 self._cleanup_orphaned_mappings()
             
@@ -770,6 +822,11 @@ class MicrosoftEmailService:
     def _extract_original_sender_from_forwarded_email(self, email_content: str, subject: str = "") -> tuple[Optional[str], Optional[str]]:
         if not email_content:
             return None, None
+
+        # 🔒 FIX: Decode HTML entities FIRST (convert &lt; to <, &gt; to >, etc.)
+        from html import unescape
+        decoded_content = unescape(email_content)
+
         forwarded_patterns = [
             r"---------- Forwarded message ---------",
             r"Begin forwarded message:",
@@ -780,59 +837,106 @@ class MicrosoftEmailService:
             r"Subject.*?FW:|Subject.*?Fwd:",
             r"Asunto.*?RV:|Asunto.*?Reenviado:"
         ]
-        is_forwarded = any(re.search(pattern, email_content, re.IGNORECASE | re.DOTALL) 
+        is_forwarded = any(re.search(pattern, decoded_content, re.IGNORECASE | re.DOTALL)
                           for pattern in forwarded_patterns)
         if subject:
             subject_forwarded_patterns = [r"^FW:", r"^Fwd:", r"^RV:", r"^Reenviado:"]
-            is_forwarded = is_forwarded or any(re.search(pattern, subject, re.IGNORECASE) 
+            is_forwarded = is_forwarded or any(re.search(pattern, subject, re.IGNORECASE)
                                              for pattern in subject_forwarded_patterns)
-        
+
         if not is_forwarded:
             return None, None
-        
+
         logger.info(f"[FORWARD DETECTION] Email detected as forwarded. Extracting original sender...")
+
+        # 🔒 FIX: Enhanced patterns to handle HTML and plain text formats
         original_sender_patterns = [
-            r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*<([^&]+?)></p>",
-            r"<p[^>]*><strong>From:</strong>\s*([^<]+?)\s*<([^>]+?)></p>",
-            r"<div[^>]*><strong>From:</strong>\s*([^<]+?)\s*<([^&]+?)></div>",
-            r"From:\s*([^<\n]+?)\s*<([^&\n]+?)>",
-            r"From:\s*([^<\n]+?)\s*<([^>\n]+?)>",
-            r"De:\s*([^<\n]+?)\s*<([^&\n]+?)>",
-            r"De:\s*([^<\n]+?)\s*<([^>\n]+?)>",
+            # HTML formats with <b> tags and <span>
+            r"<b>\s*From:\s*</b>\s*<span[^>]*>\s*(.*?)\s*<(.*?)>\s*<",
+            r"<b>\s*From:\s*</b>\s*(.*?)\s*<(.*?)>",
+            r"<b>\s*De:\s*</b>\s*<span[^>]*>\s*(.*?)\s*<(.*?)>\s*<",
+            r"<b>\s*De:\s*</b>\s*(.*?)\s*<(.*?)>",
+
+            # Plain text with mailto
+            r"From:\s*\"?(.*?)\"?\s*\[mailto:(.*?)\]",
+            r"De:\s*\"?(.*?)\"?\s*\[mailto:(.*?)\]",
+
+            # Standard email format: Name <email@domain.com>
+            r"From:\s*(.*?)\s*<(.*?)>",
+            r"De:\s*(.*?)\s*<(.*?)>",
+            r"From:\s*([^<\n]+)\s*<([^>\n]+)>",
+            r"De:\s*([^<\n]+)\s*<([^>\n]+)>",
+
+            # Email only (no name)
             r"From:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-            r"De:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
-            r"From:\s*\"?([^\"<\n]+?)\"?\s*<([^&\n]+?)>",
-            r"From:\s*\"?([^\"<\n]+?)\"?\s*<([^>\n]+?)>"
+            r"De:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
         ]
-        
+
         for pattern in original_sender_patterns:
-            match = re.search(pattern, email_content, re.IGNORECASE | re.DOTALL)
+            match = re.search(pattern, decoded_content, re.IGNORECASE | re.DOTALL)
             if match:
                 if len(match.groups()) == 2:
                     # Patrón con nombre y email
                     name = match.group(1).strip().strip('"').strip("'")
                     email = match.group(2).strip()
+
+                    # Clean up HTML tags from name if present
+                    name = re.sub(r'<[^>]+>', '', name).strip()
                 elif len(match.groups()) == 1:
                     # Solo email
                     email = match.group(1).strip()
                     name = email.split('@')[0]  # Usar la parte antes del @ como nombre
                 else:
                     continue
-                
+
                 # Validar que el email sea válido
                 if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-                    logger.info(f"[FORWARD DETECTION] Original sender found: {name} <{email}>")
+                    logger.info(f"[FORWARD DETECTION] ✅ Original sender found: {name} <{email}>")
                     return email, name
-        
+
+        # 🔒 FIX: Improved fallback - decode before searching
         email_pattern = r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
-        emails_in_content = re.findall(email_pattern, email_content)       
-        if emails_in_content:
-            first_email = emails_in_content[0]
-            logger.info(f"[FORWARD DETECTION] Fallback: Using first email found in content: {first_email}")
+        emails_in_content = re.findall(email_pattern, decoded_content)
+
+        # Filter out known system domains that shouldn't be primary contact
+        system_domains = ['cmtassociation.org', 's-fx.com', 'enque.cc']
+        filtered_emails = [
+            email for email in emails_in_content
+            if not any(domain in email.lower() for domain in system_domains)
+        ]
+
+        if filtered_emails:
+            first_email = filtered_emails[0]
+            logger.info(f"[FORWARD DETECTION] Fallback: Using first external email: {first_email}")
             return first_email, first_email.split('@')[0]
-        
+        elif emails_in_content:
+            first_email = emails_in_content[0]
+            logger.info(f"[FORWARD DETECTION] Fallback: Using first email found: {first_email}")
+            return first_email, first_email.split('@')[0]
+
         logger.warning(f"[FORWARD DETECTION] Could not extract original sender from forwarded email")
         return None, None
+
+    def _extract_recipients_from_body(self, email_body: str, header: str) -> List[str]:
+        if not email_body or not header:
+            return []
+
+        # 🔒 FIX: Decode HTML entities before extracting recipients
+        from html import unescape
+        decoded_body = unescape(email_body)
+
+        pattern = re.compile(rf"<b>{header}:</b>\s*(.*?)\s*<br>", re.IGNORECASE)
+        match = pattern.search(decoded_body)
+
+        if not match:
+            return []
+
+        recipients_str = match.group(1)
+
+        email_pattern = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
+        emails = email_pattern.findall(recipients_str)
+
+        return emails
 
     def _clean_email_address(self, email_string: str) -> Optional[str]:
         if not email_string:
@@ -853,7 +957,7 @@ class MicrosoftEmailService:
         
         return None
 
-    def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
+    async def _parse_email_data(self, email_content: Dict, user_email: str, workspace_id: int = None) -> Optional[EmailData]:
         try:
             sender_data = email_content.get("from", {}).get("emailAddress", {})
             sender_address = self._clean_email_address(sender_data.get("address", ""))
@@ -863,7 +967,7 @@ class MicrosoftEmailService:
             sender = EmailAddress(name=sender_data.get("name", ""), address=sender_address)
             sender_email = sender.address.lower()
             if workspace_id:
-                system_domains = self._get_system_domains_for_workspace(workspace_id)
+                system_domains = await self._get_system_domains_for_workspace(workspace_id)
             else:
                 system_domains = ["enque.cc", "microsoftexchange"]  # Fallback básico
                 
@@ -920,7 +1024,7 @@ class MicrosoftEmailService:
                 attachments=attachments, importance=email_content.get("importance", "normal"))
         except Exception as e: logger.error(f"Error parsing email data for email ID {email_content.get('id', 'N/A')}: {str(e)}", exc_info=True); return None
 
-    def _create_task_from_email(self, email: EmailData, config: EmailSyncConfig, system_agent: Agent) -> Optional[Task]:
+    async def _create_task_from_email(self, email: EmailData, config: EmailSyncConfig, system_agent: Agent) -> Optional[Task]:
         if not system_agent: logger.error("System agent is required for _create_task_from_email but was not provided."); return None
         if email.subject:
             subject_lower = email.subject.lower()
@@ -937,7 +1041,7 @@ class MicrosoftEmailService:
                     return None
                 if "[id:" in subject_lower:
                     sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
-                    system_domains = self._get_system_domains_for_workspace(config.workspace_id)
+                    system_domains = await self._get_system_domains_for_workspace(config.workspace_id)
                     core_system_domains = ["enque.cc", "microsoftexchange"]
                     if sender_domain not in core_system_domains and sender_domain not in system_domains:
                         logger.info(f"Permitiendo respuesta de usuario externo con [ID:] en asunto: {email.sender.address} - '{email.subject}'")
@@ -945,7 +1049,7 @@ class MicrosoftEmailService:
                         logger.warning(f"Ignorando correo con [ID:] de dominio del sistema: {email.sender.address} - '{email.subject}'")
                         return None
         sender_domain = email.sender.address.split('@')[-1].lower() if '@' in email.sender.address else ""
-        system_domains = self._get_system_domains_for_workspace(config.workspace_id)
+        system_domains = await self._get_system_domains_for_workspace(config.workspace_id)
         core_system_domains = ["enque.cc", "microsoftexchange"]
         if sender_domain in core_system_domains:
             logger.warning(f"Ignorando correo del dominio del sistema core: {sender_domain} - {email.sender.address}")
@@ -967,46 +1071,85 @@ class MicrosoftEmailService:
             if not workspace_id: logger.error(f"Missing workspace_id in sync config {config.id}. Cannot create user/task."); return None
             original_email, original_name = self._extract_original_sender_from_forwarded_email(
                 email.body_content, email.subject
-            )        
-            if original_email and original_name:
+            )
+
+            is_forwarded = bool(original_email)
+                    
+            if is_forwarded:
                 logger.info(f"[FORWARD DETECTION] Creating ticket with original sender: {original_name} <{original_email}>")
-                user = get_or_create_user(self.db, original_email, original_name, workspace_id=workspace_id)
+                user = await get_or_create_user(self.db, original_email, original_name, workspace_id=workspace_id)
                 forwarded_by_email = email.sender.address
                 forwarded_by_name = email.sender.name or "Unknown"
                 logger.info(f"[FORWARD DETECTION] Email was forwarded by: {forwarded_by_name} <{forwarded_by_email}>")
+
+                original_to = self._extract_recipients_from_body(email.body_content, "To")
+                original_cc = self._extract_recipients_from_body(email.body_content, "Cc")
+
+                to_recipients_str = ", ".join(original_to) if original_to else None
+                cc_recipients_str = ", ".join(original_cc) if original_cc else None
             else:
-                user = get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+                user = await get_or_create_user(self.db, email.sender.address, email.sender.name or "Unknown", workspace_id=workspace_id)
+
+                # 🔒 FIX: Get workspace mailboxes to filter them from recipients
+                mailbox_emails = set()
+                try:
+                    from app.models.microsoft import MailboxConnection
+                    mailboxes_stmt = select(MailboxConnection).filter(
+                        MailboxConnection.workspace_id == workspace_id,
+                        MailboxConnection.is_active == True
+                    )
+                    mailboxes_result = await self.db.execute(mailboxes_stmt)
+                    mailboxes = mailboxes_result.scalars().all()
+                    mailbox_emails = {mb.email.lower() for mb in mailboxes if mb.email}
+                    logger.info(f"[CREATE TICKET] Known mailboxes to filter: {mailbox_emails}")
+                except Exception as e:
+                    logger.warning(f"[CREATE TICKET] Could not get mailbox emails for filtering: {e}")
+
+                # 🔒 FIX: Filter mailboxes from TO recipients (only include real users)
+                to_emails = [
+                    to.address for to in email.to_recipients
+                    if to.address and to.address.lower() not in mailbox_emails
+                ]
+                to_recipients_str = ", ".join(to_emails) if to_emails else None
+
+                # 🔒 FIX: Filter mailboxes from CC recipients (only include real users)
+                cc_emails = [
+                    cc.address for cc in email.cc_recipients
+                    if cc.address and cc.address.lower() not in mailbox_emails
+                ]
+                cc_recipients_str = ", ".join(cc_emails) if cc_emails else None
+
+            if to_recipients_str:
+                logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
+            if cc_recipients_str:
+                logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
             
             if not user: logger.error(f"Could not get or create user for email: {email.sender.address} in workspace {workspace_id}"); return None
+            # Cache user properties to avoid lazy loading issues later
+            user_name = user.name if user else 'Unknown'
+            user_email = user.email if user else ''
             company_id = user.company_id; assigned_agent = None
             if config.auto_assign and config.default_assignee_id:
-                assigned_agent = self.db.query(Agent).filter(Agent.id == config.default_assignee_id).first()
-            workspace = self.db.query(Workspace).filter(Workspace.id == config.workspace_id).first()
+                agent_stmt = select(Agent).filter(Agent.id == config.default_assignee_id)
+                agent_result = await self.db.execute(agent_stmt)
+                assigned_agent = agent_result.scalar_one_or_none()
+
+            workspace_stmt = select(Workspace).filter(Workspace.id == config.workspace_id)
+            workspace_result = await self.db.execute(workspace_stmt)
+            workspace = workspace_result.scalar_one_or_none()
             if not workspace: logger.error(f"Workspace ID {config.workspace_id} not found. Skipping ticket creation."); return None
             due_date = datetime.utcnow() + timedelta(days=3)
             team_id = None
             if config.mailbox_connection_id:
                 from app.models.microsoft import mailbox_team_assignments
-                team_assignment = self.db.query(mailbox_team_assignments).filter(
+                team_stmt = select(mailbox_team_assignments).filter(
                     mailbox_team_assignments.c.mailbox_connection_id == config.mailbox_connection_id
-                ).first()
-                
+                )
+                team_result = await self.db.execute(team_stmt)
+                team_assignment = team_result.first()
+
                 if team_assignment:
                     team_id = team_assignment.team_id
-            to_recipients_str = None
-            if email.to_recipients:
-                # Store only email addresses, not the "Name <email>" format, for frontend compatibility
-                to_emails = [to.address for to in email.to_recipients if to.address]
-                if to_emails:
-                    to_recipients_str = ", ".join(to_emails)
-                    logger.info(f"Ticket from email will have TO recipients: {to_recipients_str}")
-            cc_recipients_str = None
-            if email.cc_recipients:
-                # Store only email addresses for frontend compatibility
-                cc_emails = [cc.address for cc in email.cc_recipients if cc.address]
-                if cc_emails:
-                    cc_recipients_str = ", ".join(cc_emails)
-                    logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
             if original_email and original_name:
                 forwarded_by_email = email.sender.address
                 forwarded_by_name = email.sender.name
@@ -1031,7 +1174,7 @@ class MicrosoftEmailService:
                 email_message_id=email.id, email_internet_message_id=email.internet_message_id, email_conversation_id=email.conversation_id,
                 email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str,
                 last_update=datetime.utcnow())
-            self.db.add(task); self.db.flush()
+            self.db.add(task); await self.db.flush()
             
             # Use original email sender name for forwarded emails, otherwise use direct sender
             activity_sender_name = original_name if original_name else email.sender.name
@@ -1118,7 +1261,7 @@ class MicrosoftEmailService:
             self.db.add(initial_comment)
             if s3_html_url and not s3_html_url.endswith(f"comment-{initial_comment.id}.html"):
                 try:
-                    self.db.flush()
+                    await self.db.flush()
                     from app.services.s3_service import get_s3_service
                     s3_service = get_s3_service()
                     if '[MIGRATED_TO_S3] Content moved to S3: ' in content_to_store:
@@ -1134,42 +1277,65 @@ class MicrosoftEmailService:
                     logger.warning(f"⚠️ [MAIL SYNC] Could not rename S3 file for initial comment {initial_comment.id}: {str(e)}")
             ticket_body = TicketBody(ticket_id=task.id, email_body="")
             self.db.add(ticket_body)
-            self.db.commit()
+            await self.db.commit()
             try:
+                # Refresh task to avoid lazy loading issues
+                task_refreshed_result = await self.db.execute(
+                    select(Task).filter(Task.id == task.id)
+                )
+                task_refreshed = task_refreshed_result.scalar_one_or_none()
+
+                if task_refreshed:
+                    task_data = {
+                        'id': task_refreshed.id,
+                        'title': task_refreshed.title,
+                        'status': task_refreshed.status,
+                        'priority': task_refreshed.priority,
+                        'workspace_id': task_refreshed.workspace_id,
+                        'assignee_id': task_refreshed.assignee_id,
+                        'team_id': task_refreshed.team_id,
+                        'user_id': task_refreshed.user_id,
+                        'created_at': task_refreshed.created_at.isoformat() if task_refreshed.created_at else None,
+                        'user_name': user_name,
+                        'user_email': user_email
+                    }
+                else:
+                    task_data = {
+                        'id': task.id,
+                        'title': task.title,
+                        'status': task.status,
+                        'priority': task.priority,
+                        'workspace_id': task.workspace_id,
+                        'assignee_id': task.assignee_id,
+                        'team_id': task.team_id,
+                        'user_id': task.user_id,
+                        'created_at': task.created_at.isoformat() if task.created_at else None,
+                        'user_name': user_name,
+                        'user_email': user_email
+                    }
+                # Use task_refreshed.workspace_id directly to avoid lazy loading issues with workspace object
                 from app.core.socketio import emit_new_ticket_sync
-                
-                task_data = {
-                    'id': task.id,
-                    'title': task.title,
-                    'status': task.status,
-                    'priority': task.priority,
-                    'workspace_id': task.workspace_id,
-                    'assignee_id': task.assignee_id,
-                    'team_id': task.team_id,
-                    'user_id': task.user_id,
-                    'created_at': task.created_at.isoformat() if task.created_at else None,
-                    'user_name': user.name if user else 'Unknown',
-                    'user_email': user.email if user else ''
-                }
-                emit_new_ticket_sync(workspace.id, task_data)
+                emit_new_ticket_sync(task_refreshed.workspace_id if task_refreshed else task.workspace_id, task_data)
             except Exception as e:
                 logger.error(f"❌ [MAIL SYNC] Error emitting Socket.IO event for new ticket {task.id}: {str(e)}")
             try:
                 from app.services.automation_service import execute_automations_for_ticket
                 from sqlalchemy.orm import joinedload
-                task_with_relations = self.db.query(Task).options(
+                task_stmt = select(Task).options(
                     joinedload(Task.user),
                     joinedload(Task.assignee),
                     joinedload(Task.company),
                     joinedload(Task.category),
                     joinedload(Task.team)
-                ).filter(Task.id == task.id).first()
-                
+                ).filter(Task.id == task.id)
+                task_result = await self.db.execute(task_stmt)
+                task_with_relations = task_result.scalar_one_or_none()
+
                 if task_with_relations:
-                    executed_actions = execute_automations_for_ticket(self.db, task_with_relations)
+                    executed_actions = await execute_automations_for_ticket(self.db, task_with_relations)
                     if executed_actions:
                         # Refresh the task to get updated values from automations
-                        self.db.refresh(task)
+                        await self.db.refresh(task)
                         
             except Exception as automation_error:
                 logger.error(f"Error executing automations for new ticket {task.id}: {str(automation_error)}")
@@ -1197,9 +1363,9 @@ class MicrosoftEmailService:
                         'email_sender_name': user.name,
                         'assignee_id': task.assignee_id
                     }
-                    
+
                     # Procesar workflows basados en contenido del email inicial
-                    workflow_results = workflow_service.process_message_for_workflows(
+                    workflow_results = await workflow_service.process_message_for_workflows(
                         email.body_content,
                         workspace.id,
                         workflow_context
@@ -1209,9 +1375,9 @@ class MicrosoftEmailService:
                         logger.info(f"[MAIL SYNC] Executed {len(workflow_results)} workflows for new ticket {task.id}")
                         for result in workflow_results:
                             logger.info(f"[MAIL SYNC] Workflow executed: {result.get('workflow_name')} - {result.get('trigger')}")
-                        
+
                         # Commit any changes made by workflows
-                        self.db.commit()
+                        await self.db.commit()
                     
             except Exception as workflow_error:
                 logger.error(f"[MAIL SYNC] Error processing workflows for new ticket: {str(workflow_error)}")
@@ -1221,7 +1387,7 @@ class MicrosoftEmailService:
             
             # Evitar notificaciones para correos del sistema o notificaciones automáticas
             notification_keywords = ["ticket", "created", "notification", "system", "auto", "automated", "no-reply", "noreply"]
-            system_domains = self._get_system_domains_for_workspace(workspace.id)  # Detección automática
+            system_domains = await self._get_system_domains_for_workspace(workspace.id)  # Detección automática
             
             # Verificar si el asunto parece una notificación automática
             if email.subject:
@@ -1233,7 +1399,6 @@ class MicrosoftEmailService:
                         should_send_notification = False
             if should_send_notification:
                 try:
-                    import asyncio
                     from app.services.notification_service import send_notification
                     if user and user.email and not any(domain in user.email.lower() for domain in system_domains):
                         template_vars = {
@@ -1241,45 +1406,37 @@ class MicrosoftEmailService:
                             "ticket_id": task.id,
                             "ticket_title": task.title
                         }
-                        loop = asyncio.new_event_loop()
-                        try:
-                            loop.run_until_complete(
-                                send_notification(
-                                    db=self.db,
-                                    workspace_id=workspace_id,
-                                    category="users",
-                                    notification_type="new_ticket_created",
-                                    recipient_email=user.email,
-                                    recipient_name=user.name,
-                                    template_vars=template_vars,
-                                    task_id=task.id
-                                )
-                            )
-                            logger.info(f"Notification for new ticket {task.id} sent to user {user.name}")
-                        finally:
-                            loop.close()
+                        await send_notification(
+                            db=self.db,
+                            workspace_id=workspace_id,
+                            category="users",
+                            notification_type="new_ticket_created",
+                            recipient_email=user.email,
+                            recipient_name=user.name,
+                            template_vars=template_vars,
+                            task_id=task.id
+                        )
+                        logger.info(f"Notification for new ticket {task.id} sent to user {user.name}")
                     
                     # 2. Notificar a miembros del equipo si el ticket está asignado a un equipo sin agente específico
                     if task.team_id and not task.assignee_id:
                         try:
                             from app.services.task_service import send_team_notification
-                            loop = asyncio.new_event_loop()
-                            try:
-                                loop.run_until_complete(send_team_notification(self.db, task))
-                                logger.info(f"Team notification sent for ticket {task.id} assigned to team {task.team_id}")
-                            finally:
-                                loop.close()
+                            await send_team_notification(self.db, task)
+                            logger.info(f"Team notification sent for ticket {task.id} assigned to team {task.team_id}")
                         except Exception as team_notify_err:
                             logger.warning(f"Failed to send team notification for ticket {task.id}: {str(team_notify_err)}")
                     
                     # 3. Notificar a todos los agentes activos en el workspace (solo si no es un ticket de equipo)
                     elif not task.team_id:
-                        active_agents = self.db.query(Agent).filter(
+                        agents_stmt = select(Agent).filter(
                             Agent.workspace_id == workspace_id,
                             Agent.is_active == True,
                             Agent.email != None,
                             Agent.email != ""
-                        ).all()
+                        )
+                        agents_result = await self.db.execute(agents_stmt)
+                        active_agents = agents_result.scalars().all()
                     
                         # Preparar variables de plantilla para notificaciones de agentes
                         agent_template_vars = {
@@ -1290,33 +1447,28 @@ class MicrosoftEmailService:
                         
                         # Notificar a cada agente activo
                         for agent in active_agents:
-                            # Si el agente es el asignado, añadir información adicional 
+                            # Si el agente es el asignado, añadir información adicional
                             if assigned_agent and agent.id == assigned_agent.id:
                                 agent_template_vars["agent_name"] = agent.name
                             else:
                                 agent_template_vars["agent_name"] = agent.name
-                            
+
                             # Solo enviar si el agente no está en un dominio del sistema
                             if not any(domain in agent.email.lower() for domain in system_domains):
-                                loop = asyncio.new_event_loop()
                                 try:
-                                    loop.run_until_complete(
-                                        send_notification(
-                                            db=self.db,
-                                            workspace_id=workspace_id,
-                                            category="agents",
-                                            notification_type="new_ticket_created_agent",  # Corregir tipo para agentes
-                                            recipient_email=agent.email,
-                                            recipient_name=agent.name,
-                                            template_vars=agent_template_vars,
-                                            task_id=task.id
-                                        )
+                                    await send_notification(
+                                        db=self.db,
+                                        workspace_id=workspace_id,
+                                        category="agents",
+                                        notification_type="new_ticket_created_agent",  # Corregir tipo para agentes
+                                        recipient_email=agent.email,
+                                        recipient_name=agent.name,
+                                        template_vars=agent_template_vars,
+                                        task_id=task.id
                                     )
                                     logger.info(f"Notification for new ticket {task.id} sent to agent {agent.name}")
                                 except Exception as agent_notify_err:
                                     logger.warning(f"Failed to send notification to agent {agent.name}: {str(agent_notify_err)}")
-                                finally:
-                                    loop.close()
                     
                 except Exception as e:
                     logger.error(f"Error sending notifications for ticket {task.id} created from email: {str(e)}", exc_info=True)
@@ -1336,7 +1488,7 @@ class MicrosoftEmailService:
                 },
                 exc_info=True
             )
-            self.db.rollback()
+            await self.db.rollback()
             return None
         except Exception as e:
             logger.error(
@@ -1350,10 +1502,10 @@ class MicrosoftEmailService:
                 },
                 exc_info=True
             )
-            self.db.rollback()
+            await self.db.rollback()
             return None
 
-    def _update_all_email_mappings_for_ticket(self, ticket_id: int, old_email_id: str, new_email_id: str) -> bool:
+    async def _update_all_email_mappings_for_ticket(self, ticket_id: int, old_email_id: str, new_email_id: str) -> bool:
         """
         Actualiza todos los mappings de email relacionados con un ticket cuando el Message ID cambia.
         Esto es crítico para mantener la consistencia después de mover emails a carpetas.
@@ -1380,31 +1532,37 @@ class MicrosoftEmailService:
             # Esto evita conflictos de transacciones y duplicados
             
             # 1. Verificar si ya existe un mapping con el nuevo ID
-            existing_new_mapping = self.db.query(EmailTicketMapping).filter(
+            existing_new_stmt = select(EmailTicketMapping).filter(
                 EmailTicketMapping.email_id == new_email_id,
                 EmailTicketMapping.ticket_id == ticket_id
-            ).first()
-            
+            )
+            existing_new_result = await self.db.execute(existing_new_stmt)
+            existing_new_mapping = existing_new_result.scalar_one_or_none()
+
             if existing_new_mapping:
                 logger.info(f"✅ Mapping with new email ID already exists for ticket {ticket_id}. Removing old mappings only.")
                 # Solo eliminar los mappings antiguos
-                old_mappings = self.db.query(EmailTicketMapping).filter(
+                old_mappings_stmt = select(EmailTicketMapping).filter(
                     EmailTicketMapping.ticket_id == ticket_id,
                     EmailTicketMapping.email_id == old_email_id
-                ).all()
-                
+                )
+                old_mappings_result = await self.db.execute(old_mappings_stmt)
+                old_mappings = old_mappings_result.scalars().all()
+
                 for old_mapping in old_mappings:
-                    self.db.delete(old_mapping)
-                
-                self.db.commit()
+                    await self.db.delete(old_mapping)
+
+                await self.db.commit()
                 logger.info(f"✅ Removed {len(old_mappings)} old email mappings for ticket {ticket_id}")
                 return True
-            
+
             # 2. Buscar todos los mappings antiguos para este ticket
-            old_mappings = self.db.query(EmailTicketMapping).filter(
+            old_mappings_stmt = select(EmailTicketMapping).filter(
                 EmailTicketMapping.ticket_id == ticket_id,
                 EmailTicketMapping.email_id == old_email_id
-            ).all()
+            )
+            old_mappings_result = await self.db.execute(old_mappings_stmt)
+            old_mappings = old_mappings_result.scalars().all()
             
             if not old_mappings:
                 logger.debug(f"No old mappings found for ticket {ticket_id} with email ID {old_email_id[:50]}...")
@@ -1430,42 +1588,44 @@ class MicrosoftEmailService:
                     
                     # Intentar agregar el nuevo mapping
                     self.db.add(new_mapping)
-                    self.db.flush()  # Flush para detectar duplicados temprano
+                    await self.db.flush()  # Flush para detectar duplicados temprano
                     new_mappings_created += 1
-                    
+
                 except Exception as create_error:
                     if "Duplicate entry" in str(create_error):
                         logger.warning(f"🔧 Duplicate detected while creating new mapping for ticket {ticket_id}. Skipping creation.")
-                        self.db.rollback()
+                        await self.db.rollback()
                         # Verificar si el mapping ya existe
-                        existing_check = self.db.query(EmailTicketMapping).filter(
+                        existing_check_stmt = select(EmailTicketMapping).filter(
                             EmailTicketMapping.email_id == new_email_id,
                             EmailTicketMapping.ticket_id == ticket_id
-                        ).first()
+                        )
+                        existing_check_result = await self.db.execute(existing_check_stmt)
+                        existing_check = existing_check_result.scalar_one_or_none()
                         if existing_check:
                             new_mappings_created += 1  # Contar como exitoso
                     else:
                         logger.error(f"Error creating new mapping for ticket {ticket_id}: {str(create_error)}")
-                        self.db.rollback()
+                        await self.db.rollback()
                         continue
             
             # 4. Si se crearon nuevos mappings exitosamente, eliminar los antiguos
             if new_mappings_created > 0:
                 try:
                     # Commit los nuevos mappings primero
-                    self.db.commit()
-                    
+                    await self.db.commit()
+
                     # Ahora eliminar los mappings antiguos
                     for old_mapping in old_mappings:
-                        self.db.delete(old_mapping)
-                    
-                    self.db.commit()
+                        await self.db.delete(old_mapping)
+
+                    await self.db.commit()
                     logger.info(f"✅ Successfully updated {new_mappings_created} email mappings for ticket {ticket_id}")
                     return True
-                    
+
                 except Exception as cleanup_error:
                     logger.error(f"Error during cleanup for ticket {ticket_id}: {str(cleanup_error)}")
-                    self.db.rollback()
+                    await self.db.rollback()
                     return False
             else:
                 logger.warning(f"No new mappings were created for ticket {ticket_id}")
@@ -1474,7 +1634,7 @@ class MicrosoftEmailService:
         except Exception as e:
             logger.error(f"Error updating email mappings for ticket {ticket_id}: {str(e)}")
             try:
-                self.db.rollback()
+                await self.db.rollback()
             except Exception as rollback_error:
                 logger.error(f"Error during rollback for ticket {ticket_id}: {str(rollback_error)}")
             return False
@@ -1728,45 +1888,59 @@ class MicrosoftEmailService:
         original_message_id = email_mapping.email_id
         
         # 🔧 ROBUST FIX: Combine all available CC sources to prevent data loss.
+        logger.info(f"[CC DEBUG] --- Starting CC recipient processing for task {task_id} ---")
         final_cc_recipients = set()
 
         # 1. Use CCs provided by the frontend in this specific reply.
         if cc_recipients:
-            logger.info(f"✅ Using provided CC recipients from frontend: {cc_recipients}")
+            logger.info(f"[CC DEBUG] Source 1: Frontend. Found {len(cc_recipients)} recipients: {cc_recipients}")
             for email in cc_recipients:
-                final_cc_recipients.add(email.strip())
+                final_cc_recipients.add(email.strip().lower())
+        else:
+            logger.info(f"[CC DEBUG] Source 1: Frontend. No CC recipients provided.")
         
         # 2. Also include CCs stored with the ticket in the database.
         if task.cc_recipients:
-            ticket_cc_recipients = [email.strip() for email in task.cc_recipients.split(",") if email.strip()]
+            ticket_cc_recipients = [email.strip().lower() for email in task.cc_recipients.split(",") if email.strip()]
             if ticket_cc_recipients:
-                logger.info(f"Loaded {len(ticket_cc_recipients)} CC recipients from database: {ticket_cc_recipients}")
+                logger.info(f"[CC DEBUG] Source 2: Database. Found {len(ticket_cc_recipients)} recipients: {ticket_cc_recipients}")
                 for email in ticket_cc_recipients:
                     final_cc_recipients.add(email)
+            else:
+                logger.info(f"[CC DEBUG] Source 2: Database. 'cc_recipients' field is present but empty.")
+        else:
+            logger.info(f"[CC DEBUG] Source 2: Database. No 'cc_recipients' field on task.")
 
-        # 3. As a last resort, if no CCs found yet, try fetching from the original email.
+        # 3. As a last resort, try fetching from the original email.
+        # This logic is now a fallback if the other sources yield nothing.
+        logger.info(f"[CC DEBUG] Current CC list size before fallback: {len(final_cc_recipients)}")
         if not final_cc_recipients:
-            logger.info("No CCs from frontend or DB, attempting to fetch from original email as a fallback.")
+            logger.info("[CC DEBUG] Source 3: Fallback. No CCs from frontend or DB, attempting to fetch from original email.")
             try:
                 message_data = self.graph_client.get_mailbox_email_content(app_token, mailbox_connection.email, original_message_id)
                 if message_data:
                     cc_recipients_data = message_data.get("ccRecipients", [])
+                    logger.info(f"[CC DEBUG] Fallback: Successfully fetched original email. Found {len(cc_recipients_data)} raw CC entries.")
                     for cc_recipient in cc_recipients_data:
                         email_address = cc_recipient.get("emailAddress", {}).get("address")
                         if email_address:
-                            final_cc_recipients.add(email_address.strip())
+                            final_cc_recipients.add(email_address.strip().lower())
                     if final_cc_recipients:
-                        logger.info(f"Found {len(final_cc_recipients)} CC recipients from original email (fallback).")
+                        logger.info(f"[CC DEBUG] Fallback: Added {len(final_cc_recipients)} recipients from original email.")
                 else:
-                    logger.warning(f"Could not fetch original message for CC recipients (fallback).")
+                    # This is where the 404 error would have been caught and logged by the graph_client
+                    logger.warning(f"[CC DEBUG] Fallback: Could not fetch original message content for message ID {original_message_id}. Cannot get CC recipients from this source.")
             except Exception as cc_error:
-                logger.error(f"Error fetching original CC recipients (fallback): {str(cc_error)}")
+                logger.error(f"[CC DEBUG] Fallback: An exception occurred while fetching original CC recipients: {str(cc_error)}")
 
         cc_recipients = list(final_cc_recipients)
+        logger.info(f"[CC DEBUG] --- Final CC List ---")
         if cc_recipients:
-            logger.info(f"Final combined CC recipients list ({len(cc_recipients)}): {cc_recipients}")
+            logger.info(f"[CC DEBUG] Total unique CC recipients to be used: {len(cc_recipients)}")
+            logger.info(f"[CC DEBUG] Final list: {cc_recipients}")
         else:
-            logger.info("No CC recipients found for this reply")
+            logger.info("[CC DEBUG] No CC recipients will be included in this reply.")
+        logger.info(f"[CC DEBUG] --- End of CC processing ---")
         if cc_recipients:
             cleaned_cc_recipients = []
             for cc_email in cc_recipients:
@@ -2236,24 +2410,26 @@ class MicrosoftEmailService:
             )
             return False
 
-    def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:
-        
-        try:
+    async def _get_system_domains_for_workspace(self, workspace_id: int) -> List[str]:
 
+        try:
             core_system_domains = ["enque.cc", "microsoftexchange"]
-            
-      
-            mailbox_connections = self.db.query(MailboxConnection).filter(
+
+
+            mailbox_stmt = select(MailboxConnection).filter(
                 MailboxConnection.workspace_id == workspace_id,
                 MailboxConnection.is_active == True
-            ).all()
+            )
+            mailbox_result = await self.db.execute(mailbox_stmt)
+            mailbox_connections = mailbox_result.scalars().all()
+
             workspace_domains = set()
             for mailbox in mailbox_connections:
                 if mailbox.email and '@' in mailbox.email:
                     domain = mailbox.email.split('@')[-1].lower()
                     workspace_domains.add(domain)
-            
-        
+
+
             all_system_domains = core_system_domains + list(workspace_domains)
             
 

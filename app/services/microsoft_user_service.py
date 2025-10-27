@@ -7,7 +7,8 @@ from typing import Any, Dict, Optional
 import httpx
 import requests
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.models.agent import Agent
@@ -32,7 +33,7 @@ except ImportError:
 
 
 class MicrosoftUserService:
-    def __init__(self, db: Session):
+    def __init__(self, db: AsyncSession):
         self.db = db
         self.graph_url = settings.MICROSOFT_GRAPH_URL
 
@@ -75,7 +76,7 @@ class MicrosoftUserService:
             logger.error(f"Failed to get user info: {str(e)}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to get user info: {str(e)}")
 
-    def _get_user_profile_photo(self, access_token: str) -> Optional[bytes]:
+    async def _get_user_profile_photo(self, access_token: str) -> Optional[bytes]:
         """
         Obtiene la foto de perfil del usuario desde Microsoft Graph API.
         Retorna los bytes de la imagen o None si no hay foto disponible.
@@ -85,8 +86,9 @@ class MicrosoftUserService:
             
             # Intentar obtener la foto de perfil
             photo_url = f"{self.graph_url}/me/photo/$value"
-            response = requests.get(photo_url, headers=headers, timeout=30)
-            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(photo_url, headers=headers, timeout=30)
+
             if response.status_code == 200:
                 logger.info("Successfully retrieved user profile photo from Microsoft Graph")
                 return response.content
@@ -97,45 +99,43 @@ class MicrosoftUserService:
                 logger.warning(f"Failed to get profile photo: HTTP {response.status_code}")
                 return None
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.warning("Timeout while fetching profile photo from Microsoft Graph")
             return None
         except Exception as e:
             logger.error(f"Error fetching profile photo: {str(e)}")
             return None
 
-    def _upload_avatar_to_s3(self, photo_bytes: bytes, agent_id: int) -> Optional[str]:
+    async def _upload_avatar_to_s3(self, photo_bytes: bytes, agent_id: int) -> Optional[str]:
         """
         Sube la foto de perfil a S3 y retorna la URL pública.
         """
-        try:
+        def _sync_upload():
             from app.services.s3_service import get_s3_service
-            
             s3_service = get_s3_service()
-            
-            # Generar nombre único para el avatar
             filename = f"agent_{agent_id}_avatar.jpg"
             folder = "avatars"
-            
-            # Subir a S3
-            avatar_url = s3_service.upload_file(
+            return s3_service.upload_file(
                 file_content=photo_bytes,
                 filename=filename,
                 folder=folder,
                 content_type="image/jpeg"
             )
-            
+
+        try:
+            avatar_url = await asyncio.to_thread(_sync_upload)
             logger.info(f"✅ Avatar uploaded to S3 for agent {agent_id}: {avatar_url}")
             return avatar_url
-            
         except Exception as e:
             logger.error(f"❌ Error uploading avatar to S3 for agent {agent_id}: {str(e)}")
             return None
 
-    def handle_profile_linking(self, token_data: dict, user_info: dict, current_agent: Agent, workspace: Workspace, integration: "MicrosoftIntegration") -> MicrosoftToken:
+    async def handle_profile_linking(self, token_data: dict, user_info: dict, current_agent: Agent, workspace: Workspace, integration: "MicrosoftIntegration") -> MicrosoftToken:
         try:
             # Re-fetch the agent from the database within the current session to ensure it's attached
-            agent_to_update = self.db.query(Agent).filter(Agent.id == current_agent.id).first()
+            stmt = select(Agent).filter(Agent.id == current_agent.id)
+            result = await self.db.execute(stmt)
+            agent_to_update = result.scalars().first()
             if not agent_to_update:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found during profile linking.")
 
@@ -144,7 +144,9 @@ class MicrosoftUserService:
             microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
             
             # Check if this Microsoft ID is already used by another agent
-            existing_agent_with_ms_id = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first()
+            stmt = select(Agent).filter(Agent.microsoft_id == microsoft_id)
+            result = await self.db.execute(stmt)
+            existing_agent_with_ms_id = result.scalars().first()
             
             # Only assign the microsoft_id if it's not already in use by another agent.
             # This is the key to allowing a single Microsoft user to exist in multiple workspaces.
@@ -170,22 +172,22 @@ class MicrosoftUserService:
                 agent_to_update.auth_method = "both"
             
             # 3. Commit the critical token and profile data FIRST
-            self.db.commit()
+            await self.db.commit()
 
             # 4. Handle non-critical updates (avatar) in a separate transaction
             try:
-                photo_bytes = self._get_user_profile_photo(token_data["access_token"])
+                photo_bytes = await self._get_user_profile_photo(token_data["access_token"])
                 if photo_bytes:
-                    avatar_url = self._upload_avatar_to_s3(photo_bytes, agent_to_update.id)
+                    avatar_url = await self._upload_avatar_to_s3(photo_bytes, agent_to_update.id)
                     if avatar_url:
                         agent_to_update.avatar_url = avatar_url
-                        self.db.commit() # Commit avatar update separately
+                        await self.db.commit() # Commit avatar update separately
             except Exception as avatar_error:
                 logger.error(f"Error processing avatar for agent {agent_to_update.id}: {str(avatar_error)}")
-                self.db.rollback() # Rollback only the avatar transaction if it fails
+                await self.db.rollback() # Rollback only the avatar transaction if it fails
 
             # 4. Refresh the agent object to get the latest state from the DB
-            self.db.refresh(agent_to_update)
+            await self.db.refresh(agent_to_update)
             
             # 5. Invalidate cache (another non-critical operation)
             try:
@@ -207,7 +209,7 @@ class MicrosoftUserService:
             return token_obj_for_response
             
         except Exception as e:
-            self.db.rollback()
+            await self.db.rollback()
             logger.error(f"Error handling profile linking: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

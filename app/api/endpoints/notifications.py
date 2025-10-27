@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional, Any
 from fastapi import APIRouter, Depends, HTTPException, Path, Body, Request
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.api.dependencies import get_db, get_current_active_user
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 @router.get("/{workspace_id}", response_model=NotificationSettingsResponse)
 async def get_workspace_notification_settings(
     workspace_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -41,8 +41,8 @@ async def get_workspace_notification_settings(
             status_code=403,
             detail="You don't have permission to access this workspace's notifications",
         )
-    
-    response = format_notification_settings_response(db, workspace_id)
+
+    response = await format_notification_settings_response(db, workspace_id)
     return response
 
 
@@ -51,7 +51,7 @@ async def update_notification_template_endpoint(
     template_data: NotificationTemplateUpdateRequest,
     workspace_id: int = Path(...),
     template_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -62,32 +62,32 @@ async def update_notification_template_endpoint(
             status_code=403,
             detail="You don't have permission to update this template",
         )
-    
+
     # Check if template exists and belongs to workspace
-    template = get_notification_template(db, template_id)
+    template = await get_notification_template(db, template_id)
     if not template or template.workspace_id != workspace_id:
         raise HTTPException(
             status_code=404,
             detail="Template not found",
         )
-    
-    updated_template = update_notification_template(
+
+    updated_template = await update_notification_template(
         db, template_id, template_data.content
     )
-    
+
     if not updated_template:
         raise HTTPException(
             status_code=400,
             detail="Failed to update template",
         )
-    
+
     return {"success": True, "message": "Template updated successfully"}
 
 
 @router.post("/{workspace_id}/create-missing-settings", response_model=dict)
 async def create_missing_notification_settings(
     workspace_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -98,20 +98,21 @@ async def create_missing_notification_settings(
             status_code=403,
             detail="You don't have permission to create settings for this workspace",
         )
-    
+
     from app.models.notification import NotificationSetting, NotificationTemplate
+    from sqlalchemy import select
     import json
     from datetime import datetime
-    
+
     # Get all templates for this workspace
-    templates = db.query(NotificationTemplate).filter(
-        NotificationTemplate.workspace_id == workspace_id
-    ).all()
-    
+    stmt = select(NotificationTemplate).where(NotificationTemplate.workspace_id == workspace_id)
+    result = await db.execute(stmt)
+    templates = result.scalars().all()
+
     # Get existing settings
-    existing_settings = db.query(NotificationSetting).filter(
-        NotificationSetting.workspace_id == workspace_id
-    ).all()
+    stmt = select(NotificationSetting).where(NotificationSetting.workspace_id == workspace_id)
+    result = await db.execute(stmt)
+    existing_settings = result.scalars().all()
     
     # Create a set of existing (category, type, channel) combinations
     existing_combinations = set()
@@ -165,12 +166,12 @@ async def create_missing_notification_settings(
         new_setting = NotificationSetting(**setting_data)
         db.add(new_setting)
         created_count += 1
-    
+
     if created_count > 0:
-        db.commit()
-    
+        await db.commit()
+
     return {
-        "success": True, 
+        "success": True,
         "message": f"Created {created_count} missing notification settings",
         "created_count": created_count
     }
@@ -181,7 +182,7 @@ async def toggle_notification_setting_endpoint(
     toggle_data: NotificationToggleRequest,
     workspace_id: int = Path(...),
     setting_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -192,23 +193,24 @@ async def toggle_notification_setting_endpoint(
             status_code=403,
             detail="You don't have permission to toggle this setting",
         )
-    
+
     # If setting_id is 0, it means we need to create the setting
     if setting_id == 0:
         from app.models.notification import NotificationSetting, NotificationTemplate
+        from sqlalchemy import select
         import json
         from datetime import datetime
-        
+
         # Try to create missing notification settings for this workspace
         # Get all templates for this workspace
-        templates = db.query(NotificationTemplate).filter(
-            NotificationTemplate.workspace_id == workspace_id
-        ).all()
-        
+        stmt = select(NotificationTemplate).where(NotificationTemplate.workspace_id == workspace_id)
+        result = await db.execute(stmt)
+        templates = result.scalars().all()
+
         # Get existing settings
-        existing_settings = db.query(NotificationSetting).filter(
-            NotificationSetting.workspace_id == workspace_id
-        ).all()
+        stmt = select(NotificationSetting).where(NotificationSetting.workspace_id == workspace_id)
+        result = await db.execute(stmt)
+        existing_settings = result.scalars().all()
         
         # Create a set of existing (category, type, channel) combinations
         existing_combinations = set()
@@ -258,7 +260,7 @@ async def toggle_notification_setting_endpoint(
                 created_count += 1
         
         if created_count > 0:
-            db.commit()
+            await db.commit()
             return {"success": True, "message": f"Created {created_count} missing notification settings"}
         else:
             # No settings were created, return an error
@@ -266,25 +268,25 @@ async def toggle_notification_setting_endpoint(
                 status_code=400,
                 detail="No missing notification settings found to create. Please refresh the page.",
             )
-    
+
     # Check if setting exists and belongs to workspace
-    setting = get_notification_setting(db, setting_id)
+    setting = await get_notification_setting(db, setting_id)
     if not setting or setting.workspace_id != workspace_id:
         raise HTTPException(
             status_code=404,
             detail="Setting not found",
         )
-    
-    updated_setting = toggle_notification_setting(
+
+    updated_setting = await toggle_notification_setting(
         db, setting_id, toggle_data.is_enabled
     )
-    
+
     if not updated_setting:
         raise HTTPException(
             status_code=400,
             detail="Failed to update setting",
         )
-    
+
     return {"success": True, "message": "Setting updated successfully"}
 
 
@@ -292,7 +294,7 @@ async def toggle_notification_setting_endpoint(
 async def connect_teams_channel(
     connect_data: NotificationTeamsConnectRequest,
     workspace_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -303,14 +305,14 @@ async def connect_teams_channel(
             status_code=403,
             detail="You don't have permission to connect Teams for this workspace",
         )
-    
+
     config = {"webhook_url": connect_data.webhook_url}
-    connected = connect_notification_channel(db, workspace_id, "teams", config)
-    
+    connected = await connect_notification_channel(db, workspace_id, "teams", config)
+
     if not connected:
         raise HTTPException(
             status_code=400,
             detail="Failed to connect Teams channel",
         )
-    
+
     return {"success": True, "message": "Teams channel connected successfully"} 

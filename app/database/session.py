@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 import logging
 
@@ -6,45 +6,52 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+import re
+
+# Helper to get the async driver
+def get_async_driver(uri: str) -> str:
+    if uri.startswith("postgresql"):
+        # Replaces postgresql:// or postgresql+psycopg2:// with postgresql+asyncpg://
+        return re.sub(r"postgresql(\+psycopg2)?://", "postgresql+asyncpg://", uri)
+    if uri.startswith("mysql"):
+        # Replaces mysql:// or mysql+pymysql:// with mysql+aiomysql://
+        return re.sub(r"mysql(\+pymysql)?://", "mysql+aiomysql://", uri)
+    return uri
+
 if settings.DATABASE_URI:
-    engine = create_engine(
-        settings.DATABASE_URI,
-        pool_pre_ping=True, 
-        pool_recycle=settings.DB_POOL_RECYCLE,  
-        pool_size=settings.DB_POOL_SIZE,  
-        max_overflow=settings.DB_MAX_OVERFLOW,  
-        pool_timeout=settings.DB_POOL_TIMEOUT,  
-        echo=False,  
-      
-        connect_args={
-            "charset": "utf8mb4",
-            "autocommit": False,
-            "connect_timeout": 30,  
-            "read_timeout": 60,       
-            "write_timeout": 60,    
-            "init_command": "SET time_zone = '+00:00'", 
-        } if "mysql" in settings.DATABASE_URI else {}
+    async_db_uri = get_async_driver(settings.DATABASE_URI)
+    
+    engine = create_async_engine(
+        async_db_uri,
+        pool_pre_ping=True,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+        echo=False,
     )
-    SessionLocal = sessionmaker(
-        autocommit=False, 
-        autoflush=False, 
+    
+    AsyncSessionLocal = sessionmaker(
         bind=engine,
-        expire_on_commit=False  
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 else:
     logger.warning("No se ha configurado DATABASE_URI. La funcionalidad de base de datos no estará disponible.")
     engine = None
-    SessionLocal = None
+    AsyncSessionLocal = None
 
-def get_db():
-    if SessionLocal is None:
+async def get_db() -> AsyncSession:
+    if AsyncSessionLocal is None:
         raise ValueError("No hay conexión a la base de datos configurada")
     
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
 def get_pool_status():
     if engine is None:
         return {"error": "No database engine configured"}
@@ -80,4 +87,42 @@ def is_pool_healthy():
     status = get_pool_status()
     if "error" in status:
         return False
-    return status.get('pool_utilization', 100) < 80 
+    return status.get('pool_utilization', 100) < 80
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_background_db_session():
+    """
+    Provides an AsyncSession for background tasks, creating a new engine
+    to ensure it's bound to the correct event loop in a separate thread.
+    """
+    if not settings.DATABASE_URI:
+        raise ValueError("No hay conexión a la base de datos configurada")
+
+    # Create a new engine specifically for this background task context
+    local_engine = create_async_engine(
+        get_async_driver(settings.DATABASE_URI),
+        pool_pre_ping=True,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        pool_size=5,  # Smaller pool for background tasks
+        max_overflow=10,
+        echo=False,
+    )
+
+    LocalAsyncSessionMaker = sessionmaker(
+        bind=local_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+    async with LocalAsyncSessionMaker() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+    
+    # Dispose of the engine after the session is closed
+    await local_engine.dispose()

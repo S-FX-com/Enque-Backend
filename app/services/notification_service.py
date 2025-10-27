@@ -2,8 +2,8 @@ import json
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, or_, func, select
 from app.models.notification import NotificationTemplate, NotificationSetting
 from app.models.workspace import Workspace
 from app.models.microsoft import MailboxConnection, MicrosoftToken
@@ -24,22 +24,22 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-def get_notification_templates(db: Session, workspace_id: int) -> List[NotificationTemplate]:
+async def get_notification_templates(db: AsyncSession, workspace_id: int) -> List[NotificationTemplate]:
     """Get all notification templates for a workspace."""
-    return db.query(NotificationTemplate).filter(
-        NotificationTemplate.workspace_id == workspace_id
-    ).all()
+    result = await db.execute(
+        select(NotificationTemplate).filter(NotificationTemplate.workspace_id == workspace_id)
+    )
+    return result.scalars().all()
 
 
-def get_notification_template(db: Session, template_id: int) -> Optional[NotificationTemplate]:
+async def get_notification_template(db: AsyncSession, template_id: int) -> Optional[NotificationTemplate]:
     """Get a notification template by ID."""
-    return db.query(NotificationTemplate).filter(
-        NotificationTemplate.id == template_id
-    ).first()
+    result = await db.execute(select(NotificationTemplate).filter(NotificationTemplate.id == template_id))
+    return result.scalars().first()
 
 
-def create_notification_template(
-    db: Session, workspace_id: int, type: str, name: str, subject: str, template: str
+async def create_notification_template(
+    db: AsyncSession, workspace_id: int, type: str, name: str, subject: str, template: str
 ) -> NotificationTemplate:
     """Create a notification template."""
     db_template = NotificationTemplate(
@@ -51,67 +51,67 @@ def create_notification_template(
         is_enabled=True
     )
     db.add(db_template)
-    db.commit()
-    db.refresh(db_template)
+    await db.commit()
+    await db.refresh(db_template)
     return db_template
 
 
-def update_notification_template(
-    db: Session, template_id: int, template_content: str
+async def update_notification_template(
+    db: AsyncSession, template_id: int, template_content: str
 ) -> Optional[NotificationTemplate]:
     """Update a notification template."""
-    db_template = get_notification_template(db, template_id)
+    db_template = await get_notification_template(db, template_id)
     if not db_template:
         return None
     
     db_template.template = template_content
     db_template.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(db_template)
+    await db.commit()
+    await db.refresh(db_template)
     return db_template
 
 
-def get_notification_settings(db: Session, workspace_id: int) -> List[NotificationSetting]:
+async def get_notification_settings(db: AsyncSession, workspace_id: int) -> List[NotificationSetting]:
     """Get all notification settings for a workspace."""
-    return db.query(NotificationSetting).filter(
-        NotificationSetting.workspace_id == workspace_id
-    ).all()
+    result = await db.execute(select(NotificationSetting).filter(NotificationSetting.workspace_id == workspace_id))
+    return result.scalars().all()
 
 
-def get_notification_setting(db: Session, setting_id: int) -> Optional[NotificationSetting]:
+async def get_notification_setting(db: AsyncSession, setting_id: int) -> Optional[NotificationSetting]:
     """Get a notification setting by ID."""
-    return db.query(NotificationSetting).filter(
-        NotificationSetting.id == setting_id
-    ).first()
+    result = await db.execute(select(NotificationSetting).filter(NotificationSetting.id == setting_id))
+    return result.scalars().first()
 
 
-def toggle_notification_setting(
-    db: Session, setting_id: int, enabled: bool
+async def toggle_notification_setting(
+    db: AsyncSession, setting_id: int, enabled: bool
 ) -> Optional[NotificationSetting]:
     """Toggle a notification setting."""
-    db_setting = get_notification_setting(db, setting_id)
+    db_setting = await get_notification_setting(db, setting_id)
     if not db_setting:
         return None
     
     db_setting.is_enabled = enabled
     db_setting.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(db_setting)
+    await db.commit()
+    await db.refresh(db_setting)
     return db_setting
 
 
-def connect_notification_channel(
-    db: Session, workspace_id: int, channel: str, config: Dict[str, Any]
+async def connect_notification_channel(
+    db: AsyncSession, workspace_id: int, channel: str, config: Dict[str, Any]
 ) -> Optional[NotificationSetting]:
     """Connect a notification channel."""
-    db_setting = db.query(NotificationSetting).filter(
-        NotificationSetting.workspace_id == workspace_id,
-        NotificationSetting.category == "agents",
-        NotificationSetting.type == channel
-    ).first()
+    result = await db.execute(
+        select(NotificationSetting).filter(
+            NotificationSetting.workspace_id == workspace_id,
+            NotificationSetting.category == "agents",
+            NotificationSetting.type == channel
+        )
+    )
+    db_setting = result.scalars().first()
     
     if not db_setting:
-        # Create a new setting if it doesn't exist
         channels = json.dumps([channel])
         db_setting = NotificationSetting(
             workspace_id=workspace_id,
@@ -122,43 +122,34 @@ def connect_notification_channel(
         )
         db.add(db_setting)
     else:
-        # Update existing setting
         db_setting.is_enabled = True
-        # Add configuration data if needed
         if channel == "teams" and "webhook_url" in config:
-            # Store Teams webhook URL or other configuration
             current_channels = json.loads(db_setting.channels) if isinstance(db_setting.channels, str) else db_setting.channels
-            # Add or update teams in the channels
             if "teams" not in current_channels:
                 current_channels.append("teams")
             db_setting.channels = json.dumps(current_channels)
     
     db_setting.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(db_setting)
+    await db.commit()
+    await db.refresh(db_setting)
     return db_setting
 
 
-def format_notification_settings_response(
-    db: Session, workspace_id: int
+async def format_notification_settings_response(
+    db: AsyncSession, workspace_id: int
 ) -> NotificationSettingsResponse:
     """Format notification settings for response."""
-    settings = get_notification_settings(db, workspace_id)
+    settings = await get_notification_settings(db, workspace_id)
     
-    # Initialize default configs
     response = NotificationSettingsResponse()
     
-    # Process all settings
     for setting in settings:
-        # Convert channels from JSON string to list if needed
         channels = json.loads(setting.channels) if isinstance(setting.channels, str) else setting.channels
         
-        # Get template content if applicable
         template_content = None
         if setting.template_id:
-            template = db.query(NotificationTemplate).filter(
-                NotificationTemplate.id == setting.template_id
-            ).first()
+            result = await db.execute(select(NotificationTemplate).filter(NotificationTemplate.id == setting.template_id))
+            template = result.scalars().first()
             if template:
                 template_content = template.template
         
@@ -207,29 +198,24 @@ def format_notification_settings_response(
     return response
 
 
-def is_team_notification_enabled(db: Session, workspace_id: int) -> bool:
+async def is_team_notification_enabled(db: AsyncSession, workspace_id: int) -> bool:
     """
     Check if team notifications are enabled for a workspace.
-    
-    Args:
-        db: Database session
-        workspace_id: Workspace ID
-        
-    Returns:
-        bool: Whether team notifications are enabled
     """
     try:
-        notification_setting = db.query(NotificationSetting).filter(
-            NotificationSetting.workspace_id == workspace_id,
-            NotificationSetting.category == "agents",
-            NotificationSetting.type == "new_ticket_for_team",
-            NotificationSetting.is_enabled == True
-        ).first()
+        result = await db.execute(
+            select(NotificationSetting).filter(
+                NotificationSetting.workspace_id == workspace_id,
+                NotificationSetting.category == "agents",
+                NotificationSetting.type == "new_ticket_for_team",
+                NotificationSetting.is_enabled == True
+            )
+        )
+        notification_setting = result.scalars().first()
         
         if not notification_setting:
             return False
         
-        # Check if email channel is enabled for this notification
         channels = json.loads(notification_setting.channels) if isinstance(notification_setting.channels, str) else notification_setting.channels
         return "email" in channels
         
@@ -239,7 +225,7 @@ def is_team_notification_enabled(db: Session, workspace_id: int) -> bool:
 
 
 async def send_notification(
-    db: Session,
+    db: AsyncSession,
     workspace_id: int,
     category: str,
     notification_type: str,
@@ -268,13 +254,15 @@ async def send_notification(
     try:
         logger.info(f"[NOTIFY] Iniciando envío de notificación: {category}/{notification_type} para {recipient_email} en workspace {workspace_id}")
         
-        # Check if this notification type is enabled
-        notification_setting = db.query(NotificationSetting).filter(
-            NotificationSetting.workspace_id == workspace_id,
-            NotificationSetting.category == category,
-            NotificationSetting.type == notification_type,
-            NotificationSetting.is_enabled == True
-        ).first()
+        result = await db.execute(
+            select(NotificationSetting).filter(
+                NotificationSetting.workspace_id == workspace_id,
+                NotificationSetting.category == category,
+                NotificationSetting.type == notification_type,
+                NotificationSetting.is_enabled == True
+            )
+        )
+        notification_setting = result.scalars().first()
         
         if not notification_setting:
             logger.warning(f"[NOTIFY] Notificación {notification_type} para {category} no está habilitada en workspace {workspace_id}")
@@ -282,7 +270,6 @@ async def send_notification(
         
         logger.info(f"[NOTIFY] Configuración de notificación encontrada: ID={notification_setting.id}, template_id={notification_setting.template_id}")
         
-        # Check if email channel is enabled for this notification
         channels = json.loads(notification_setting.channels) if isinstance(notification_setting.channels, str) else notification_setting.channels
         logger.info(f"[NOTIFY] Canales configurados: {channels}")
         
@@ -290,13 +277,15 @@ async def send_notification(
             logger.warning(f"[NOTIFY] Canal de email no habilitado para notificación {notification_type} en workspace {workspace_id}")
             return False
         
-        # Get the template
         template = None
         if notification_setting.template_id:
-            template = db.query(NotificationTemplate).filter(
-                NotificationTemplate.id == notification_setting.template_id,
-                NotificationTemplate.is_enabled == True
-            ).first()
+            result = await db.execute(
+                select(NotificationTemplate).filter(
+                    NotificationTemplate.id == notification_setting.template_id,
+                    NotificationTemplate.is_enabled == True
+                )
+            )
+            template = result.scalars().first()
             logger.info(f"[NOTIFY] Plantilla encontrada: ID={template.id if template else 'None'}")
         
         if not template:
@@ -306,7 +295,6 @@ async def send_notification(
         success_email = False
         success_teams = False
         
-        # Enviar por email si está habilitado
         if "email" in channels:
             logger.info(f"[NOTIFY] Enviando notificación por EMAIL")
             success_email = await _send_email_notification(
@@ -314,30 +302,32 @@ async def send_notification(
                 recipient_email, task_id
             )
 
-        # Enviar por Microsoft Teams si es un agente y lo tiene habilitado
         if category == "agents":
-            agent = db.query(Agent).filter(
-                Agent.email == recipient_email,
-                Agent.workspace_id == workspace_id
-            ).first()
+            result = await db.execute(
+                select(Agent).filter(
+                    Agent.email == recipient_email,
+                    Agent.workspace_id == workspace_id
+                )
+            )
+            agent = result.scalars().first()
 
             if agent and agent.teams_notifications_enabled:
                 logger.info(f"[NOTIFY] Enviando notificación por TEAMS al agente {agent.id}")
                 try:
-                    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+                    result = await db.execute(select(Workspace).filter(Workspace.id == workspace_id))
+                    workspace = result.scalars().first()
                     if workspace and task_id:
                         link_to_ticket = f"https://{workspace.subdomain}.enque.cc/tickets/{task_id}"
                         
-                        # Usar el subject y un resumen del cuerpo como título y mensaje
                         title = template.subject
                         for var_name, var_value in template_vars.items():
                             placeholder = "{{" + var_name + "}}"
                             title = title.replace(placeholder, str(var_value))
                         
-                        # Extraer un mensaje de vista previa más simple
                         preview_message = f"Ticket #{task_id}: {template_vars.get('ticket_title', '')}"
 
                         graph_service = MicrosoftGraphService(db=db)
+                        await graph_service.initialize()
                         await graph_service.send_teams_activity_notification(
                             agent_id=agent.id,
                             title=title,
@@ -361,7 +351,7 @@ async def send_notification(
 
 
 async def _send_email_notification(
-    db: Session,
+    db: AsyncSession,
     workspace_id: int,
     template: NotificationTemplate,
     template_vars: Dict[str, Any],
@@ -376,21 +366,23 @@ async def _send_email_notification(
         preferred_token = None
         
         if task_id:
-            # Buscar el ticket y su mailbox específico
             from app.models.task import Task
-            task = db.query(Task).filter(Task.id == task_id).first()
+            result = await db.execute(select(Task).filter(Task.id == task_id))
+            task = result.scalars().first()
             
             if task and task.mailbox_connection_id:
                 logger.info(f"[NOTIFY] Ticket {task_id} tiene mailbox específico ID: {task.mailbox_connection_id}")
                 
-                # Buscar el token válido para este mailbox específico
-                mailbox_token_info = db.query(MailboxConnection, MicrosoftToken)\
-                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                result = await db.execute(
+                    select(MailboxConnection, MicrosoftToken)
+                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)
                     .filter(
                         MailboxConnection.id == task.mailbox_connection_id,
                         MailboxConnection.is_active == True,
                         MicrosoftToken.access_token.isnot(None)
-                    ).first()
+                    )
+                )
+                mailbox_token_info = result.first()
                 
                 if mailbox_token_info:
                     preferred_mailbox, preferred_token = mailbox_token_info
@@ -398,21 +390,22 @@ async def _send_email_notification(
                 else:
                     logger.warning(f"[NOTIFY] No se encontró token válido para el mailbox específico del ticket {task_id}")
 
-        # Si no hay mailbox específico o no tiene token válido, usar fallback
         if not preferred_mailbox or not preferred_token:
             logger.info(f"[NOTIFY] Buscando mailbox fallback para workspace {workspace_id}")
             
-            # Get an admin with access to a mailbox to send the email
             try:
-                admin_sender_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
-                    .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
-                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+                result = await db.execute(
+                    select(Agent, MailboxConnection, MicrosoftToken)
+                    .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)
+                    .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)
                     .filter(
                         Agent.workspace_id == workspace_id,
                         Agent.role.in_(['admin', 'manager']),
                         MailboxConnection.is_active == True,
                         MicrosoftToken.access_token.isnot(None)
-                    ).order_by(Agent.role.desc()).first()
+                    ).order_by(Agent.role.desc())
+                )
+                admin_sender_info = result.first()
                 
                 logger.info(f"[NOTIFY] Admin con acceso al mailbox encontrado: {admin_sender_info is not None}")
                 

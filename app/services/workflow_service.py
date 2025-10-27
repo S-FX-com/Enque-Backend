@@ -1,6 +1,6 @@
 from typing import List, Optional, Dict, Any
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, select
 from fastapi import HTTPException, status
 import json
 from datetime import datetime
@@ -20,23 +20,29 @@ logger = logging.getLogger(__name__)
 
 class WorkflowService:
     
-    def __init__(self, db: Session = None):
+    def __init__(self, db: AsyncSession = None):
         """Initialize WorkflowService with optional database session"""
         self.db = db
 
     @staticmethod
-    def get_workflows(db: Session, workspace_id: int, skip: int = 0, limit: int = 100) -> List[Workflow]:
+    async def get_workflows(db: AsyncSession, workspace_id: int, skip: int = 0, limit: int = 100) -> List[Workflow]:
         """Obtener todos los workflows de un workspace"""
-        return db.query(Workflow).filter(
-            Workflow.workspace_id == workspace_id
-        ).offset(skip).limit(limit).all()
+        result = await db.execute(
+            select(Workflow).filter(
+                Workflow.workspace_id == workspace_id
+            ).offset(skip).limit(limit)
+        )
+        return result.scalars().all()
 
     @staticmethod
-    def get_workflow(db: Session, workflow_id: int, workspace_id: int) -> Optional[Workflow]:
+    async def get_workflow(db: AsyncSession, workflow_id: int, workspace_id: int) -> Optional[Workflow]:
         """Obtener un workflow específico"""
-        return db.query(Workflow).filter(
-            and_(Workflow.id == workflow_id, Workflow.workspace_id == workspace_id)
-        ).first()
+        result = await db.execute(
+            select(Workflow).filter(
+                and_(Workflow.id == workflow_id, Workflow.workspace_id == workspace_id)
+            )
+        )
+        return result.scalars().first()
 
     @staticmethod
     def get_default_message_analysis_rules():
@@ -118,12 +124,15 @@ class WorkflowService:
         }
 
     @staticmethod
-    def create_workflow(db: Session, workflow_data: WorkflowCreate, workspace_id: int) -> Workflow:
+    async def create_workflow(db: AsyncSession, workflow_data: WorkflowCreate, workspace_id: int) -> Workflow:
         """Crear un nuevo workflow"""
         # Verificar que el nombre no esté en uso en este workspace
-        existing = db.query(Workflow).filter(
-            and_(Workflow.name == workflow_data.name, Workflow.workspace_id == workspace_id)
-        ).first()
+        result = await db.execute(
+            select(Workflow).filter(
+                and_(Workflow.name == workflow_data.name, Workflow.workspace_id == workspace_id)
+            )
+        )
+        existing = result.scalars().first()
         
         if existing:
             raise HTTPException(
@@ -162,16 +171,16 @@ class WorkflowService:
         )
         
         db.add(db_workflow)
-        db.commit()
-        db.refresh(db_workflow)
+        await db.commit()
+        await db.refresh(db_workflow)
         
         logger.info(f"Created workflow {db_workflow.name} for workspace {workspace_id}")
         return db_workflow
 
     @staticmethod
-    def update_workflow(db: Session, workflow_id: int, workflow_data: WorkflowUpdate, workspace_id: int) -> Workflow:
+    async def update_workflow(db: AsyncSession, workflow_id: int, workflow_data: WorkflowUpdate, workspace_id: int) -> Workflow:
         """Actualizar un workflow existente"""
-        db_workflow = WorkflowService.get_workflow(db, workflow_id, workspace_id)
+        db_workflow = await WorkflowService.get_workflow(db, workflow_id, workspace_id)
         
         if not db_workflow:
             raise HTTPException(
@@ -181,13 +190,16 @@ class WorkflowService:
 
         # Verificar nombre único si se está actualizando
         if workflow_data.name and workflow_data.name != db_workflow.name:
-            existing = db.query(Workflow).filter(
-                and_(
-                    Workflow.name == workflow_data.name,
-                    Workflow.workspace_id == workspace_id,
-                    Workflow.id != workflow_id
+            result = await db.execute(
+                select(Workflow).filter(
+                    and_(
+                        Workflow.name == workflow_data.name,
+                        Workflow.workspace_id == workspace_id,
+                        Workflow.id != workflow_id
+                    )
                 )
-            ).first()
+            )
+            existing = result.scalars().first()
             
             if existing:
                 raise HTTPException(
@@ -214,16 +226,16 @@ class WorkflowService:
             setattr(db_workflow, field, value)
 
         db_workflow.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(db_workflow)
+        await db.commit()
+        await db.refresh(db_workflow)
         
         logger.info(f"Updated workflow {db_workflow.name} for workspace {workspace_id}")
         return db_workflow
 
     @staticmethod
-    def delete_workflow(db: Session, workflow_id: int, workspace_id: int) -> bool:
+    async def delete_workflow(db: AsyncSession, workflow_id: int, workspace_id: int) -> bool:
         """Eliminar un workflow"""
-        db_workflow = WorkflowService.get_workflow(db, workflow_id, workspace_id)
+        db_workflow = await WorkflowService.get_workflow(db, workflow_id, workspace_id)
         
         if not db_workflow:
             raise HTTPException(
@@ -231,16 +243,16 @@ class WorkflowService:
                 detail="Workflow not found"
             )
 
-        db.delete(db_workflow)
-        db.commit()
+        await db.delete(db_workflow)
+        await db.commit()
         
         logger.info(f"Deleted workflow {db_workflow.name} for workspace {workspace_id}")
         return True
 
     @staticmethod
-    def toggle_workflow(db: Session, workflow_id: int, workspace_id: int, is_enabled: bool) -> Workflow:
+    async def toggle_workflow(db: AsyncSession, workflow_id: int, workspace_id: int, is_enabled: bool) -> Workflow:
         """Activar/desactivar un workflow"""
-        db_workflow = WorkflowService.get_workflow(db, workflow_id, workspace_id)
+        db_workflow = await WorkflowService.get_workflow(db, workflow_id, workspace_id)
         
         if not db_workflow:
             raise HTTPException(
@@ -250,17 +262,17 @@ class WorkflowService:
 
         db_workflow.is_enabled = is_enabled
         db_workflow.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(db_workflow)
+        await db.commit()
+        await db.refresh(db_workflow)
         
         status_text = "enabled" if is_enabled else "disabled"
         logger.info(f"Workflow {db_workflow.name} {status_text} for workspace {workspace_id}")
         return db_workflow
 
     @staticmethod
-    def duplicate_workflow(db: Session, workflow_id: int, workspace_id: int) -> Workflow:
+    async def duplicate_workflow(db: AsyncSession, workflow_id: int, workspace_id: int) -> Workflow:
         """Duplicar un workflow"""
-        original_workflow = WorkflowService.get_workflow(db, workflow_id, workspace_id)
+        original_workflow = await WorkflowService.get_workflow(db, workflow_id, workspace_id)
         
         if not original_workflow:
             raise HTTPException(
@@ -272,11 +284,11 @@ class WorkflowService:
         copy_name = f"{original_workflow.name} (Copy)"
         counter = 1
         
-        while db.query(Workflow).filter(
-            and_(Workflow.name == copy_name, Workflow.workspace_id == workspace_id)
-        ).first():
+        result = await db.execute(select(Workflow).filter(and_(Workflow.name == copy_name, Workflow.workspace_id == workspace_id)))
+        while result.scalars().first():
             counter += 1
             copy_name = f"{original_workflow.name} (Copy {counter})"
+            result = await db.execute(select(Workflow).filter(and_(Workflow.name == copy_name, Workflow.workspace_id == workspace_id)))
 
         # Crear duplicado
         duplicate_workflow = Workflow(
@@ -291,8 +303,8 @@ class WorkflowService:
         )
         
         db.add(duplicate_workflow)
-        db.commit()
-        db.refresh(duplicate_workflow)
+        await db.commit()
+        await db.refresh(duplicate_workflow)
         
         logger.info(f"Duplicated workflow {original_workflow.name} as {copy_name} for workspace {workspace_id}")
         return duplicate_workflow
@@ -332,36 +344,27 @@ class WorkflowService:
         ]
 
     @staticmethod
-    def execute_workflows(db: Session, trigger: str, workspace_id: int, context: Dict[str, Any]) -> List[str]:
+    async def execute_workflows(db: AsyncSession, trigger: str, workspace_id: int, context: Dict[str, Any]) -> List[str]:
         """
         Ejecutar workflows que coincidan con el trigger dado
-        
-        Args:
-            db: Sesión de base de datos
-            trigger: El evento que activó el workflow
-            workspace_id: ID del workspace
-            context: Datos del contexto (ticket, comment, etc.)
-            
-        Returns:
-            Lista de nombres de workflows ejecutados
         """
         executed_workflows = []
         
-        # Obtener workflows activos para este trigger
-        workflows = db.query(Workflow).filter(
-            and_(
-                Workflow.workspace_id == workspace_id,
-                Workflow.is_enabled == True,
-                Workflow.trigger == trigger
+        result = await db.execute(
+            select(Workflow).filter(
+                and_(
+                    Workflow.workspace_id == workspace_id,
+                    Workflow.is_enabled == True,
+                    Workflow.trigger == trigger
+                )
             )
-        ).all()
+        )
+        workflows = result.scalars().all()
         
         for workflow in workflows:
             try:
-                # Evaluar condiciones
                 if WorkflowService._evaluate_conditions(workflow.conditions or [], context):
-                    # Ejecutar acciones
-                    WorkflowService._execute_actions(db, workflow.actions or [], context)
+                    await WorkflowService._execute_actions(db, workflow.actions or [], context)
                     executed_workflows.append(workflow.name)
                     logger.info(f"Executed workflow: {workflow.name} for trigger: {trigger}")
                     
@@ -435,7 +438,7 @@ class WorkflowService:
         return False
 
     @staticmethod
-    def _execute_actions(db: Session, actions: List[Dict[str, Any]], context: Dict[str, Any]):
+    async def _execute_actions(db: AsyncSession, actions: List[Dict[str, Any]], context: Dict[str, Any]):
         """Ejecutar las acciones del workflow"""
         for action in actions:
             action_type = action.get('type')
@@ -443,7 +446,7 @@ class WorkflowService:
             
             try:
                 if action_type == "change_priority":
-                    WorkflowService._action_change_priority(db, action_config, context)
+                    await WorkflowService._action_change_priority(db, action_config, context)
                 else:
                     logger.warning(f"Unknown action type: {action_type}")
                     
@@ -456,30 +459,34 @@ class WorkflowService:
                 continue
 
     @staticmethod
-    def _action_change_priority(db: Session, config: Dict[str, Any], context: Dict[str, Any]):
+    async def _action_change_priority(db: AsyncSession, config: Dict[str, Any], context: Dict[str, Any]):
         """Acción: Cambiar prioridad del ticket"""
         ticket = context.get('ticket')
         new_priority = config.get('priority')
         
         if ticket and new_priority:
             ticket.priority = new_priority
-            db.commit()
+            await db.commit()
             logger.info(f"Ticket {ticket.id} priority changed to {new_priority}")
 
-    def process_message_for_workflows(self, message_content: str, workspace_id: int, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    async def process_message_for_workflows(self, message_content: str, workspace_id: int, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
         Process a message against all enabled workflows and execute matching ones
         This is the main entry point for content-based workflow automation
         """
         try:
+            from sqlalchemy import select
+
             if not message_content or not message_content.strip():
                 return []
 
             # Get all enabled workflows for this workspace
-            workflows = self.db.query(Workflow).filter(
+            workflows_stmt = select(Workflow).filter(
                 Workflow.workspace_id == workspace_id,
                 Workflow.is_enabled == True
-            ).all()
+            )
+            workflows_result = await self.db.execute(workflows_stmt)
+            workflows = workflows_result.scalars().all()
 
             if not workflows:
                 return []

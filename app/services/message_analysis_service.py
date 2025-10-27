@@ -1,7 +1,8 @@
 import re
 import logging
 from typing import List, Dict, Optional
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from app.schemas.workflow import MessageAnalysisResult, MessageAnalysisRule
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class MessageAnalysisService:
     NEGATIVE_WORDS = ['bad', 'terrible', 'awful', 'hate', 'angry', 'disappointed', 'worst', 'malo', 'terrible', 'odio']
     
     @classmethod
-    def analyze_message(cls, message_content: str, custom_rules: Optional[MessageAnalysisRule] = None, db: Session = None, workspace_id: int = None) -> MessageAnalysisResult:
+    async def analyze_message(cls, message_content: str, custom_rules: Optional[MessageAnalysisRule] = None, db: AsyncSession = None, workspace_id: int = None) -> MessageAnalysisResult:
         """
         Analyze message content and return analysis results
         """
@@ -47,7 +48,7 @@ class MessageAnalysisService:
             urgency_level = cls._analyze_urgency(message_lower)
             
             # Category detection (using real workspace categories)
-            categories = cls._detect_categories(message_lower, db, workspace_id)
+            categories = await cls._detect_categories(message_lower, db, workspace_id)
             
             # Keywords detection
             keywords_found = cls._find_keywords(message_lower, custom_rules)
@@ -94,42 +95,35 @@ class MessageAnalysisService:
         return 'low'
     
     @classmethod
-    def _detect_categories(cls, message: str, db: Session, workspace_id: int) -> List[str]:
+    async def _detect_categories(cls, message: str, db: AsyncSession, workspace_id: int) -> List[str]:
         """Detect categories mentioned in the message using real workspace categories"""
         categories = []
         
         if db and workspace_id:
             try:
-                # Import here to avoid circular imports
                 from app.models.category import Category
                 
-                # Get all categories for this workspace
-                workspace_categories = db.query(Category).filter(
-                    Category.workspace_id == workspace_id
-                ).all()
+                result = await db.execute(
+                    select(Category).filter(Category.workspace_id == workspace_id)
+                )
+                workspace_categories = result.scalars().all()
                 
-                # Check if message contains any category name
                 for category in workspace_categories:
                     category_name = category.name.lower()
                     if category_name in message:
                         categories.append(category.name)
                         
-                # Also check default keywords for backward compatibility
-                # This helps when users haven't created custom categories yet
                 for category, keywords in cls.DEFAULT_CATEGORY_KEYWORDS.items():
                     if any(keyword in message for keyword in keywords):
-                        # Only add if not already found and category doesn't exist in workspace
                         if category not in [cat.lower() for cat in categories]:
                             categories.append(category)
                             
             except Exception as e:
                 logger.error(f"Error querying workspace categories: {str(e)}")
-                # Fallback to default keywords
                 for category, keywords in cls.DEFAULT_CATEGORY_KEYWORDS.items():
                     if any(keyword in message for keyword in keywords):
                         categories.append(category)
         else:
-            # Fallback to default keywords when no DB session
             for category, keywords in cls.DEFAULT_CATEGORY_KEYWORDS.items():
                 if any(keyword in message for keyword in keywords):
                     categories.append(category)
@@ -203,7 +197,7 @@ class MessageAnalysisService:
         )
     
     @classmethod
-    def check_trigger_match(cls, analysis: MessageAnalysisResult, trigger: str, rules: Optional[MessageAnalysisRule] = None, db: Session = None, workspace_id: int = None) -> bool:
+    async def check_trigger_match(cls, analysis: MessageAnalysisResult, trigger: str, rules: Optional[MessageAnalysisRule] = None, db: AsyncSession = None, workspace_id: int = None) -> bool:
         """
         Check if the analysis results match the workflow trigger
         """
@@ -229,36 +223,31 @@ class MessageAnalysisService:
                 return rules and rules.language and analysis.language == rules.language
                 
             elif trigger.startswith('message.category_'):
-                # Handle both default and custom category triggers
                 if trigger.startswith('message.category_custom_'):
-                    # Custom workspace category trigger
                     safe_name = trigger.replace('message.category_custom_', '')
                     
                     if db and workspace_id:
                         try:
                             from app.models.category import Category
-                            # Find category by matching the safe name format
-                            workspace_categories = db.query(Category).filter(
-                                Category.workspace_id == workspace_id
-                            ).all()
+                            result = await db.execute(
+                                select(Category).filter(Category.workspace_id == workspace_id)
+                            )
+                            workspace_categories = result.scalars().all()
                             
                             for category in workspace_categories:
                                 category_safe_name = category.name.lower().replace(' ', '_').replace('-', '_')
                                 category_safe_name = ''.join(c for c in category_safe_name if c.isalnum() or c == '_')
                                 
                                 if category_safe_name == safe_name:
-                                    # Check if this category was detected
                                     return category.name in analysis.categories
                                     
                         except Exception as e:
                             logger.error(f"Error checking custom category trigger: {str(e)}")
                             return False
                 else:
-                    # Default category trigger (message.category_support, etc.)
                     category = trigger.replace('message.category_', '')
                     return category in analysis.categories
                 
-            # For non-message triggers, always return True (legacy support)
             elif not trigger.startswith('message.'):
                 return True
                 
@@ -266,4 +255,4 @@ class MessageAnalysisService:
             
         except Exception as e:
             logger.error(f"Error checking trigger match: {str(e)}")
-            return False 
+            return False

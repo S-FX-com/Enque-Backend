@@ -1,7 +1,7 @@
 from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
 from app.database.session import get_db
@@ -30,18 +30,18 @@ router = APIRouter()
 @router.post("/setup", response_model=WorkspaceSetupResponse)
 async def setup_workspace_endpoint(
     setup_data: WorkspaceSetupCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     """
     Setup initial workspace with first admin user.
     This is a public endpoint that doesn't require authentication.
     """
-    return setup_workspace(db, setup_data)
+    return await setup_workspace(db, setup_data)
 
 
 @router.get("/", response_model=List[WorkspaceSchema])
 async def read_workspaces(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     skip: int = 0,
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_admin),
@@ -49,21 +49,21 @@ async def read_workspaces(
     """
     Retrieve all workspaces (admin only)
     """
-    workspaces = get_workspaces(db, skip=skip, limit=limit)
+    workspaces = await get_workspaces(db, skip=skip, limit=limit)
     return workspaces
 
 
 @router.post("/", response_model=WorkspaceSchema)
 async def create_workspace_endpoint(
     workspace_in: WorkspaceCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
 ) -> Any:
     """
     Create a new workspace (admin only)
     """
     # Check if subdomain already exists
-    existing_workspace = get_workspace_by_subdomain(db, workspace_in.subdomain)
+    existing_workspace = await get_workspace_by_subdomain(db, workspace_in.subdomain)
     if existing_workspace:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -71,7 +71,7 @@ async def create_workspace_endpoint(
         )
     
     # Create the workspace
-    workspace = create_workspace(db, workspace_in)
+    workspace = await create_workspace(db, workspace_in)
     return workspace
 
 
@@ -88,12 +88,12 @@ async def read_current_workspace(
 @router.get("/by-subdomain/{subdomain}", response_model=WorkspaceSchema)
 async def read_workspace_by_subdomain(
     subdomain: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     """
     Retrieve workspace by subdomain (public endpoint)
     """
-    workspace = get_workspace_by_subdomain(db, subdomain)
+    workspace = await get_workspace_by_subdomain(db, subdomain)
     if not workspace:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -105,13 +105,13 @@ async def read_workspace_by_subdomain(
 @router.get("/{workspace_id}", response_model=WorkspaceSchema)
 async def read_workspace(
     workspace_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
 ) -> Any:
     """
     Retrieve workspace by ID (admin only)
     """
-    workspace = get_workspace(db, workspace_id)
+    workspace = await get_workspace(db, workspace_id)
     if not workspace:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -124,14 +124,14 @@ async def read_workspace(
 async def update_workspace_endpoint(
     workspace_id: int,
     workspace_in: WorkspaceUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
 ) -> Any:
     """
     Update a workspace (admin only)
     """
     # Check if workspace exists
-    workspace = get_workspace(db, workspace_id)
+    workspace = await get_workspace(db, workspace_id)
     if not workspace:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -141,7 +141,7 @@ async def update_workspace_endpoint(
     # Check if subdomain is being changed and already exists
     if "subdomain" in workspace_in.dict(exclude_unset=True):
         if workspace_in.subdomain != workspace.subdomain:
-            existing_workspace = get_workspace_by_subdomain(db, workspace_in.subdomain)
+            existing_workspace = await get_workspace_by_subdomain(db, workspace_in.subdomain)
             if existing_workspace:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -149,23 +149,23 @@ async def update_workspace_endpoint(
                 )
     
     # Update the workspace
-    updated_workspace = update_workspace(db, workspace_id, workspace_in)
+    updated_workspace = await update_workspace(db, workspace_id, workspace_in)
     return updated_workspace
 
 
 @router.delete("/{workspace_id}")
 async def delete_workspace_endpoint(
     workspace_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
 ) -> Any:
     """
     Delete a workspace (admin only)
     """
-    deleted = delete_workspace(db, workspace_id)
+    deleted = await delete_workspace(db, workspace_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
         )
-    return {"message": "Workspace deleted successfully"} 
+    return {"message": "Workspace deleted successfully"}

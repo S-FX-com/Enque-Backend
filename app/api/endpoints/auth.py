@@ -3,7 +3,9 @@ from typing import Any, Optional, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Header, Query 
 from fastapi.responses import RedirectResponse 
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session, joinedload 
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
 from jose import jwt, JWTError
 from app.models.workspace import Workspace
 from app.core.config import settings
@@ -30,49 +32,127 @@ router = APIRouter()
 @limiter.limit("10/minute")
 async def login_access_token(
     request: Request,
-    db: Session = Depends(get_db), 
+    db: AsyncSession = Depends(get_db), 
     form_data: OAuth2PasswordRequestForm = Depends(),
     x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID") 
 ) -> Any:
-    logger.info(f"Login attempt for user: {form_data.username} with X-Workspace-ID: {x_workspace_id or 'Not Provided'}")
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(f"🔑 LOGIN ATTEMPT - User: {form_data.username}, X-Workspace-ID: {x_workspace_id or 'Not Provided'}, IP: {client_ip}, User-Agent: {user_agent[:100]}")
     
-    if not x_workspace_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="X-Workspace-ID header is required for login.",
-        )
-
-    try:
-        requested_workspace_id = int(x_workspace_id)
-    except (ValueError, TypeError):
-        logger.warning(f"Invalid X-Workspace-ID format provided: {x_workspace_id}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid X-Workspace-ID header format.",
-        )
-
-    user = db.query(Agent).filter(
-        Agent.email == form_data.username,
-        Agent.workspace_id == requested_workspace_id
-    ).first()
+    # Manejar workspace ID - puede ser proporcionado o inferido
+    requested_workspace_id = None
+    user = None
+    
+    if x_workspace_id:
+        try:
+            requested_workspace_id = int(x_workspace_id)
+            logger.debug(f"🔍 LOGIN DEBUG - Parsed workspace ID: {requested_workspace_id} for user: {form_data.username}")
+            
+            # Buscar usuario en el workspace especificado
+            result = await db.execute(
+                select(Agent).filter(
+                    Agent.email == form_data.username,
+                    Agent.workspace_id == requested_workspace_id
+                )
+            )
+            user = result.scalars().first()
+            
+            if user:
+                logger.info(f"� LOGIN DEBUG - User {form_data.username} found in specified workspace {requested_workspace_id}")
+            else:
+                logger.warning(f"❌ LOGIN WARNING - User {form_data.username} not found in workspace {requested_workspace_id}")
+                
+        except (ValueError, TypeError):
+            logger.warning(f"⚠️ LOGIN WARNING - Invalid X-Workspace-ID format '{x_workspace_id}' for user: {form_data.username}, IP: {client_ip}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid X-Workspace-ID header format.",
+            )
+    else:
+        # No X-Workspace-ID proporcionado - buscar usuario en todos los workspaces
+        logger.info(f"🔍 LOGIN DEBUG - No X-Workspace-ID provided, searching for {form_data.username} in all workspaces")
+        result = await db.execute(select(Agent).filter(Agent.email == form_data.username))
+        users_found = result.scalars().all()
+        
+        if len(users_found) == 0:
+            logger.warning(f"❌ LOGIN WARNING - User {form_data.username} not found in any workspace")
+        elif len(users_found) == 1:
+            user = users_found[0]
+            requested_workspace_id = user.workspace_id
+            logger.info(f"✅ LOGIN DEBUG - User {form_data.username} found in single workspace {requested_workspace_id}")
+        else:
+            # Usuario existe en múltiples workspaces - requerir X-Workspace-ID
+            workspace_ids = [u.workspace_id for u in users_found]
+            logger.warning(f"⚠️ LOGIN WARNING - User {form_data.username} exists in multiple workspaces {workspace_ids}, X-Workspace-ID required")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User exists in multiple workspaces. X-Workspace-ID header is required to specify which workspace to authenticate against.",
+            )
+    
+    if user:
+        logger.info(f"👤 LOGIN DEBUG - User {form_data.username} (ID: {user.id}) found with auth_method: {user.auth_method}, has_password: {bool(user.password)}, workspace_id: {user.workspace_id}")
+    else:
+        logger.warning(f"❌ LOGIN WARNING - User {form_data.username} not found")
     
     # Verificar contraseña con manejo robusto de errores
     password_valid = False
     try:
         if user:
-            password_valid = verify_password(form_data.password, user.password)
-            logger.info(f"Password verification result for {form_data.username}: {password_valid}")
+            if not user.password:
+                logger.warning(f"⚠️ LOGIN WARNING - User {form_data.username} has no password set (auth_method: {user.auth_method})")
+                password_valid = False
+            else:
+                password_valid = verify_password(form_data.password, user.password)
+                logger.info(f"🔐 LOGIN DEBUG - Password verification result for {form_data.username}: {password_valid}")
+        else:
+            logger.debug(f"🔍 LOGIN DEBUG - Skipping password verification - user not found")
     except Exception as pwd_error:
-        logger.error(f"Error during password verification for {form_data.username}: {pwd_error}")
+        logger.error(f"💥 LOGIN ERROR - Error during password verification for {form_data.username}: {pwd_error}")
         password_valid = False
     
     if not user or not password_valid:
-        logger.warning(f"Authentication failed for user: {form_data.username} (User not found or incorrect password)")
+        auth_failure_reason = "User not found" if not user else "Incorrect password"
+        logger.warning(f"❌ LOGIN FAILED - Authentication failed for user: {form_data.username} - Reason: {auth_failure_reason}, IP: {client_ip}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    logger.info(f"✅ LOGIN SUCCESS - User {user.email} (ID: {user.id}) authenticated successfully. Workspace: {user.workspace_id}, Auth method: {user.auth_method}")
+    logger.info(f"🔐 LOGIN SUCCESS - User {user.email} successfully authenticated and authorized for workspace {user.workspace_id}")
+    
+    user.last_login = datetime.utcnow()
+    origin = None
+
+    origin_header = request.headers.get("origin")
+    if origin_header:
+        origin = origin_header
+        logger.info(f"🌐 LOGIN DEBUG - Setting origin from header for user {user.email}: {origin}")
+    else:
+        logger.debug(f"🌐 LOGIN DEBUG - No origin header found for user {user.email}")
+
+    user.last_login_origin = origin
+    db.add(user)
+    await db.commit()
+    
+    logger.debug(f"🔑 LOGIN DEBUG - Generating token for user {user.email} (ID: {user.id}, Workspace: {user.workspace_id})")
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_payload = {
+        "role": user.role,
+        "workspace_id": str(user.workspace_id),
+        "name": user.name,
+        "email": user.email,
+        "auth_method": user.auth_method
+    }
+    access_token = create_access_token(
+        subject=str(user.id),
+        extra_data=token_payload,
+        expires_delta=access_token_expires
+    )
+    logger.info(f"🎫 LOGIN SUCCESS - Generated token for user {user.email} (ID: {user.id}, Workspace: {user.workspace_id})")
+    return {"access_token": access_token, "token_type": "bearer"}
     
     logger.info(f"User {user.email} (ID: {user.id}) found with matching password. Belongs to workspace {user.workspace_id}.")
     logger.info(f"User {user.email} successfully authenticated and authorized for workspace {user.workspace_id}.")
@@ -122,17 +202,21 @@ async def get_current_user(current_user: Agent = Depends(get_current_active_user
     return current_user
 
 @router.post("/register/agent", response_model=AgentSchema)
-async def register_agent(user_in: AgentCreate, db: Session = Depends(get_db)) -> Any:
-    user = db.query(Agent).filter(
-        Agent.email == user_in.email, 
-        Agent.workspace_id == user_in.workspace_id
-    ).first()
+async def register_agent(user_in: AgentCreate, db: AsyncSession = Depends(get_db)) -> Any:
+    result = await db.execute(
+        select(Agent).filter(
+            Agent.email == user_in.email,
+            Agent.workspace_id == user_in.workspace_id
+        )
+    )
+    user = result.scalars().first()
     if user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail=f"Email already registered in workspace {user_in.workspace_id}"
         )
-    workspace = db.query(Workspace).filter(Workspace.id == user_in.workspace_id).first()
+    result = await db.execute(select(Workspace).filter(Workspace.id == user_in.workspace_id))
+    workspace = result.scalars().first()
     if not workspace:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Workspace with ID {user_in.workspace_id} not found")
     try:
@@ -142,15 +226,17 @@ async def register_agent(user_in: AgentCreate, db: Session = Depends(get_db)) ->
             role=user_in.role, is_active=user_in.is_active,
             workspace_id=user_in.workspace_id
         )
-        db.add(user); db.commit(); db.refresh(user)
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
         return user
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error registrando agente: {str(e)}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error creating agent: {str(e)}")
 
 @router.post("/verify-token", response_model=Dict[str, Any])
-async def verify_token(request: Request, token: str = Header(..., description="JWT Token to verify")) -> Dict[str, Any]:
+async def verify_token(request: Request, db: AsyncSession = Depends(get_db), token: str = Header(..., description="JWT Token to verify")) -> Dict[str, Any]:
     try:
         unverified_payload = jwt.decode(token, key="", options={"verify_signature": False})
         verified_payload = None
@@ -160,9 +246,9 @@ async def verify_token(request: Request, token: str = Header(..., description="J
         user_info = None
         if 'sub' in unverified_payload:
             try:
-                db_session = next(get_db())
                 user_id = unverified_payload.get('sub')
-                user = db_session.query(Agent).filter(Agent.id == user_id).first()
+                result = await db.execute(select(Agent).filter(Agent.id == user_id))
+                user = result.scalars().first()
                 if user:
                     user_info = {"id": user.id, "name": user.name, "email": user.email, "role": user.role, "workspace_id": user.workspace_id, "is_active": user.is_active}
             except Exception as e: user_info = {"error": f"Error fetching user data: {str(e)}"}
@@ -175,7 +261,7 @@ async def verify_token(request: Request, token: str = Header(..., description="J
 async def request_password_reset(
     request: Request,
     request_data: AgentPasswordResetRequest, 
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID")
 ):
     requested_workspace_id: Optional[int] = None
@@ -188,15 +274,19 @@ async def request_password_reset(
     
     # Buscar el agente en el workspace específico si se proporciona
     if requested_workspace_id is not None:
-        agent = db.query(Agent).filter(
-            Agent.email == request_data.email, 
-            Agent.workspace_id == requested_workspace_id,
-            Agent.is_active == True
-        ).first()
+        result = await db.execute(
+            select(Agent).filter(
+                Agent.email == request_data.email,
+                Agent.workspace_id == requested_workspace_id,
+                Agent.is_active == True
+            )
+        )
+        agent = result.scalars().first()
         logger.info(f"Password reset requested for {request_data.email} in workspace {requested_workspace_id}: {'Found' if agent else 'Not found'}")
     else:
         # Si no se proporciona workspace_id, buscar solo por email (comportamiento original)
-        agent = db.query(Agent).filter(Agent.email == request_data.email, Agent.is_active == True).first()
+        result = await db.execute(select(Agent).filter(Agent.email == request_data.email, Agent.is_active == True))
+        agent = result.scalars().first()
         logger.info(f"Password reset requested for {request_data.email} without workspace restriction: {'Found' if agent else 'Not found'}")
     
     if not agent:
@@ -204,7 +294,8 @@ async def request_password_reset(
         return {"message": "If an account with that email exists, a password reset link has been sent."}
 
     # Get the workspace information to construct the correct reset link
-    workspace = db.query(Workspace).filter(Workspace.id == agent.workspace_id).first()
+    result = await db.execute(select(Workspace).filter(Workspace.id == agent.workspace_id))
+    workspace = result.scalars().first()
     if not workspace:
         logger.error(f"Workspace not found for agent {agent.email} (workspace_id: {agent.workspace_id})")
         return {"message": "If an account with that email exists, a password reset link has been sent."}
@@ -212,20 +303,24 @@ async def request_password_reset(
     token = secrets.token_urlsafe(32)
     agent.password_reset_token = token
     agent.password_reset_token_expires_at = datetime.utcnow() + timedelta(hours=settings.PASSWORD_RESET_TOKEN_EXPIRE_HOURS)
-    db.add(agent); db.commit()
+    db.add(agent)
+    await db.commit()
     
     # Construct reset link using workspace subdomain, similar to invitation links
     reset_link = f"https://{workspace.subdomain}.enque.cc/reset-password?token={token}"
     
-    admin_sender_mailbox_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
-        .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
-        .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+    result = await db.execute(
+        select(Agent, MailboxConnection, MicrosoftToken)
+        .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)
+        .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)
         .filter(
             Agent.workspace_id == agent.workspace_id,
             Agent.role.in_(['admin', 'manager']),
             MailboxConnection.is_active == True,
             MicrosoftToken.access_token.isnot(None)
-        ).order_by(Agent.role.desc()).first()
+        ).order_by(Agent.role.desc())
+    )
+    admin_sender_mailbox_info = result.first()
 
     if not admin_sender_mailbox_info:
         logger.error(f"No admin/manager with an active and tokenized mailbox found in workspace {agent.workspace_id} to send password reset for {agent.email}.")
@@ -256,8 +351,9 @@ async def request_password_reset(
 
 @router.post("/reset-password", response_model=Token)
 @limiter.limit("10/minute")
-async def reset_password(request: Request, reset_data: AgentResetPassword, db: Session = Depends(get_db)):
-    agent = db.query(Agent).filter(Agent.password_reset_token == reset_data.token).first()
+async def reset_password(request: Request, reset_data: AgentResetPassword, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Agent).filter(Agent.password_reset_token == reset_data.token))
+    agent = result.scalars().first()
     if not agent:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired password reset token.")
     if not agent.is_active:
@@ -265,13 +361,15 @@ async def reset_password(request: Request, reset_data: AgentResetPassword, db: S
     if agent.password_reset_token_expires_at and agent.password_reset_token_expires_at < datetime.utcnow():
         agent.password_reset_token = None
         agent.password_reset_token_expires_at = None
-        db.commit()
+        await db.commit()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password reset token has expired. Please request a new one.")
 
     agent.password = get_password_hash(reset_data.new_password)
     agent.password_reset_token = None
     agent.password_reset_token_expires_at = None
-    db.add(agent); db.commit(); db.refresh(agent)
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
     logger.info(f"Password successfully reset for agent {agent.email} (ID: {agent.id})")
 
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -284,38 +382,48 @@ async def reset_password(request: Request, reset_data: AgentResetPassword, db: S
 async def microsoft_login(
     request: Request,
     microsoft_data: AgentMicrosoftLogin, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Any:
-    logger.info(f"Microsoft login attempt for user: {microsoft_data.microsoft_email}")
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(f"🔑 MICROSOFT LOGIN ATTEMPT - User: {microsoft_data.microsoft_email}, Workspace ID: {microsoft_data.workspace_id}, IP: {client_ip}, User-Agent: {user_agent[:100]}")
+    
     workspace_id = microsoft_data.workspace_id
     if not workspace_id:
-        workspace = db.query(Workspace).first()
-        if not workspace:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No workspace available. Please contact support."
-            )
-        workspace_id = workspace.id
-    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        logger.error(f"❌ MICROSOFT LOGIN FAILED - Missing workspace_id for user: {microsoft_data.microsoft_email}, IP: {client_ip}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workspace ID is required for Microsoft login. Please specify the workspace."
+        )
+    
+    logger.debug(f"🔍 MICROSOFT LOGIN DEBUG - Validating workspace {workspace_id}")
+    result = await db.execute(select(Workspace).filter(Workspace.id == workspace_id))
+    workspace = result.scalars().first()
     if not workspace:
+        logger.error(f"❌ MICROSOFT LOGIN FAILED - Workspace {workspace_id} not found for user: {microsoft_data.microsoft_email}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Workspace with ID {workspace_id} not found"
         )
-    logger.info(f"🔍 Searching for agent with microsoft_id: {microsoft_data.microsoft_id} in workspace: {workspace_id}")
-    agent = db.query(Agent).filter(
-        Agent.microsoft_id == microsoft_data.microsoft_id,
-        Agent.workspace_id == workspace_id
-    ).first()
-    agent_any_workspace = db.query(Agent).filter(
-        Agent.microsoft_id == microsoft_data.microsoft_id
-    ).first()
+    
+    logger.info(f"🔍 MICROSOFT LOGIN DEBUG - Searching for agent with microsoft_id: {microsoft_data.microsoft_id} in workspace: {workspace_id}")
+    result = await db.execute(
+        select(Agent).filter(
+            Agent.microsoft_id == microsoft_data.microsoft_id,
+            Agent.workspace_id == workspace_id
+        )
+    )
+    agent = result.scalars().first()
+    
+    # También buscar en otros workspaces para debugging
+    result = await db.execute(select(Agent).filter(Agent.microsoft_id == microsoft_data.microsoft_id))
+    agent_any_workspace = result.scalars().first()
     
     if agent_any_workspace and agent_any_workspace.workspace_id != workspace_id:
-        logger.warning(f"⚠️ Found agent with microsoft_id in different workspace: {agent_any_workspace.workspace_id} (expected: {workspace_id})")
+        logger.warning(f"⚠️ MICROSOFT LOGIN WARNING - Found agent with microsoft_id {microsoft_data.microsoft_id} in different workspace: {agent_any_workspace.workspace_id} (expected: {workspace_id})")
     
     if agent:
-        logger.info(f"Existing Microsoft agent found: {agent.email}")
+        logger.info(f"✅ MICROSOFT LOGIN SUCCESS - Existing Microsoft agent found: {agent.email} (ID: {agent.id}, Workspace: {agent.workspace_id})")
         agent.microsoft_email = microsoft_data.microsoft_email
         agent.microsoft_tenant_id = microsoft_data.microsoft_tenant_id
         agent.microsoft_profile_data = microsoft_data.microsoft_profile_data
@@ -323,13 +431,17 @@ async def microsoft_login(
         agent.last_login_origin = "Microsoft 365"
         
     else:
-        agent = db.query(Agent).filter(
-            Agent.email == microsoft_data.microsoft_email,
-            Agent.workspace_id == workspace_id
-        ).first()
+        logger.debug(f"🔍 MICROSOFT LOGIN DEBUG - Agent not found by microsoft_id, searching by email: {microsoft_data.microsoft_email}")
+        result = await db.execute(
+            select(Agent).filter(
+                Agent.email == microsoft_data.microsoft_email,
+                Agent.workspace_id == workspace_id
+            )
+        )
+        agent = result.scalars().first()
         
         if agent:
-            logger.info(f"Linking Microsoft account to existing agent: {agent.email}")
+            logger.info(f"🔗 MICROSOFT LOGIN LINK - Linking Microsoft account to existing agent: {agent.email} (ID: {agent.id})")
             agent.microsoft_id = microsoft_data.microsoft_id
             agent.microsoft_email = microsoft_data.microsoft_email
             agent.microsoft_tenant_id = microsoft_data.microsoft_tenant_id
@@ -339,12 +451,14 @@ async def microsoft_login(
             agent.last_login_origin = "Microsoft 365"
             
         else:
-            logger.info(f"Creating new Microsoft agent: {microsoft_data.microsoft_email}")
+            logger.info(f"🆕 MICROSOFT LOGIN CREATE - Creating new Microsoft agent: {microsoft_data.microsoft_email} in workspace {workspace_id}")
             try:
                 profile_data = json.loads(microsoft_data.microsoft_profile_data) if microsoft_data.microsoft_profile_data else {}
                 display_name = profile_data.get("displayName", microsoft_data.microsoft_email.split("@")[0])
-            except:
+                logger.debug(f"🔍 MICROSOFT LOGIN DEBUG - Extracted display name: {display_name} for user: {microsoft_data.microsoft_email}")
+            except json.JSONDecodeError:
                 display_name = microsoft_data.microsoft_email.split("@")[0]
+                logger.warning(f"⚠️ MICROSOFT LOGIN WARNING - Failed to parse profile data for {microsoft_data.microsoft_email}, using fallback display name: {display_name}")
                 
             agent = Agent(
                 name=display_name,
@@ -364,8 +478,8 @@ async def microsoft_login(
             db.add(agent)
     
     try:
-        db.commit()
-        db.refresh(agent)
+        await db.commit()
+        await db.refresh(agent)
         logger.info(f"Microsoft authentication successful for agent {agent.email} (ID: {agent.id})")
         
         # Extract and save Microsoft 365 avatar if available
@@ -435,14 +549,17 @@ async def microsoft_login(
 async def link_microsoft_account(
     microsoft_data: AgentMicrosoftLinkRequest,
     current_agent: Agent = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Any:
     logger.info(f"Linking Microsoft account {microsoft_data.microsoft_email} to agent {current_agent.email}")
-    existing_microsoft_agent = db.query(Agent).filter(
-        Agent.microsoft_id == microsoft_data.microsoft_id,
-        Agent.workspace_id == current_agent.workspace_id,
-        Agent.id != current_agent.id
-    ).first()
+    result = await db.execute(
+        select(Agent).filter(
+            Agent.microsoft_id == microsoft_data.microsoft_id,
+            Agent.workspace_id == current_agent.workspace_id,
+            Agent.id != current_agent.id
+        )
+    )
+    existing_microsoft_agent = result.scalars().first()
     
     if existing_microsoft_agent:
         raise HTTPException(
@@ -459,8 +576,8 @@ async def link_microsoft_account(
         pass
     
     try:
-        db.commit()
-        db.refresh(current_agent)
+        await db.commit()
+        await db.refresh(current_agent)
         logger.info(f"Successfully linked Microsoft account to agent {current_agent.email}")
         
         return {
@@ -470,7 +587,7 @@ async def link_microsoft_account(
         }
         
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"Error linking Microsoft account: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -483,7 +600,7 @@ async def link_microsoft_account(
 async def get_microsoft_auth_url(
     request: Request,
     workspace_id: Optional[int] = Query(None, description="Workspace ID for authentication"),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         # Get original hostname from referer first
@@ -499,13 +616,15 @@ async def get_microsoft_auth_url(
             # Extract subdomain from hostname (e.g., "sfx" from "sfx.enque.cc")
             if original_hostname.endswith('.enque.cc'):
                 subdomain = original_hostname.replace('.enque.cc', '')
-                workspace = db.query(Workspace).filter(Workspace.subdomain == subdomain).first()
+                result = await db.execute(select(Workspace).filter(Workspace.subdomain == subdomain))
+                workspace = result.scalars().first()
                 if workspace:
                     workspace_id = workspace.id
             
         # Default workspace if still not found
         if not workspace_id:
-            workspace = db.query(Workspace).first()
+            result = await db.execute(select(Workspace))
+            workspace = result.scalars().first()
             if not workspace:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -514,7 +633,8 @@ async def get_microsoft_auth_url(
             workspace_id = workspace.id
             
         # Validate workspace exists
-        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        result = await db.execute(select(Workspace).filter(Workspace.id == workspace_id))
+        workspace = result.scalars().first()
         if not workspace:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -559,20 +679,21 @@ async def get_microsoft_auth_url(
 async def check_auth_methods(
     email: str = Query(..., description="Email address to check authentication methods for"),
     x_workspace_id: Optional[str] = Header(None, alias="X-Workspace-ID"),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Any:
     """
     Check available authentication methods for a user by email.
     Returns the auth methods available and whether Microsoft is required.
     """
-    logger.info(f"Checking auth methods for email: {email} with X-Workspace-ID: {x_workspace_id or 'Not Provided'}")
+    logger.info(f"🔍 AUTH METHODS CHECK - Email: {email}, X-Workspace-ID: {x_workspace_id or 'Not Provided'}")
     
     requested_workspace_id: Optional[int] = None
     if x_workspace_id:
         try:
             requested_workspace_id = int(x_workspace_id)
+            logger.debug(f"🔍 AUTH METHODS DEBUG - Parsed workspace ID: {requested_workspace_id}")
         except ValueError:
-            logger.warning(f"Invalid X-Workspace-ID format provided: {x_workspace_id}")
+            logger.warning(f"⚠️ AUTH METHODS WARNING - Invalid X-Workspace-ID format: {x_workspace_id}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid X-Workspace-ID header format.",
@@ -581,18 +702,24 @@ async def check_auth_methods(
     # Search for user
     user = None
     if requested_workspace_id is not None:
-        user = db.query(Agent).filter(
-            Agent.email == email,
-            Agent.workspace_id == requested_workspace_id
-        ).first()
-        logger.info(f"Searching for user {email} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
+        logger.debug(f"🔍 AUTH METHODS DEBUG - Searching for {email} in workspace {requested_workspace_id}")
+        result = await db.execute(
+            select(Agent).filter(
+                Agent.email == email,
+                Agent.workspace_id == requested_workspace_id
+            )
+        )
+        user = result.scalars().first()
+        logger.info(f"🔍 AUTH METHODS SEARCH - User {email} in workspace {requested_workspace_id}: {'Found' if user else 'Not found'}")
     else:
-        user = db.query(Agent).filter(Agent.email == email).first()
-        logger.info(f"Searching for user {email} without workspace restriction: {'Found' if user else 'Not found'}")
+        logger.debug(f"🔍 AUTH METHODS DEBUG - Searching for {email} in all workspaces")
+        result = await db.execute(select(Agent).filter(Agent.email == email))
+        user = result.scalars().first()
+        logger.info(f"🔍 AUTH METHODS SEARCH - User {email} without workspace restriction: {'Found' if user else 'Not found'}")
     
     if not user:
         # User not found - return default auth methods (password only)
-        logger.info(f"User {email} not found, returning default auth methods")
+        logger.info(f"❌ AUTH METHODS WARNING - User {email} not found, returning default auth methods")
         return {
             "email": email,
             "user_exists": False,
@@ -604,23 +731,42 @@ async def check_auth_methods(
         }
     
     # User found - analyze their auth method
+    logger.info(f"👤 AUTH METHODS SUCCESS - User {email} found: ID={user.id}, Workspace={user.workspace_id}, Auth method={user.auth_method}")
     auth_method = user.auth_method
     has_microsoft = bool(user.microsoft_id and user.microsoft_email)
     has_password = bool(user.password)
     
+    logger.debug(f"🔍 AUTH METHODS DEBUG - Has Microsoft: {has_microsoft}, Has Password: {has_password}")
+    
     auth_methods = []
     if auth_method == "password":
+        logger.debug(f"🔍 AUTH METHODS DEBUG - User {email} configured for password authentication")
         auth_methods = ["password"]
+        if has_microsoft:
+            auth_methods.append("microsoft")
+            logger.debug(f"✅ AUTH METHODS INFO - Microsoft login also available for {email}")
     elif auth_method == "microsoft":
+        logger.debug(f"🔍 AUTH METHODS DEBUG - User {email} configured for Microsoft authentication")
         auth_methods = ["microsoft"]
+        if has_password:
+            auth_methods.append("password")
+            logger.debug(f"✅ AUTH METHODS INFO - Password login also available for {email}")
     elif auth_method == "both":
+        logger.debug(f"🔍 AUTH METHODS DEBUG - User {email} configured for both authentication methods")
         auth_methods = ["password", "microsoft"]
+    else:
+        logger.warning(f"⚠️ AUTH METHODS WARNING - User {email} has unknown auth method: {auth_method}")
+        # Fallback - try to determine from available data
+        if has_password:
+            auth_methods.append("password")
+        if has_microsoft:
+            auth_methods.append("microsoft")
     
     requires_microsoft = auth_method == "microsoft"
     can_use_password = auth_method in ["password", "both"] and has_password
     can_use_microsoft = auth_method in ["microsoft", "both"] and has_microsoft
     
-    logger.info(f"User {email} found with auth_method: {auth_method}, has_microsoft: {has_microsoft}, has_password: {has_password}")
+    logger.info(f"✅ AUTH METHODS RESULT - Email: {email}, Methods: {auth_methods}, Requires Microsoft: {requires_microsoft}, Password Available: {can_use_password}, Microsoft Available: {can_use_microsoft}")
     
     return {
         "email": email,

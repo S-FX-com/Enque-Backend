@@ -6,6 +6,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
 from pydantic import BaseModel
 from app.api.dependencies import get_current_active_user
 from app.database.session import get_db
@@ -21,7 +22,6 @@ from app.schemas.task import TaskStatus, Task as TaskSchema, TicketWithDetails
 from app.services.microsoft_service import get_microsoft_service, MicrosoftGraphService
 from app.services.task_service import send_assignment_notification
 from app.utils.logger import logger
-from app.core.socketio import emit_comment_update_sync
 from app.core.config import settings
 from app.core.exceptions import MicrosoftAPIException, DatabaseException
 from app.services.workflow_service import WorkflowService
@@ -226,11 +226,15 @@ async def create_comment(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid email addresses in bcc_recipients: {str(e)}"
             )
-    task = db.query(TaskModel).filter(
+    task_stmt = select(TaskModel).options(
+        joinedload(TaskModel.user)  # Eager load user to avoid lazy loading issues
+    ).filter(
         TaskModel.id == task_id,
         TaskModel.workspace_id == current_user.workspace_id,
         TaskModel.is_deleted == False
-    ).first()
+    )
+    task_result = await db.execute(task_stmt)
+    task = task_result.scalar_one_or_none()
 
     if not task:
         raise HTTPException(
@@ -280,10 +284,12 @@ async def create_comment(
                 # Set the first recipient as the new primary contact
                 new_primary_email = to_recipients[0] # Use original casing
                 
-                new_primary_user = db.query(User).filter(
+                new_primary_user_stmt = select(User).filter(
                     User.email.ilike(new_primary_email),
                     User.workspace_id == current_user.workspace_id
-                ).first()
+                )
+                new_primary_user_result = await db.execute(new_primary_user_stmt)
+                new_primary_user = new_primary_user_result.scalar_one_or_none()
 
                 if new_primary_user:
                     task.user_id = new_primary_user.id
@@ -387,10 +393,10 @@ async def create_comment(
             attachment_ids=comment_in.attachment_ids or []
         )
         db.add(scheduled_comment)
-        db.commit()
+        await db.commit()
 
         # Read back from DB to verify
-        db.refresh(scheduled_comment)
+        await db.refresh(scheduled_comment)
         logger.info(f"🕐 DEBUG - After DB storage:")
         logger.info(f"   DB stored: {scheduled_comment.scheduled_send_at}")
         logger.info(f"   DB type: {type(scheduled_comment.scheduled_send_at)}")
@@ -423,15 +429,19 @@ async def create_comment(
     processed_attachment_ids = []
     if comment_in.attachment_ids:
         from app.models.ticket_attachment import TicketAttachment
-        db.commit()
-        db.refresh(comment)
+        await db.commit()
+        await db.refresh(comment)
 
         logger.info(f"Processing {len(comment_in.attachment_ids)} attachment IDs for comment ID {comment.id}: {comment_in.attachment_ids}")
 
         for attachment_id in comment_in.attachment_ids:
-            attachment = db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
+            attachment_stmt = select(TicketAttachment).filter(TicketAttachment.id == attachment_id)
+            attachment_result = await db.execute(attachment_stmt)
+            attachment = attachment_result.scalar_one_or_none()
             if attachment:
-                prev_comment = db.query(CommentModel).filter(CommentModel.id == attachment.comment_id).first()
+                prev_comment_stmt = select(CommentModel).filter(CommentModel.id == attachment.comment_id)
+                prev_comment_result = await db.execute(prev_comment_stmt)
+                prev_comment = prev_comment_result.scalar_one_or_none()
                 if prev_comment and prev_comment.content == "TEMP_ATTACHMENT_PLACEHOLDER":
                     attachment.comment_id = comment.id
                     db.add(attachment)
@@ -442,8 +452,8 @@ async def create_comment(
             else:
                 logger.warning(f"Adjunto {attachment_id} no encontrado al crear el comentario {comment.id}")
     else:
-        db.commit()
-        db.refresh(comment)
+        await db.commit()
+        await db.refresh(comment)
     if s3_html_url and comment.id:
         try:
             s3_service = get_s3_service()
@@ -473,7 +483,7 @@ async def create_comment(
                 'previous_assignee_id': previous_assignee_id,
                 'current_assignee_id': task.assignee_id
             }
-            workflow_results = workflow_service.process_message_for_workflows(
+            workflow_results = await workflow_service.process_message_for_workflows(
                 comment_in.content,
                 current_user.workspace_id,
                 workflow_context
@@ -489,10 +499,12 @@ async def create_comment(
                                 if action_result.get('status') == 'success':
                                     action_data = action_result.get('result', {})
                                     if 'assigned_to' in action_data and not assignee_changed:
-                                        assignee = db.query(AgentModel).filter(
+                                        assignee_stmt = select(AgentModel).filter(
                                             AgentModel.email == action_data['assigned_to'],
                                             AgentModel.workspace_id == current_user.workspace_id
-                                        ).first()
+                                        )
+                                        assignee_result = await db.execute(assignee_stmt)
+                                        assignee = assignee_result.scalar_one_or_none()
                                         if assignee:
                                             task.assignee_id = assignee.id
                                             assignee_changed = True
@@ -509,8 +521,8 @@ async def create_comment(
                         continue
 
                 # Commit changes made by workflows
-                db.commit()
-                db.refresh(task)
+                await db.commit()
+                await db.refresh(task)
 
     except Exception as e:
         logger.error(f"Error processing workflows for comment {comment.id}: {str(e)}")
@@ -527,13 +539,13 @@ async def create_comment(
         logger.info(f"Activity logged for comment creation: comment {comment.id} on task {task_id} by agent {current_user.id}")
     except Exception as e:
         logger.error(f"Error creating activity for comment {comment.id}: {e}")
-    db.commit()
-    db.refresh(task)
-    db.refresh(comment)
+    await db.commit()
+    await db.refresh(task)
+    await db.refresh(comment)
 
     try:
         context = {'ticket': task, 'comment': comment, 'agent': current_user}
-        executed_workflows = WorkflowService.execute_workflows(
+        executed_workflows = await WorkflowService.execute_workflows(
             db=db,
             trigger='comment.added',
             workspace_id=task.workspace_id,
@@ -542,19 +554,21 @@ async def create_comment(
 
         if not comment_in.is_private:
             if current_user:  # Es un agente
-                executed_workflows.extend(WorkflowService.execute_workflows(
+                agent_workflows = await WorkflowService.execute_workflows(
                     db=db,
                     trigger='agent.replied',
                     workspace_id=task.workspace_id,
                     context=context
-                ))
+                )
+                executed_workflows.extend(agent_workflows)
             else:
-                executed_workflows.extend(WorkflowService.execute_workflows(
+                customer_workflows = await WorkflowService.execute_workflows(
                     db=db,
                     trigger='customer.replied',
                     workspace_id=task.workspace_id,
                     context=context
-                ))
+                )
+                executed_workflows.extend(customer_workflows)
 
         if executed_workflows:
             logger.info(f"Executed workflows for comment creation {comment.id}: {executed_workflows}")
@@ -569,8 +583,11 @@ async def create_comment(
             if not origin_url:
                 origin_url = settings.FRONTEND_URL
             logger.info(f"Using {origin_url} for assignment notification")
-            assigned_agent = db.query(AgentModel).filter(AgentModel.id == task.assignee_id).first()
+            assigned_agent_stmt = select(AgentModel).filter(AgentModel.id == task.assignee_id)
+            assigned_agent_result = await db.execute(assigned_agent_stmt)
+            assigned_agent = assigned_agent_result.scalar_one_or_none()
             if assigned_agent:
+                task.assignee = assigned_agent
                 from app.services.task_service import send_assignment_notification
                 await send_assignment_notification(db, task, origin_url)
                 logger.info(f"Notification scheduled for new assignment from comment: task {task_id} to agent {task.assignee_id}")
@@ -584,13 +601,17 @@ async def create_comment(
 
             task_user = None
             if task.user_id:
-                task_user = db.query(User).filter(User.id == task.user_id).first()
+                task_user_stmt = select(User).filter(User.id == task.user_id)
+                task_user_result = await db.execute(task_user_stmt)
+                task_user = task_user_result.scalar_one_or_none()
 
-            agents = db.query(AgentModel).filter(
+            agents_stmt = select(AgentModel).filter(
                 AgentModel.workspace_id == task.workspace_id,
                 AgentModel.is_active == True,
                 AgentModel.id != current_user.id  # Don't notify the commenting agent
-            ).all()
+            )
+            agents_result = await db.execute(agents_stmt)
+            agents = agents_result.scalars().all()
 
             for agent in agents:
                 if agent.email:
@@ -621,12 +642,12 @@ async def create_comment(
 
     # Final commit for any remaining changes
     try:
-        db.commit()
-        db.refresh(comment)
-        db.refresh(task)
+        await db.commit()
+        await db.refresh(comment)
+        await db.refresh(task)
     except Exception as e:
         logger.error(f"Error in final commit for comment {comment.id}: {e}")
-        db.rollback()
+        await db.rollback()
         raise HTTPException(status_code=500, detail="Error saving comment")
 
     if not comment_in.is_private:
@@ -635,7 +656,7 @@ async def create_comment(
             db_path = str(settings.DATABASE_URI)
 
             background_tasks.add_task(
-                send_email_in_background,
+                run_send_email_in_background,
                 task_id=task_id,
                 comment_id=comment.id,
                 comment_content=comment_in.content,
@@ -653,18 +674,34 @@ async def create_comment(
         except Exception as e:
             logger.error(f"Error queuing email background task for comment {comment.id}: {e}")
 
-    # Load the task with all necessary relationships
-    task_with_details = db.query(TaskModel).options(
-        joinedload(TaskModel.assignee),
-        joinedload(TaskModel.comments).joinedload(CommentModel.agent),
-        joinedload(TaskModel.comments).joinedload(CommentModel.attachments),
-        joinedload(TaskModel.user)
-    ).filter(TaskModel.id == task_id).first()
+    # Load the task with all necessary relationships to prevent lazy loading issues
+    from sqlalchemy.orm import selectinload
 
-    comment_with_agent = db.query(CommentModel).options(
+    task_with_details_stmt = select(TaskModel).options(
+        # Use selectinload for collections to avoid cartesian product, joinedload for one-to-one
+        selectinload(TaskModel.comments).selectinload(CommentModel.agent),
+        selectinload(TaskModel.comments).selectinload(CommentModel.attachments),
+        selectinload(TaskModel.email_mappings), # For is_from_email property
+        joinedload(TaskModel.assignee),
+        joinedload(TaskModel.user).selectinload(User.company), # Eager load user and its company
+        joinedload(TaskModel.workspace),
+        joinedload(TaskModel.team),
+        joinedload(TaskModel.company),
+        joinedload(TaskModel.sent_from),
+        joinedload(TaskModel.sent_to),
+        joinedload(TaskModel.category),
+        joinedload(TaskModel.body),
+        joinedload(TaskModel.merged_by_agent)
+    ).filter(TaskModel.id == task_id)
+    task_with_details_result = await db.execute(task_with_details_stmt)
+    task_with_details = task_with_details_result.unique().scalar_one_or_none()
+
+    comment_with_agent_stmt = select(CommentModel).options(
         joinedload(CommentModel.agent),
         joinedload(CommentModel.attachments)
-    ).filter(CommentModel.id == comment.id).first()
+    ).filter(CommentModel.id == comment.id)
+    comment_with_agent_result = await db.execute(comment_with_agent_stmt)
+    comment_with_agent = comment_with_agent_result.unique().scalar_one_or_none()
 
     response_data = CommentResponseModel(
         comment=comment_with_agent,
@@ -684,9 +721,10 @@ async def create_comment(
         return None
 
     try:
-        task_user = db.query(User).options(
-            joinedload(User.company)
-        ).filter(User.id == task.user_id).first()
+        task_user_result = await db.execute(
+            select(User).options(joinedload(User.company)).filter(User.id == task.user_id)
+        )
+        task_user = task_user_result.scalar_one_or_none()
 
         comment_data = {
             'id': comment.id,
@@ -715,8 +753,9 @@ async def create_comment(
             ] if comment_with_agent.attachments else []
         }
 
-        # Emitir evento de forma síncrona
-        emit_comment_update_sync(
+        # Emitir evento de forma asíncrona
+        from app.core.socketio import emit_comment_update
+        await emit_comment_update(
             workspace_id=current_user.workspace_id,
             comment_data=comment_data
         )
@@ -866,6 +905,13 @@ async def delete_comment(
     db.commit()
 
     return comment
+def run_send_email_in_background(*args, **kwargs):
+    """Wrapper to run email function in background task."""
+    try:
+        send_email_in_background(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Error running background email task: {e}", exc_info=True)
+
 def send_email_in_background(
     task_id: int,
     comment_id: int,
@@ -882,104 +928,102 @@ def send_email_in_background(
 ):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker, joinedload
+    from sqlalchemy import select
     from app.models.task import Task as TaskModel
     from app.models.agent import Agent as AgentModel
     from app.models.microsoft import MailboxConnection
-    from app.services.microsoft_service import get_microsoft_service
 
     engine = create_engine(db_path)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    db = SessionLocal()
-    task_with_user = None
+    
+    with SessionLocal() as db:
+        task_with_user = None
 
-    try:
-        agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
-        if not agent:
-            logger.warning(f"Background email task: Agent {agent_id} not found.")
-            return
-        if is_private:
-            logger.info(f"Background email task: Comment {comment_id} is private, skipping email.")
-            return
-
-        db.expire_all()
-        task_with_user = db.query(TaskModel).options(
-            joinedload(TaskModel.user)
-        ).filter(TaskModel.id == task_id).first()
-
-        if not task_with_user:
-            logger.warning(f"Background email task: Task {task_id} not found.")
-            return
-
-        if task_with_user.mailbox_connection_id:
-            logger.info(f"Background email task: Sending reply for task {task_id} via connected mailbox {task_with_user.mailbox_connection_id}")
-            microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_reply_email(
-                task_id=task_id,
-                reply_content=comment_content,
-                agent=agent,
-                attachment_ids=processed_attachment_ids,
-                to_recipients=to_recipients,
-                cc_recipients=cc_recipients,
-                bcc_recipients=bcc_recipients
-            )
-        else:
-            if not task_with_user.user or not task_with_user.user.email:
-                logger.warning(f"Background email task: No user or user email for task {task_id}. Cannot send new email.")
+        try:
+            from app.services.microsoft_service import MicrosoftGraphService
+            agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+            if not agent:
+                logger.warning(f"Background email task: Agent {agent_id} not found.")
+                return
+                
+            if is_private:
+                logger.info(f"Background email task: Comment {comment_id} is private, skipping email.")
                 return
 
-            recipient_email = task_with_user.user.email
-            sender_mailbox_conn = db.query(MailboxConnection).filter(
-                MailboxConnection.workspace_id == task_with_user.workspace_id,
-                MailboxConnection.is_active == True
-            ).first()
+            task_with_user = db.query(TaskModel).options(joinedload(TaskModel.user)).filter(TaskModel.id == task_id).first()
 
-            if not sender_mailbox_conn:
-                logger.warning(f"Background email task: No active mailbox for workspace {task_with_user.workspace_id}.")
+            if not task_with_user:
+                logger.warning(f"Background email task: Task {task_id} not found.")
                 return
 
-            sender_mailbox = sender_mailbox_conn.email
-            subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
-            html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
+            if task_with_user.mailbox_connection_id:
+                logger.info(f"Background email task: Sending reply for task {task_id} via connected mailbox {task_with_user.mailbox_connection_id}")
+                microsoft_service = MicrosoftGraphService(db)
+                microsoft_service.send_reply_email(
+                    task_id=task_id,
+                    reply_content=comment_content,
+                    agent=agent,
+                    attachment_ids=processed_attachment_ids,
+                    to_recipients=to_recipients,
+                    cc_recipients=cc_recipients,
+                    bcc_recipients=bcc_recipients
+                )
+            else:
+                if not task_with_user.user or not task_with_user.user.email:
+                    logger.warning(f"Background email task: No user or user email for task {task_id}. Cannot send new email.")
+                    return
 
-            microsoft_service = get_microsoft_service(db)
-            microsoft_service.send_new_email(
-                mailbox_email=sender_mailbox,
-                recipient_email=recipient_email,
-                subject=subject,
-                html_body=html_body,
-                attachment_ids=processed_attachment_ids,
-                task_id=task_id,
-                cc_recipients=cc_recipients,
-                bcc_recipients=bcc_recipients
+                recipient_email = task_with_user.user.email
+                sender_mailbox_conn = db.query(MailboxConnection).filter(
+                    MailboxConnection.workspace_id == task_with_user.workspace_id,
+                    MailboxConnection.is_active == True
+                ).first()
+
+                if not sender_mailbox_conn:
+                    logger.warning(f"Background email task: No active mailbox for workspace {task_with_user.workspace_id}.")
+                    return
+
+                sender_mailbox = sender_mailbox_conn.email
+                subject = f"New comment on ticket #{task_id}: {task_with_user.title}"
+                html_body = f"<p><strong>{agent_name} commented:</strong></p>{comment_content}"
+
+                microsoft_service = MicrosoftGraphService(db)
+                microsoft_service.send_new_email(
+                    mailbox_email=sender_mailbox,
+                    recipient_email=recipient_email,
+                    subject=subject,
+                    html_body=html_body,
+                    attachment_ids=processed_attachment_ids,
+                    task_id=task_id,
+                    cc_recipients=cc_recipients,
+                    bcc_recipients=bcc_recipients
+                )
+            logger.info(f"✅ Successfully sent email for comment {comment_id} on task {task_id}")
+
+        except (MicrosoftAPIException, DatabaseException) as e:
+            workspace_id = task_with_user.workspace_id if task_with_user else None
+            logger.error(
+                f"Error sending email in background for comment {comment_id}: {e}",
+                extra={
+                    "comment_id": comment_id,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
             )
-        logger.info(f"✅ Successfully sent email for comment {comment_id} on task {task_id}")
-
-    except (MicrosoftAPIException, DatabaseException) as e:
-        workspace_id = task_with_user.workspace_id if task_with_user else None
-        logger.error(
-            f"Error sending email in background for comment {comment_id}: {e}",
-            extra={
-                "comment_id": comment_id,
-                "task_id": task_id,
-                "workspace_id": workspace_id,
-                "error_type": type(e).__name__
-            },
-            exc_info=True
-        )
-    except Exception as e:
-        workspace_id = task_with_user.workspace_id if task_with_user else None
-        logger.error(
-            f"An unexpected error occurred in send_email_in_background for comment {comment_id}: {e}",
-            extra={
-                "comment_id": comment_id,
-                "task_id": task_id,
-                "workspace_id": workspace_id,
-                "error_type": type(e).__name__
-            },
-            exc_info=True
-        )
-    finally:
-        db.close()
+        except Exception as e:
+            workspace_id = task_with_user.workspace_id if task_with_user else None
+            logger.error(
+                f"An unexpected error occurred in send_email_in_background for comment {comment_id}: {e}",
+                extra={
+                    "comment_id": comment_id,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
 
 @router.get("/comments/{comment_id}/s3-content")
 def get_comment_s3_content(

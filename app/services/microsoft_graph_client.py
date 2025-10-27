@@ -181,8 +181,14 @@ class MicrosoftGraphClient:
                 
             return response.json()
             
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Email content for message ID {message_id} not found (404). It may have been moved or deleted.")
+            else:
+                logger.error(f"HTTP error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            return {}
         except Exception as e:
-            logger.error(f"Error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
             return {}
 
     def get_mailbox_email_content(self, app_token: str, user_email: str, message_id: str) -> Dict[str, Any]:
@@ -207,8 +213,14 @@ class MicrosoftGraphClient:
             response.raise_for_status()
             return response.json()
             
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Email content for message ID {message_id} not found (404). It may have been moved or deleted.")
+            else:
+                logger.error(f"HTTP error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            return {}
         except Exception as e:
-            logger.error(f"Error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error getting full email content for message ID {message_id}: {str(e)}", exc_info=True)
             return {}
 
     def mark_email_as_read(self, app_token: str, user_email: str, message_id: str) -> bool:

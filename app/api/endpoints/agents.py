@@ -1,6 +1,7 @@
 from typing import Any, List, Optional 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from sqlalchemy import func 
 from sqlalchemy.exc import IntegrityError  # Añadimos la importación para el manejo del error
 
@@ -29,7 +30,7 @@ router = APIRouter()
 
 @router.get("/", response_model=List[AgentSchema])
 async def read_agents(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     skip: int = Query(0, ge=0), 
     limit: int = Query(100, ge=1, le=200), 
     current_user: Agent = Depends(get_current_active_user),
@@ -39,9 +40,11 @@ async def read_agents(
     Retrieve agents for the current workspace with pagination.
     """
     logger.info(f"Fetching agents for workspace {current_workspace.id} with skip={skip}, limit={limit}")
-    agents = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.workspace_id == current_workspace.id
-    ).order_by(Agent.name).offset(skip).limit(limit).all()
+    ).order_by(Agent.name).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    agents = result.scalars().all()
     logger.info(f"Retrieved {len(agents)} agents.")
     return agents
 
@@ -49,17 +52,19 @@ async def read_agents(
 @router.post("/", response_model=AgentSchema)
 async def create_agent(
     agent_in: AgentCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Create a new agent (admin only)
     """
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.email == agent_in.email,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
     if agent:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -78,8 +83,8 @@ async def create_agent(
         email_signature=agent_in.email_signature
     )
     db.add(agent)
-    db.commit()
-    db.refresh(agent)
+    await db.commit()
+    await db.refresh(agent)
 
     return agent
 
@@ -87,17 +92,19 @@ async def create_agent(
 @router.get("/{agent_id}", response_model=AgentSchema)
 async def read_agent(
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Get agent by ID
     """
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
     if not agent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -110,17 +117,19 @@ async def read_agent(
 async def update_agent(
     agent_id: int,
     agent_in: AgentUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Update an agent. Users can update their own profiles, admins can update any profile.
     """
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
     if not agent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -159,8 +168,8 @@ async def update_agent(
     for field, value in update_data.items():
         setattr(agent, field, value)
 
-    db.commit()
-    db.refresh(agent)
+    await db.commit()
+    await db.refresh(agent)
 
     return agent
 
@@ -168,17 +177,19 @@ async def update_agent(
 @router.delete("/{agent_id}", response_model=AgentSchema)
 async def delete_agent(
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Delete an agent (admin only)
     """
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
     if not agent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -190,8 +201,8 @@ async def delete_agent(
             detail="Cannot delete your own account",
         )
 
-    db.delete(agent)
-    db.commit()
+    await db.delete(agent)
+    await db.commit()
 
     return agent
 
@@ -199,7 +210,7 @@ async def delete_agent(
 @router.post("/invite", response_model=AgentSchema) # Or a different response model like a status message
 async def invite_agent(
     agent_invite_in: AgentInviteCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin), # Ensure only admins can invite
     current_workspace: Workspace = Depends(get_current_workspace), # Get current workspace from dependency
 ):
@@ -214,10 +225,12 @@ async def invite_agent(
         )
     
     # Primero verificamos si el agente ya existe en este workspace
-    existing_agent_in_workspace = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.email == agent_invite_in.email,
         Agent.workspace_id == agent_invite_in.workspace_id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    existing_agent_in_workspace = result.scalars().first()
     
     if existing_agent_in_workspace:
         raise HTTPException(
@@ -226,9 +239,9 @@ async def invite_agent(
         )
 
     # Luego verificamos si el agente existe en cualquier otro workspace
-    existing_agent = db.query(Agent).filter(
-        Agent.email == agent_invite_in.email
-    ).first()
+    stmt = select(Agent).filter(Agent.email == agent_invite_in.email)
+    result = await db.execute(stmt)
+    existing_agent = result.scalars().first()
 
     invitation_token = secrets.token_urlsafe(32)
     token_expires_at = datetime.utcnow() + timedelta(hours=settings.AGENT_INVITATION_TOKEN_EXPIRE_HOURS)
@@ -267,10 +280,10 @@ async def invite_agent(
 
     try:
         db.add(db_agent)
-        db.commit()
-        db.refresh(db_agent)
+        await db.commit()
+        await db.refresh(db_agent)
     except IntegrityError as e:
-        db.rollback()
+        await db.rollback()
         logger.error(f"IntegrityError while inviting agent {agent_invite_in.email}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -279,33 +292,40 @@ async def invite_agent(
     
     invitation_link = f"https://{current_workspace.subdomain}.enque.cc/accept-invitation?token={invitation_token}"
 
-    admin_mailbox_connection = db.query(MailboxConnection).filter(
+    stmt = select(MailboxConnection).filter(
         MailboxConnection.created_by_agent_id == current_user.id,
         MailboxConnection.workspace_id == current_workspace.id,
         MailboxConnection.is_active == True
-    ).first()
+    )
+    result = await db.execute(stmt)
+    admin_mailbox_connection = result.scalars().first()
 
     if not admin_mailbox_connection:
         logger.info(f"Admin {current_user.email} has no active mailbox. Looking for any active mailbox in workspace {current_workspace.id}.")
-        admin_agents = db.query(Agent.id).filter(
+        stmt = select(Agent.id).filter(
             Agent.workspace_id == current_workspace.id,
             Agent.role == "admin",
             Agent.is_active == True
-        ).all()
-        admin_ids = [admin.id for admin in admin_agents]
+        )
+        result = await db.execute(stmt)
+        admin_ids = result.scalars().all()
         
-        admin_mailbox_connection = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.created_by_agent_id.in_(admin_ids),
             MailboxConnection.workspace_id == current_workspace.id,
             MailboxConnection.is_active == True
-        ).first()
+        )
+        result = await db.execute(stmt)
+        admin_mailbox_connection = result.scalars().first()
         
         # If still no mailbox found, try any active mailbox in the workspace
         if not admin_mailbox_connection:
-            admin_mailbox_connection = db.query(MailboxConnection).filter(
-        MailboxConnection.workspace_id == current_workspace.id,
-        MailboxConnection.is_active == True
-    ).first()
+            stmt = select(MailboxConnection).filter(
+                MailboxConnection.workspace_id == current_workspace.id,
+                MailboxConnection.is_active == True
+            )
+            result = await db.execute(stmt)
+            admin_mailbox_connection = result.scalars().first()
 
     if not admin_mailbox_connection:
         logger.error(f"No active mailbox connection found in workspace {current_workspace.id} to send invitation from.")
@@ -313,9 +333,11 @@ async def invite_agent(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No active mailbox found in this workspace. Please connect a mailbox to send invitations."
         )
-    ms_token = db.query(MicrosoftToken).filter(
+    stmt = select(MicrosoftToken).filter(
         MicrosoftToken.mailbox_connection_id == admin_mailbox_connection.id
-    ).order_by(MicrosoftToken.created_at.desc()).first()
+    ).order_by(MicrosoftToken.created_at.desc())
+    result = await db.execute(stmt)
+    ms_token = result.scalars().first()
 
     if not ms_token:
         logger.error(f"No Microsoft token found for mailbox {admin_mailbox_connection.email} (ID: {admin_mailbox_connection.id}).")
@@ -327,7 +349,7 @@ async def invite_agent(
     if ms_token.expires_at < datetime.utcnow():
         try:
             logger.info(f"Token for {admin_mailbox_connection.email} expired, attempting refresh.")
-            ms_token = graph_service.refresh_token(ms_token)
+            ms_token = await graph_service.refresh_token(ms_token)
         except HTTPException as e:
             logger.error(f"Failed to refresh token for {admin_mailbox_connection.email}: {e.detail}")
             raise HTTPException(
@@ -358,7 +380,7 @@ async def invite_agent(
 @router.post("/{agent_id}/resend-invite", response_model=AgentSchema)
 async def resend_agent_invitation(
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin), # Ensure only admins can resend invitations
     current_workspace: Workspace = Depends(get_current_workspace),
 ):
@@ -367,10 +389,12 @@ async def resend_agent_invitation(
     Generates a new invitation token and sends a new invitation email.
     """
     # Find the agent to resend invitation to
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
     
     if not agent:
         raise HTTPException(
@@ -394,40 +418,47 @@ async def resend_agent_invitation(
     agent.invitation_token_expires_at = token_expires_at
     
     db.add(agent)
-    db.commit()
-    db.refresh(agent)
+    await db.commit()
+    await db.refresh(agent)
     
     # Create invitation link
     invitation_link = f"https://{current_workspace.subdomain}.enque.cc/accept-invitation?token={invitation_token}"
     
     # Find an active mailbox to send from (same logic as original invite)
-    admin_mailbox_connection = db.query(MailboxConnection).filter(
+    stmt = select(MailboxConnection).filter(
         MailboxConnection.created_by_agent_id == current_user.id,
         MailboxConnection.workspace_id == current_workspace.id,
         MailboxConnection.is_active == True
-    ).first()
+    )
+    result = await db.execute(stmt)
+    admin_mailbox_connection = result.scalars().first()
 
     if not admin_mailbox_connection:
         logger.info(f"Admin {current_user.email} has no active mailbox. Looking for any active mailbox in workspace {current_workspace.id}.")
-        admin_agents = db.query(Agent.id).filter(
+        stmt = select(Agent.id).filter(
             Agent.workspace_id == current_workspace.id,
             Agent.role == "admin",
             Agent.is_active == True
-        ).all()
-        admin_ids = [admin.id for admin in admin_agents]
+        )
+        result = await db.execute(stmt)
+        admin_ids = result.scalars().all()
         
-        admin_mailbox_connection = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.created_by_agent_id.in_(admin_ids),
             MailboxConnection.workspace_id == current_workspace.id,
             MailboxConnection.is_active == True
-        ).first()
+        )
+        result = await db.execute(stmt)
+        admin_mailbox_connection = result.scalars().first()
         
         # If still no mailbox found, try any active mailbox in the workspace
         if not admin_mailbox_connection:
-            admin_mailbox_connection = db.query(MailboxConnection).filter(
+            stmt = select(MailboxConnection).filter(
                 MailboxConnection.workspace_id == current_workspace.id,
                 MailboxConnection.is_active == True
-            ).first()
+            )
+            result = await db.execute(stmt)
+            admin_mailbox_connection = result.scalars().first()
 
     if not admin_mailbox_connection:
         logger.error(f"No active mailbox connection found in workspace {current_workspace.id} to send invitation from.")
@@ -437,9 +468,11 @@ async def resend_agent_invitation(
         )
     
     # Get Microsoft token for the mailbox
-    ms_token = db.query(MicrosoftToken).filter(
+    stmt = select(MicrosoftToken).filter(
         MicrosoftToken.mailbox_connection_id == admin_mailbox_connection.id
-    ).order_by(MicrosoftToken.created_at.desc()).first()
+    ).order_by(MicrosoftToken.created_at.desc())
+    result = await db.execute(stmt)
+    ms_token = result.scalars().first()
 
     if not ms_token:
         logger.error(f"No Microsoft token found for mailbox {admin_mailbox_connection.email} (ID: {admin_mailbox_connection.id}).")
@@ -453,7 +486,7 @@ async def resend_agent_invitation(
     if ms_token.expires_at < datetime.utcnow():
         try:
             logger.info(f"Token for {admin_mailbox_connection.email} expired, attempting refresh.")
-            ms_token = graph_service.refresh_token(ms_token)
+            ms_token = await graph_service.refresh_token(ms_token)
         except HTTPException as e:
             logger.error(f"Failed to refresh token for {admin_mailbox_connection.email}: {e.detail}")
             raise HTTPException(
@@ -487,12 +520,14 @@ async def resend_agent_invitation(
 @router.post("/accept-invitation", response_model=Token) # Responds with a JWT token upon successful activation
 async def accept_agent_invitation(
     invitation_data: AgentAcceptInvitation,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Allows an agent to accept an invitation, set their password, and activate their account.
     """
-    agent = db.query(Agent).filter(Agent.invitation_token == invitation_data.token).first()
+    stmt = select(Agent).filter(Agent.invitation_token == invitation_data.token)
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
 
     if not agent:
         raise HTTPException(
@@ -517,8 +552,8 @@ async def accept_agent_invitation(
     agent.invitation_token_expires_at = None 
     
     db.add(agent)
-    db.commit()
-    db.refresh(agent)
+    await db.commit()
+    await db.refresh(agent)
 
     logger.info(f"Agent {agent.email} (ID: {agent.id}) accepted invitation and activated account.")
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -535,7 +570,9 @@ async def accept_agent_invitation(
     )
     
     # Get workspace information to include subdomain in response
-    workspace = db.query(Workspace).filter(Workspace.id == agent.workspace_id).first()
+    stmt = select(Workspace).filter(Workspace.id == agent.workspace_id)
+    result = await db.execute(stmt)
+    workspace = result.scalars().first()
     
     return {
         "access_token": access_token, 
@@ -551,17 +588,19 @@ class TeamsNotificationSettings(BaseModel):
 async def update_teams_notification_settings(
     agent_id: int,
     settings: TeamsNotificationSettings,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ):
     """
     Update an agent's Microsoft Teams notification preference.
     """
-    agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    agent = result.scalars().first()
 
     if not agent:
         raise HTTPException(
@@ -577,8 +616,8 @@ async def update_teams_notification_settings(
         )
 
     agent.teams_notifications_enabled = settings.enabled
-    db.commit()
-    db.refresh(agent)
+    await db.commit()
+    await db.refresh(agent)
     logger.info(f"Agent {agent.id} Teams notification settings updated to: {settings.enabled} by user {current_user.id}")
     return agent
 
@@ -586,34 +625,40 @@ async def update_teams_notification_settings(
 @router.get("/{agent_id}/teams", response_model=List[TeamSchema])
 async def read_agent_teams(
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user), 
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Retrieve teams that a specific agent belongs to within the current workspace.
     """
-    target_agent = db.query(Agent).filter(
+    stmt = select(Agent).filter(
         Agent.id == agent_id,
         Agent.workspace_id == current_workspace.id
-    ).first()
+    )
+    result = await db.execute(stmt)
+    target_agent = result.scalars().first()
     if not target_agent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found in this workspace",
         )
-    teams_query = db.query(Team).join(TeamMember).filter(
+    
+    stmt = select(Team).join(TeamMember).filter(
         TeamMember.agent_id == agent_id,
         Team.workspace_id == current_workspace.id
-    ).all()
+    )
+    result = await db.execute(stmt)
+    teams_query = result.scalars().all()
 
     teams_with_counts = []
     for team_model in teams_query:
-
-        ticket_count = db.query(func.count(Task.id)).filter(
+        stmt = select(func.count(Task.id)).filter(
             Task.team_id == team_model.id,
-                            Task.status != 'Closed' 
-        ).scalar() or 0
+            Task.status != 'Closed'
+        )
+        result = await db.execute(stmt)
+        ticket_count = result.scalar() or 0
         
         team_schema = TeamSchema.from_orm(team_model)
         team_schema.ticket_count = ticket_count

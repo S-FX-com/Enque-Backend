@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from sqlalchemy import func, case 
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, case, select
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from app.api import dependencies
@@ -13,9 +13,9 @@ from app.schemas import report as report_schema
 router = APIRouter()
 
 @router.get("/summary", response_model=report_schema.ReportSummary, status_code=status.HTTP_200_OK)
-def get_report_summary(
+async def get_report_summary(
     *,
-    db: Session = Depends(dependencies.get_db),
+    db: AsyncSession = Depends(dependencies.get_db),
     current_user: Agent = Depends(dependencies.get_current_active_user),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering (ISO format)"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering (ISO format)"),
@@ -26,33 +26,35 @@ def get_report_summary(
     if not end_date:
         end_date = datetime.utcnow()
 
-    # Define base_query first
-    base_query = db.query(Task).filter(
+    # Build filters
+    filters = [
         Task.workspace_id == current_user.workspace_id,
         Task.created_at >= start_date,
         Task.created_at <= end_date
-    )
-    
+    ]
+
     # Add team filter if provided
     if team_id is not None:
         from app.models.microsoft import mailbox_team_assignments
         from sqlalchemy import or_, and_
-        
-        base_query = base_query.filter(
+
+        mailbox_subquery = select(mailbox_team_assignments.c.mailbox_connection_id).where(
+            mailbox_team_assignments.c.team_id == team_id
+        ).scalar_subquery()
+
+        filters.append(
             or_(
                 Task.team_id == team_id,
                 and_(
                     Task.team_id.is_(None),
                     Task.mailbox_connection_id.isnot(None),
-                    Task.mailbox_connection_id.in_(
-                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                            mailbox_team_assignments.c.team_id == team_id
-                        )
-                    )
+                    Task.mailbox_connection_id.in_(mailbox_subquery)
                 )
             )
         )
-    counts = base_query.with_entities(
+
+    # Build aggregate query
+    stmt = select(
         func.count(Task.id).label("created_tickets"),
         func.sum(case((Task.status == TaskStatus.CLOSED, 1), else_=0)).label("resolved_tickets"),
         func.sum(case((Task.status != TaskStatus.CLOSED, 1), else_=0)).label("unresolved_tickets"),
@@ -64,7 +66,10 @@ def get_report_summary(
         func.count(case((Task.priority == TaskPriority.LOW, Task.id))).label("low_priority_count"),
         func.count(case((Task.priority == TaskPriority.MEDIUM, Task.id))).label("medium_priority_count"),
         func.count(case((Task.priority == TaskPriority.HIGH, Task.id))).label("high_priority_count")
-    ).first()
+    ).where(*filters)
+
+    result = await db.execute(stmt)
+    counts = result.first()
 
     # TODO: Calculate Avg Response Times (more complex, requires joining comments/activities)
 
@@ -89,9 +94,9 @@ def get_report_summary(
 
 
 @router.get("/created_by_hour", response_model=List[report_schema.TimeSeriesDataPoint], status_code=status.HTTP_200_OK)
-def get_tickets_created_by_hour(
+async def get_tickets_created_by_hour(
     *,
-    db: Session = Depends(dependencies.get_db),
+    db: AsyncSession = Depends(dependencies.get_db),
     current_user: Agent = Depends(dependencies.get_current_active_user),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering (ISO format)"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering (ISO format)"),
@@ -102,38 +107,46 @@ def get_tickets_created_by_hour(
     if not end_date:
         end_date = datetime.utcnow()
 
-    # Build base query with filters
-    query = db.query(
-        func.extract('hour', Task.created_at).label('hour'), 
-        func.count(Task.id).label('count')
-    ).filter(
+    # Build filters
+    filters = [
         Task.workspace_id == current_user.workspace_id,
         Task.created_at >= start_date,
         Task.created_at <= end_date
-    )
+    ]
+
     if team_id is not None:
         from app.models.microsoft import mailbox_team_assignments
         from sqlalchemy import or_, and_
-        
-        query = query.filter(
+
+        mailbox_subquery = select(mailbox_team_assignments.c.mailbox_connection_id).where(
+            mailbox_team_assignments.c.team_id == team_id
+        ).scalar_subquery()
+
+        filters.append(
             or_(
                 Task.team_id == team_id,
-                and_( 
+                and_(
                     Task.team_id.is_(None),
                     Task.mailbox_connection_id.isnot(None),
-                    Task.mailbox_connection_id.in_(
-                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                            mailbox_team_assignments.c.team_id == team_id
-                        )
-                    )
+                    Task.mailbox_connection_id.in_(mailbox_subquery)
                 )
             )
         )
-    results = query.group_by(
-        func.extract('hour', Task.created_at) # Group by hour
+
+    # Build query
+    stmt = select(
+        func.extract('hour', Task.created_at).label('hour'),
+        func.count(Task.id).label('count')
+    ).where(
+        *filters
+    ).group_by(
+        func.extract('hour', Task.created_at)
     ).order_by(
-        func.extract('hour', Task.created_at) # Order by hour
-    ).all()
+        func.extract('hour', Task.created_at)
+    )
+
+    result = await db.execute(stmt)
+    results = result.all()
     hourly_counts = {f"{h:02d}": 0 for h in range(24)}
     for row in results:
         hour_str = f"{int(row.hour):02d}" 
@@ -147,9 +160,9 @@ def get_tickets_created_by_hour(
 
 
 @router.get("/created_by_day", response_model=List[report_schema.TimeSeriesDataPoint], status_code=status.HTTP_200_OK)
-def get_tickets_created_by_day(
+async def get_tickets_created_by_day(
     *,
-    db: Session = Depends(dependencies.get_db),
+    db: AsyncSession = Depends(dependencies.get_db),
     current_user: Agent = Depends(dependencies.get_current_active_user),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering (ISO format)"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering (ISO format)"),
@@ -160,42 +173,48 @@ def get_tickets_created_by_day(
     if not end_date:
         end_date = datetime.utcnow()
 
-    # Build base query with filters
-    query = db.query(
-        func.weekday(Task.created_at).label('weekday'), 
-        func.count(Task.id).label('count')
-    ).filter(
+    # Build filters
+    filters = [
         Task.workspace_id == current_user.workspace_id,
         Task.created_at >= start_date,
         Task.created_at <= end_date
-    )
-    
+    ]
+
     # Add team filter if provided
     if team_id is not None:
         from app.models.microsoft import mailbox_team_assignments
         from sqlalchemy import or_, and_
-        
-        query = query.filter(
+
+        mailbox_subquery = select(mailbox_team_assignments.c.mailbox_connection_id).where(
+            mailbox_team_assignments.c.team_id == team_id
+        ).scalar_subquery()
+
+        filters.append(
             or_(
-                Task.team_id == team_id, 
-                and_(  
+                Task.team_id == team_id,
+                and_(
                     Task.team_id.is_(None),
                     Task.mailbox_connection_id.isnot(None),
-                    Task.mailbox_connection_id.in_(
-                        db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                            mailbox_team_assignments.c.team_id == team_id
-                        )
-                    )
+                    Task.mailbox_connection_id.in_(mailbox_subquery)
                 )
             )
         )
-    
-    # Execute query
-    results = query.group_by(
-        func.weekday(Task.created_at) 
+
+    # Build query
+    stmt = select(
+        func.weekday(Task.created_at).label('weekday'),
+        func.count(Task.id).label('count')
+    ).where(
+        *filters
+    ).group_by(
+        func.weekday(Task.created_at)
     ).order_by(
-        func.weekday(Task.created_at) 
-    ).all()
+        func.weekday(Task.created_at)
+    )
+
+    # Execute query
+    result = await db.execute(stmt)
+    results = result.all()
     days_of_week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     daily_counts = {day: 0 for day in days_of_week}
 

@@ -5,7 +5,9 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import ValidationError
-from sqlalchemy.orm import Session, noload
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.database.session import get_db
@@ -21,7 +23,7 @@ oauth2_scheme = OAuth2PasswordBearer(
 
 
 async def get_current_user(
-    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
+    db: AsyncSession = Depends(get_db), token: str = Depends(oauth2_scheme)
 ) -> Agent:
     """
     Get the current authenticated user from the token.
@@ -55,16 +57,19 @@ async def get_current_user(
         return agent
 
     # If not in cache, query the database
-    user = db.query(Agent).filter(Agent.id == user_id).options(
-        noload(Agent.assigned_tasks),
-        noload(Agent.sent_tasks),
-        noload(Agent.teams),
-        noload(Agent.comments),
-        noload(Agent.activities),
-        noload(Agent.created_mailboxes),
-        noload(Agent.microsoft_tokens),
-        noload(Agent.created_canned_replies)
-    ).first()
+    result = await db.execute(
+        select(Agent).filter(Agent.id == user_id).options(
+            noload(Agent.assigned_tasks),
+            noload(Agent.sent_tasks),
+            noload(Agent.teams),
+            noload(Agent.comments),
+            noload(Agent.activities),
+            noload(Agent.created_mailboxes),
+            noload(Agent.microsoft_tokens),
+            noload(Agent.created_canned_replies)
+        )
+    )
+    user = result.scalars().first()
 
     if not user:
         raise HTTPException(
@@ -87,7 +92,7 @@ async def get_current_user(
     return user
 
 
-def get_current_active_user(
+async def get_current_active_user(
     current_user: Agent = Depends(get_current_user),
 ) -> Agent:
     """
@@ -98,7 +103,7 @@ def get_current_active_user(
     return current_user
 
 
-def get_current_active_admin(
+async def get_current_active_admin(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Agent:
     """
@@ -112,7 +117,7 @@ def get_current_active_admin(
     return current_user
 
 
-def get_current_active_admin_or_manager(
+async def get_current_active_admin_or_manager(
     current_user: Agent = Depends(get_current_active_user),
 ) -> Agent:
     """
@@ -126,14 +131,15 @@ def get_current_active_admin_or_manager(
     return current_user
 
 
-def get_current_workspace(
-    db: Session = Depends(get_db),
+async def get_current_workspace(
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user)
 ) -> Workspace:
     """
     Dependency function that returns the current workspace based on the user's workspace_id
     """
-    workspace = db.query(Workspace).filter(Workspace.id == current_user.workspace_id).first()
+    result = await db.execute(select(Workspace).filter(Workspace.id == current_user.workspace_id))
+    workspace = result.scalars().first()
     if not workspace:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

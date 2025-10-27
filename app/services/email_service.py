@@ -2,7 +2,9 @@ import re
 from app.core.config import settings
 from app.services.microsoft_service import MicrosoftGraphService # Assuming this service can send mail
 from app.utils.logger import logger
-from sqlalchemy.orm import Session # MicrosoftGraphService might need a DB session
+from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import Optional, Tuple, List, Dict, Any
 from app.models.agent import Agent
 from app.models.workspace import Workspace
@@ -112,7 +114,7 @@ def create_invitation_email_html(agent_name: str, invitation_link: str, logo_url
     return html_content
 
 async def send_agent_invitation_email(
-    db: Session,
+    db: AsyncSession,
     to_email: str,
     agent_name: str,
     invitation_link: str,
@@ -245,7 +247,7 @@ def create_password_reset_email_html(agent_name: str, reset_link: str) -> str:
     return html_content
 
 async def send_password_reset_email( # Changed to async
-    db: Session,
+    db: AsyncSession,
     to_email: str,
     agent_name: str,
     reset_link: str,
@@ -374,7 +376,7 @@ def create_ticket_assignment_email_html(agent_name: str, ticket_id: int, ticket_
     return html_content
 
 async def send_ticket_assignment_email(
-    db: Session,
+    db: AsyncSession,
     to_email: str,
     agent_name: str,
     ticket_id: int,
@@ -415,10 +417,12 @@ async def send_ticket_assignment_email(
             
             # --- BEGIN TEAMS NOTIFICATION LOGIC ---
             try:
-                agent_to_notify = db.query(Agent).filter(Agent.email == to_email).first()
+                result = await db.execute(select(Agent).filter(Agent.email == to_email))
+                agent_to_notify = result.scalars().first()
                 if agent_to_notify and agent_to_notify.teams_notifications_enabled:
                     logger.info(f"Agent {agent_to_notify.id} has Teams notifications enabled. Sending notification.")
-                    workspace = db.query(Workspace).filter(Workspace.id == agent_to_notify.workspace_id).first()
+                    result = await db.execute(select(Workspace).filter(Workspace.id == agent_to_notify.workspace_id))
+                    workspace = result.scalars().first()
                     if workspace:
                         ticket_link_teams = f"https://{workspace.subdomain}.enque.cc/tickets/{ticket_id}"
                         graph_service_for_teams = MicrosoftGraphService(db=db)
@@ -552,7 +556,7 @@ def create_team_ticket_notification_email_html(agent_name: str, team_name: str, 
 
 
 async def send_team_ticket_notification_email(
-    db: Session,
+    db: AsyncSession,
     to_email: str,
     agent_name: str,
     team_name: str,
@@ -861,7 +865,7 @@ def create_mention_notification_email_html(
 
 
 async def send_mention_notification_email(
-    db: Session,
+    db: AsyncSession,
     mentioned_agent_email: str,
     mentioned_agent_name: str,
     mentioning_agent_name: str,
@@ -913,7 +917,7 @@ async def send_mention_notification_email(
 
 
 async def process_mention_notifications(
-    db: Session,
+    db: AsyncSession,
     comment_content: str,
     workspace_id: int,
     ticket_id: int,
@@ -934,18 +938,22 @@ async def process_mention_notifications(
     from app.models.task import Task
     from app.models.microsoft import MailboxConnection, MicrosoftToken
     
-    task = db.query(Task).filter(Task.id == ticket_id).first()
+    result = await db.execute(select(Task).filter(Task.id == ticket_id))
+    task = result.scalars().first()
     preferred_mailbox = None
     
     if task and task.mailbox_connection_id:
         logger.info(f"Ticket {ticket_id} tiene mailbox específico ID: {task.mailbox_connection_id}")
         
-        mailbox_token_info = db.query(MailboxConnection, MicrosoftToken)\
-            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+        result = await db.execute(
+            select(MailboxConnection, MicrosoftToken)
+            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)
             .filter(
                 MailboxConnection.id == task.mailbox_connection_id,
                 MailboxConnection.is_active == True
-            ).first()
+            )
+        )
+        mailbox_token_info = result.first()
         
         if mailbox_token_info:
             preferred_mailbox = {
@@ -958,12 +966,15 @@ async def process_mention_notifications(
     if not preferred_mailbox:
         logger.info(f"Buscando mailbox activo para workspace {workspace_id}")
         
-        mailbox_info = db.query(MailboxConnection, MicrosoftToken)\
-            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
+        result = await db.execute(
+            select(MailboxConnection, MicrosoftToken)
+            .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)
             .filter(
                 MailboxConnection.workspace_id == workspace_id,
                 MailboxConnection.is_active == True
-            ).first()
+            )
+        )
+        mailbox_info = result.first()
         
         if mailbox_info:
             preferred_mailbox = {
@@ -982,18 +993,21 @@ async def process_mention_notifications(
             from app.services.microsoft_service import MicrosoftGraphService
             ms_service = MicrosoftGraphService(db)
             await ms_service.refresh_token_async(token)
-            db.refresh(token)
+            await db.refresh(token)
         except Exception as e:
             logger.error(f"Error refreshing token for mention notifications: {str(e)}")
             return []
     
     for mentioned_name in mentioned_names:
         try:
-            mentioned_agent = db.query(Agent).filter(
-                Agent.name == mentioned_name,
-                Agent.workspace_id == workspace_id,
-                Agent.is_active == True
-            ).first()
+            result = await db.execute(
+                select(Agent).filter(
+                    Agent.name == mentioned_name,
+                    Agent.workspace_id == workspace_id,
+                    Agent.is_active == True
+                )
+            )
+            mentioned_agent = result.scalars().first()
             
             if not mentioned_agent:
                 logger.warning(f"Agent '{mentioned_name}' no encontrado en workspace {workspace_id}")
@@ -1007,7 +1021,8 @@ async def process_mention_notifications(
             clean_content = re.sub(r'<[^>]+>', '', comment_content)
             clean_content = re.sub(r'\s+', ' ', clean_content).strip()
             
-            mentioning_agent = db.query(Agent).filter(Agent.id == mentioning_agent_id).first()
+            result = await db.execute(select(Agent).filter(Agent.id == mentioning_agent_id))
+            mentioning_agent = result.scalars().first()
             mentioning_agent_name = mentioning_agent.name if mentioning_agent else "Unknown Agent"
             
             success = await send_mention_notification_email(

@@ -35,21 +35,20 @@ class RateLimiterService:
     """
     
     def __init__(self):
-        # Global throttler for Microsoft Graph
-        self.global_throttler = Throttler(
-            rate_limit=settings.MS_GRAPH_RATE_LIMIT,
-            period=1.0  # per second
-        )
-        
-        # Per-tenant throttlers
+        # Global throttler for Microsoft Graph - lazy initialized
+        self.global_throttler: Optional[Throttler] = None
+        self._global_throttler_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Per-tenant throttlers - lazy initialized per event loop
         self.tenant_throttlers: Dict[str, Throttler] = {}
-        
+        self._tenant_throttler_loops: Dict[str, asyncio.AbstractEventLoop] = {}
+
         # Rate limit tracking per tenant
         self.rate_limits: Dict[str, RateLimitInfo] = defaultdict(RateLimitInfo)
-        
+
         # Request timing for adaptive throttling
         self.request_times: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
-        
+
         # Metrics
         self.metrics = {
             'total_requests': 0,
@@ -58,30 +57,83 @@ class RateLimiterService:
             'cache_hits': 0,
             'cache_misses': 0
         }
-        
+
+    def _get_global_throttler(self) -> Throttler:
+        """
+        Get or create global throttler for the current event loop.
+        This prevents 'attached to a different loop' errors when using
+        the rate limiter across different async contexts (e.g., background tasks).
+        """
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop running, create throttler without loop check
+            if self.global_throttler is None:
+                self.global_throttler = Throttler(
+                    rate_limit=settings.MS_GRAPH_RATE_LIMIT,
+                    period=1.0
+                )
+            return self.global_throttler
+
+        # Check if throttler exists and is for the current loop
+        if self.global_throttler is None or self._global_throttler_loop != current_loop:
+            self.global_throttler = Throttler(
+                rate_limit=settings.MS_GRAPH_RATE_LIMIT,
+                period=1.0
+            )
+            self._global_throttler_loop = current_loop
+            logger.debug(f"🔄 Created new global throttler for event loop {id(current_loop)}")
+
+        return self.global_throttler
+
     def get_tenant_throttler(self, tenant_id: str) -> Throttler:
-        """Get or create throttler for specific tenant"""
-        if tenant_id not in self.tenant_throttlers:
+        """
+        Get or create throttler for specific tenant.
+        Recreates throttler if event loop has changed.
+        """
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop running, create throttler without loop check
+            if tenant_id not in self.tenant_throttlers:
+                self.tenant_throttlers[tenant_id] = Throttler(
+                    rate_limit=settings.MS_GRAPH_RATE_LIMIT,
+                    period=1.0
+                )
+            return self.tenant_throttlers[tenant_id]
+
+        # Check if throttler exists and is for the current loop
+        needs_new_throttler = (
+            tenant_id not in self.tenant_throttlers or
+            tenant_id not in self._tenant_throttler_loops or
+            self._tenant_throttler_loops[tenant_id] != current_loop
+        )
+
+        if needs_new_throttler:
             self.tenant_throttlers[tenant_id] = Throttler(
                 rate_limit=settings.MS_GRAPH_RATE_LIMIT,
                 period=1.0
             )
+            self._tenant_throttler_loops[tenant_id] = current_loop
+            logger.debug(f"🔄 Created new throttler for tenant {tenant_id} in loop {id(current_loop)}")
+
         return self.tenant_throttlers[tenant_id]
     
     async def acquire(self, tenant_id: str = "default", resource: str = "graph") -> None:
         """
         Acquire permission to make a request
-        
+
         Args:
             tenant_id: Microsoft tenant ID for rate limiting
             resource: Resource type (graph, mail, calendar, etc.)
         """
         start_time = time.time()
-        
-        # Global throttling first
-        await self.global_throttler.acquire()
-        
-        # Tenant-specific throttling
+
+        # Global throttling first (lazy initialization for current event loop)
+        global_throttler = self._get_global_throttler()
+        await global_throttler.acquire()
+
+        # Tenant-specific throttling (lazy initialization for current event loop)
         tenant_throttler = self.get_tenant_throttler(tenant_id)
         await tenant_throttler.acquire()
         
@@ -125,6 +177,12 @@ class RateLimiterService:
                 # Slow down the tenant throttler
                 new_rate = max(1, settings.MS_GRAPH_RATE_LIMIT * 0.5)
                 self.tenant_throttlers[tenant_id] = Throttler(rate_limit=new_rate, period=1.0)
+                # Update event loop tracking
+                try:
+                    current_loop = asyncio.get_running_loop()
+                    self._tenant_throttler_loops[tenant_id] = current_loop
+                except RuntimeError:
+                    pass  # No event loop running
                 logger.warning(f"🐌 Adaptive throttling: Reduced rate to {new_rate}/s for tenant {tenant_id}")
             
         except (ValueError, KeyError) as e:
@@ -157,6 +215,12 @@ class RateLimiterService:
                 rate_limit=settings.MS_GRAPH_RATE_LIMIT,
                 period=1.0
             )
+            # Update event loop tracking
+            try:
+                current_loop = asyncio.get_running_loop()
+                self._tenant_throttler_loops[tenant_id] = current_loop
+            except RuntimeError:
+                pass  # No event loop running
     
     async def wait_for_reset(self, tenant_id: str) -> None:
         """Wait for rate limit to reset for a specific tenant"""

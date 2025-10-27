@@ -7,7 +7,8 @@ from urllib.parse import urlencode
 import httpx
 import requests
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.models.agent import Agent
@@ -19,7 +20,7 @@ from app.utils.logger import logger
 
 
 class MicrosoftAuthService:
-    def __init__(self, db: Session, integration: MicrosoftIntegration, user_service: MicrosoftUserService):
+    def __init__(self, db: AsyncSession, integration: MicrosoftIntegration, user_service: MicrosoftUserService):
         self.db = db
         self.integration = integration
         self.user_service = user_service
@@ -29,7 +30,7 @@ class MicrosoftAuthService:
         self._app_token = None
         self._app_token_expires_at = datetime.utcnow()
 
-    def get_application_token(self) -> str:
+    async def get_application_token(self) -> str:
         if self._app_token and self._app_token_expires_at > datetime.utcnow():
             return self._app_token
 
@@ -48,7 +49,8 @@ class MicrosoftAuthService:
         }
 
         try:
-            response = requests.post(token_endpoint, data=data)
+            async with httpx.AsyncClient() as client:
+                response = await client.post(token_endpoint, data=data)
             response.raise_for_status()
             token_data = response.json()
             self._app_token = token_data["access_token"]
@@ -90,7 +92,10 @@ class MicrosoftAuthService:
         logger.info(f"Generated Microsoft Auth URL with redirect_uri: {final_redirect_uri}, scopes: '{scope_string}', prompt: {prompt}, state: {state}")
         return f"{auth_endpoint}?{urlencode(params)}"
 
-    def exchange_code_for_token(self, code: str, redirect_uri: str, state: Optional[str] = None) -> MicrosoftToken:
+    async def exchange_code_for_token(self, code: str, redirect_uri: str, state: Optional[str] = None) -> MicrosoftToken:
+        logger.info(f"🔑 MICROSOFT AUTH START - Starting token exchange process")
+        logger.debug(f"🔍 MICROSOFT AUTH DEBUG - Code: {code[:20]}..., Redirect URI: {redirect_uri}, State provided: {bool(state)}")
+        
         needs_integration = not self.integration
         tenant_id = settings.MICROSOFT_TENANT_ID
         client_id = settings.MICROSOFT_CLIENT_ID
@@ -111,11 +116,12 @@ class MicrosoftAuthService:
         }
         token_endpoint = self.token_url  
         try:
-            response = requests.post(token_endpoint, data=data)
+            async with httpx.AsyncClient() as client:
+                response = await client.post(token_endpoint, data=data)
             response.raise_for_status()
             token_data = response.json()
             refresh_token_val = token_data.get("refresh_token", "")
-            user_info = self.user_service.get_user_info(token_data["access_token"])
+            user_info = await self.user_service._get_user_info_cached(token_data["access_token"])
             mailbox_email = user_info.get("mail")
             if not mailbox_email:
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Could not get email address from Microsoft user info")
@@ -134,24 +140,33 @@ class MicrosoftAuthService:
                     ag_id_str = state_data.get('agent_id')
                     conn_id_str = state_data.get('connection_id')  
                     is_reconnect_str = state_data.get('is_reconnect')  
+                    flow_type = state_data.get('flow')
                     
                     if ws_id_str: workspace_id = int(ws_id_str)
                     if ag_id_str: agent_id = int(ag_id_str)
                     if conn_id_str: connection_id = int(conn_id_str)
                     if is_reconnect_str and is_reconnect_str.lower() == 'true': is_reconnect = True
                     
-                    logger.info(f"Extracted from Base64 state: workspace_id={workspace_id}, agent_id={agent_id}, connection_id={connection_id}, is_reconnect={is_reconnect}")
+                    logger.info(f"🔍 MICROSOFT AUTH DEBUG - Extracted from state: workspace_id={workspace_id}, agent_id={agent_id}, flow={flow_type}, connection_id={connection_id}, is_reconnect={is_reconnect}")
                 except Exception as decode_err:
-                    logger.error(f"Failed to decode/parse Base64 state parameter '{state}': {decode_err}")
+                    logger.error(f"💥 MICROSOFT AUTH ERROR - Failed to decode/parse state parameter '{state}': {decode_err}")
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state parameter format.")
             else:
-                 logger.error("State parameter is missing in exchange_code_for_token.")
+                 logger.error("❌ MICROSOFT AUTH ERROR - State parameter is missing in exchange_code_for_token.")
                  raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="State parameter is required.")
                  
-            if not workspace_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID missing or invalid in state parameter.")
-            
-            workspace = self.db.query(Workspace).filter(Workspace.id == workspace_id).first()
-            if not workspace: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
+            if not workspace_id:
+                logger.error(f"❌ MICROSOFT AUTH ERROR - Workspace ID missing or invalid in state parameter")
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID missing or invalid in state parameter.")
+
+            stmt = select(Workspace).where(Workspace.id == workspace_id)
+            result = await self.db.execute(stmt)
+            workspace = result.scalar_one_or_none()
+            if not workspace:
+                logger.error(f"❌ MICROSOFT AUTH ERROR - Workspace with ID {workspace_id} not found")
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workspace with ID {workspace_id} not found.")
+
+            logger.info(f"✅ MICROSOFT AUTH SUCCESS - Validated workspace {workspace_id}: {workspace.subdomain}")
 
             # --- START: Logic to handle both auth and profile_link flows ---
             try:
@@ -161,34 +176,77 @@ class MicrosoftAuthService:
                 state_data = json.loads(decoded_state_json)
                 flow_type = state_data.get('flow')
                 
+                logger.info(f"🔍 MICROSOFT AUTH DEBUG - Processing flow type: {flow_type}")
+                
+                # If flow is None or not specified, this is likely a mailbox configuration flow
+                if flow_type is None:
+                    logger.info(f"📬 MICROSOFT AUTH DEBUG - No flow specified, treating as mailbox configuration")
+                    flow_type = 'mailbox'  # Set default flow type
+                
                 current_agent = None
                 if flow_type == 'profile_link':
-                    if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state for profile_link flow.")
-                    current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
-                    if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
-                    if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+                    if not agent_id:
+                        logger.error(f"❌ MICROSOFT AUTH ERROR - Agent ID missing in state for profile_link flow")
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state for profile_link flow.")
+                    stmt = select(Agent).where(Agent.id == agent_id)
+                    result = await self.db.execute(stmt)
+                    current_agent = result.scalar_one_or_none()
+                    if not current_agent:
+                        logger.error(f"❌ MICROSOFT AUTH ERROR - Agent with ID {agent_id} not found")
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+                    if current_agent.workspace_id != workspace.id: 
+                        logger.error(f"❌ MICROSOFT AUTH ERROR - Agent {agent_id} does not belong to workspace {workspace.id}")
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+                    
+                    logger.info(f"✅ MICROSOFT AUTH SUCCESS - Profile link validated for agent {current_agent.email} (ID: {agent_id})")
                 
                 elif flow_type == 'auth':
+                    logger.info(f"🔍 MICROSOFT AUTH DEBUG - Processing authentication flow for workspace {workspace_id}")
                     microsoft_id = user_info.get("id")
                     microsoft_email = user_info.get("mail") or user_info.get("userPrincipalName")
+                    
+                    logger.info(f"🔍 MICROSOFT AUTH DEBUG - Microsoft user details: ID={microsoft_id}, Email={microsoft_email}")
 
                     # New Strategy: Prioritize finding the user in the target workspace and handle multi-workspace scenarios.
-                    
+
                     # 1. Find agent by microsoft_id in the target workspace.
-                    agent = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id, Agent.workspace_id == workspace_id).first()
+                    logger.debug(f"🔍 MICROSOFT AUTH DEBUG - Step 1: Searching by microsoft_id {microsoft_id} in workspace {workspace_id}")
+                    stmt = select(Agent).where(Agent.microsoft_id == microsoft_id, Agent.workspace_id == workspace_id)
+                    result = await self.db.execute(stmt)
+                    agent = result.scalar_one_or_none()
 
                     # 2. If not found, find by email in the target workspace.
                     if not agent:
-                        agent = self.db.query(Agent).filter(Agent.email == microsoft_email, Agent.workspace_id == workspace_id).first()
+                        logger.debug(f"🔍 MICROSOFT AUTH DEBUG - Step 2: Searching by email {microsoft_email} in workspace {workspace_id}")
+                        stmt = select(Agent).where(Agent.email == microsoft_email, Agent.workspace_id == workspace_id)
+                        result = await self.db.execute(stmt)
+                        agent = result.scalar_one_or_none()
 
                     # 3. If still not found, it might be a new agent for this workspace.
                     if not agent:
+                        logger.info(f"🔍 MICROSOFT AUTH DEBUG - Agent not found in workspace {workspace_id}, checking if microsoft_id exists elsewhere")
                         # Before creating, check if this Microsoft account is linked to an agent in another workspace.
                         # This is to avoid the IntegrityError, as microsoft_id must be unique.
-                        is_ms_id_already_used = self.db.query(Agent).filter(Agent.microsoft_id == microsoft_id).first() is not None
+                        stmt = select(Agent).where(Agent.microsoft_id == microsoft_id)
+                        result = await self.db.execute(stmt)
+                        existing_agent_elsewhere = result.scalar_one_or_none()
+                        is_ms_id_already_used = existing_agent_elsewhere is not None
                         
-                        logger.info(f"Creating new Microsoft agent: {microsoft_email} in workspace {workspace_id}")
+                        if existing_agent_elsewhere:
+                            logger.warning(f"⚠️ MICROSOFT AUTH WARNING - Microsoft ID {microsoft_id} already used by agent {existing_agent_elsewhere.email} in workspace {existing_agent_elsewhere.workspace_id}")
+                        
+                        # Additional validation: Don't create agents without proper flow context
+                        if not flow_type or flow_type != 'auth':
+                            logger.error(f"🚨 MICROSOFT AUTH SECURITY - Attempted to create Microsoft agent {microsoft_email} without proper auth flow context. Flow: {flow_type}, Workspace: {workspace_id}")
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST, 
+                                detail="Invalid authentication flow for creating new agent."
+                            )
+                        
+                        logger.info(f"🆕 MICROSOFT AUTH CREATE - Creating new Microsoft agent: {microsoft_email} in workspace {workspace_id}")
                         display_name = user_info.get("displayName", microsoft_email.split("@")[0])
+                        logger.debug(f"🔍 MICROSOFT AUTH DEBUG - Display name extracted: {display_name}")
+                        
                         agent = Agent(
                             name=display_name,
                             email=microsoft_email,
@@ -200,38 +258,85 @@ class MicrosoftAuthService:
                         # Only set microsoft_id on the new agent if it's not already in use in another workspace.
                         if not is_ms_id_already_used:
                             agent.microsoft_id = microsoft_id
+                            logger.debug(f"✅ MICROSOFT AUTH DEBUG - Assigned microsoft_id {microsoft_id} to new agent")
+                        else:
+                            logger.warning(f"⚠️ MICROSOFT AUTH WARNING - Skipping microsoft_id assignment due to conflict")
 
                         self.db.add(agent)
-                        self.db.flush()  # Flush to get the agent ID
+                        await self.db.flush()  # Flush to get the agent ID
+                        logger.info(f"✅ MICROSOFT AUTH SUCCESS - Created new agent with ID: {agent.id}")
+                    
+                    else:
+                        logger.info(f"✅ MICROSOFT AUTH SUCCESS - Found existing agent: {agent.email} (ID: {agent.id}) in workspace {workspace_id}")
 
                     current_agent = agent
 
                 if current_agent and flow_type in ['profile_link', 'auth']:
                     logger.info(f"'{flow_type}' flow detected for agent {current_agent.id}. Updating agent with latest token info.")
-                    return self.user_service.handle_profile_linking(token_data, user_info, current_agent, workspace, self.integration)
+                    return await self.user_service.handle_profile_linking(token_data, user_info, current_agent, workspace, self.integration)
+                
+                elif flow_type == 'mailbox':
+                    logger.info(f"📬 MICROSOFT MAILBOX FLOW - Processing mailbox configuration for workspace {workspace_id}")
+                    if not agent_id:
+                        logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent ID missing in state for mailbox flow")
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter for mailbox flow.")
+
+                    stmt = select(Agent).where(Agent.id == agent_id)
+                    result = await self.db.execute(stmt)
+                    current_agent = result.scalar_one_or_none()
+                    if not current_agent:
+                        logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent with ID {agent_id} not found")
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+                    
+                    if current_agent.workspace_id != workspace.id: 
+                        logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent {agent_id} does not belong to workspace {workspace.id}")
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+                    
+                    logger.info(f"✅ MICROSOFT MAILBOX SUCCESS - Validated agent {current_agent.email} (ID: {agent_id}) for mailbox configuration")
+                    # Continue with mailbox configuration logic below
 
             except Exception as decode_err:
-                logger.warning(f"Could not decode state for flow check: {decode_err}")
+                logger.warning(f"⚠️ MICROSOFT AUTH WARNING - Could not decode state for flow check: {decode_err}")
+                # Fallback to mailbox configuration if state decode fails
+                flow_type = 'mailbox'
+                logger.info(f"📬 MICROSOFT AUTH FALLBACK - Defaulting to mailbox configuration flow")
             # --- END: Logic to handle both auth and profile_link flows ---
             
-            # Fallback for mailbox connection if flow is not auth or profile_link
-            if not agent_id: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter for mailbox flow.")
-            current_agent = self.db.query(Agent).filter(Agent.id == agent_id).first()
-            if not current_agent: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
-            if current_agent.workspace_id != workspace.id: raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+            # Handle mailbox configuration if we're in mailbox flow
+            if flow_type == 'mailbox' or not current_agent:
+                if not agent_id:
+                    logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent ID missing in state parameter for mailbox flow")
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent ID missing in state parameter for mailbox flow.")
+
+                if not current_agent:  # If not set above, get it now
+                    stmt = select(Agent).where(Agent.id == agent_id)
+                    result = await self.db.execute(stmt)
+                    current_agent = result.scalar_one_or_none()
+                    if not current_agent:
+                        logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent with ID {agent_id} not found")
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found.")
+                    if current_agent.workspace_id != workspace.id:
+                        logger.error(f"❌ MICROSOFT MAILBOX ERROR - Agent {agent_id} does not belong to workspace {workspace.id}")
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent does not belong to the specified workspace.")
+                
+                logger.info(f"📬 MICROSOFT MAILBOX CONTINUE - Proceeding with mailbox configuration for {current_agent.email}")
             
             if needs_integration:
                 self.integration = MicrosoftIntegration(
                     tenant_id=tenant_id, client_id=client_id, client_secret=client_secret,
                     redirect_uri=settings.MICROSOFT_REDIRECT_URI, scope=scope, is_active=True)
-                self.db.add(self.integration); self.db.commit(); self.db.refresh(self.integration)
+                self.db.add(self.integration)
+                await self.db.commit()
+                await self.db.refresh(self.integration)
             mailbox_connection = None
             if is_reconnect and connection_id:
-                mailbox_connection = self.db.query(MailboxConnection).filter(
+                stmt = select(MailboxConnection).where(
                     MailboxConnection.id == connection_id,
                     MailboxConnection.workspace_id == workspace_id
-                ).first()
-                
+                )
+                result = await self.db.execute(stmt)
+                mailbox_connection = result.scalar_one_or_none()
+
                 if not mailbox_connection:
                     logger.error(f"Could not find mailbox connection with ID {connection_id} for workspace {workspace_id}")
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Mailbox connection with ID {connection_id} not found")
@@ -239,45 +344,56 @@ class MicrosoftAuthService:
                     logger.info(f"Updating email address for connection {connection_id} from {mailbox_connection.email} to {mailbox_email}")
                     mailbox_connection.email = mailbox_email
                     mailbox_connection.display_name = user_info.get("displayName", "Microsoft User")
-                old_tokens = self.db.query(MicrosoftToken).filter(
-                    MicrosoftToken.mailbox_connection_id == mailbox_connection.id
-                ).all()
-                
+
+                stmt = select(MicrosoftToken).where(MicrosoftToken.mailbox_connection_id == mailbox_connection.id)
+                result = await self.db.execute(stmt)
+                old_tokens = result.scalars().all()
+
                 if old_tokens:
                     for old_token in old_tokens:
-                        self.db.delete(old_token)
+                        await self.db.delete(old_token)
                     logger.info(f"Deleted {len(old_tokens)} old token(s) for mailbox connection {connection_id}")
-                
-                self.db.commit()
+
+                await self.db.commit()
             else:
-                mailbox_connection = self.db.query(MailboxConnection).filter(
-                    MailboxConnection.email == mailbox_email, 
+                stmt = select(MailboxConnection).where(
+                    MailboxConnection.email == mailbox_email,
                     MailboxConnection.workspace_id == workspace.id
-                ).first()
+                )
+                result = await self.db.execute(stmt)
+                mailbox_connection = result.scalar_one_or_none()
                 
             if not mailbox_connection:
                 mailbox_connection = MailboxConnection(
                     email=mailbox_email, display_name=user_info.get("displayName", "Microsoft User"),
                     workspace_id=workspace.id, created_by_agent_id=current_agent.id, is_active=True)
-                self.db.add(mailbox_connection); self.db.commit(); self.db.refresh(mailbox_connection)
+                self.db.add(mailbox_connection)
+                await self.db.commit()
+                await self.db.refresh(mailbox_connection)
             token = MicrosoftToken(
                 integration_id=self.integration.id, agent_id=current_agent.id, mailbox_connection_id=mailbox_connection.id,
                 access_token=token_data["access_token"], refresh_token=refresh_token_val, token_type=token_data["token_type"],
                 expires_at=datetime.utcnow() + timedelta(seconds=token_data["expires_in"]))
-            self.db.add(token); self.db.commit(); self.db.refresh(token)
-            existing_config = self.db.query(EmailSyncConfig).filter(
-                EmailSyncConfig.mailbox_connection_id == mailbox_connection.id, 
+            self.db.add(token)
+            await self.db.commit()
+            await self.db.refresh(token)
+            stmt = select(EmailSyncConfig).where(
+                EmailSyncConfig.mailbox_connection_id == mailbox_connection.id,
                 EmailSyncConfig.workspace_id == workspace.id
-            ).first()
-            
+            )
+            result = await self.db.execute(stmt)
+            existing_config = result.scalar_one_or_none()
+
             if not existing_config:
                 new_config = EmailSyncConfig(
                     integration_id=self.integration.id, mailbox_connection_id=mailbox_connection.id, folder_name="Inbox",
                     sync_interval=1, default_priority="Medium", auto_assign=False, workspace_id=workspace.id, is_active=True)
-                self.db.add(new_config); self.db.commit()
+                self.db.add(new_config)
+                await self.db.commit()
             elif not existing_config.is_active:
                 existing_config.is_active = True
-                self.db.add(existing_config); self.db.commit()
+                self.db.add(existing_config)
+                await self.db.commit()
                 
             logger.info(f"Successfully {'reconnected' if is_reconnect else 'connected'} mailbox {mailbox_email} for workspace {workspace_id}")
             return token
@@ -367,8 +483,8 @@ class MicrosoftAuthService:
             token.expires_at = datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
             
             self.db.add(token) 
-            self.db.commit()
-            self.db.refresh(token)
+            await self.db.commit()
+            await self.db.refresh(token)
             logger.info(f"Successfully refreshed token ID: {token.id} for mailbox_connection_id: {token.mailbox_connection_id}")
             return token
         except httpx.HTTPStatusError as e:
@@ -379,8 +495,8 @@ class MicrosoftAuthService:
                 except: pass
                 if error_json.get("error") == "invalid_grant":
                     logger.warning(f"Refresh token for token ID {token.id} is invalid or expired. Deleting it.")
-                    self.db.delete(token)
-                    self.db.commit()
+                    await self.db.delete(token)
+                    await self.db.commit()
                     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token invalid. Re-authentication required.")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to refresh token: {str(e)}")
         except Exception as e:

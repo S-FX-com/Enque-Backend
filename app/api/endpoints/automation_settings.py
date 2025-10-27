@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Path
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -51,31 +52,39 @@ async def get_workspace_automation_settings(
         )
     
     # Get automation settings
-    team_notification_setting = db.query(NotificationSetting).filter(
+    stmt_team = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "teams",
         NotificationSetting.type == "new_ticket_created"
-    ).first()
-    
-    weekly_summary_setting = db.query(NotificationSetting).filter(
+    )
+    result_team = await db.execute(stmt_team)
+    team_notification_setting = result_team.scalars().first()
+
+    stmt_weekly = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "agents",
         NotificationSetting.type == "weekly_agent_summary"
-    ).first()
-    
+    )
+    result_weekly = await db.execute(stmt_weekly)
+    weekly_summary_setting = result_weekly.scalars().first()
+
     # 🔧 ADDED: Get daily outstanding tasks setting
-    daily_outstanding_setting = db.query(NotificationSetting).filter(
+    stmt_daily = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "agents",
         NotificationSetting.type == "daily_outstanding_tasks"
-    ).first()
-    
+    )
+    result_daily = await db.execute(stmt_daily)
+    daily_outstanding_setting = result_daily.scalars().first()
+
     # 🔧 ADDED: Get weekly manager summary setting
-    weekly_manager_setting = db.query(NotificationSetting).filter(
+    stmt_manager = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "teams",
         NotificationSetting.type == "weekly_manager_summary"
-    ).first()
+    )
+    result_manager = await db.execute(stmt_manager)
+    weekly_manager_setting = result_manager.scalars().first()
     
     # If no team notification setting exists, create a default one
     if not team_notification_setting:
@@ -195,8 +204,8 @@ async def toggle_automation_setting_endpoint(
             updated_at=datetime.utcnow()
         )
         db.add(new_setting)
-        db.commit()
-        db.refresh(new_setting)
+        await db.commit()
+        await db.refresh(new_setting)
         
         return {"success": True, "message": "Automation setting created successfully"}
     
@@ -242,18 +251,20 @@ async def create_weekly_summary_setting(
     from datetime import datetime
     
     # Check if setting already exists
-    existing_setting = db.query(NotificationSetting).filter(
+    stmt = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "agents",
         NotificationSetting.type == "weekly_agent_summary"
-    ).first()
+    )
+    result = await db.execute(stmt)
+    existing_setting = result.scalars().first()
     
     if existing_setting:
         # Update existing setting
         existing_setting.is_enabled = toggle_data.is_enabled
         existing_setting.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(existing_setting)
+        await db.commit()
+        await db.refresh(existing_setting)
     else:
         # Create new setting
         new_setting = NotificationSetting(
@@ -266,8 +277,8 @@ async def create_weekly_summary_setting(
             updated_at=datetime.utcnow()
         )
         db.add(new_setting)
-        db.commit()
-        db.refresh(new_setting)
+        await db.commit()
+        await db.refresh(new_setting)
     
     return {"success": True, "message": "Weekly agent summary setting updated successfully"} 
 
@@ -293,18 +304,20 @@ async def create_daily_outstanding_setting(
     from datetime import datetime
     
     # Check if setting already exists
-    existing_setting = db.query(NotificationSetting).filter(
+    stmt = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "agents",
         NotificationSetting.type == "daily_outstanding_tasks"
-    ).first()
+    )
+    result = await db.execute(stmt)
+    existing_setting = result.scalars().first()
     
     if existing_setting:
         # Update existing setting
         existing_setting.is_enabled = toggle_data.is_enabled
         existing_setting.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(existing_setting)
+        await db.commit()
+        await db.refresh(existing_setting)
     else:
         # Create new setting
         new_setting = NotificationSetting(
@@ -317,8 +330,8 @@ async def create_daily_outstanding_setting(
             updated_at=datetime.utcnow()
         )
         db.add(new_setting)
-        db.commit()
-        db.refresh(new_setting)
+        await db.commit()
+        await db.refresh(new_setting)
     
     return {"success": True, "message": "Daily outstanding tasks setting updated successfully"}
 
@@ -344,18 +357,20 @@ async def create_weekly_manager_summary_setting(
     from datetime import datetime
     
     # Check if setting already exists
-    existing_setting = db.query(NotificationSetting).filter(
+    stmt = select(NotificationSetting).filter(
         NotificationSetting.workspace_id == workspace_id,
         NotificationSetting.category == "teams",
         NotificationSetting.type == "weekly_manager_summary"
-    ).first()
+    )
+    result = await db.execute(stmt)
+    existing_setting = result.scalars().first()
     
     if existing_setting:
         # Update existing setting
         existing_setting.is_enabled = toggle_data.is_enabled
         existing_setting.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(existing_setting)
+        await db.commit()
+        await db.refresh(existing_setting)
     else:
         # Create new setting
         new_setting = NotificationSetting(
@@ -368,7 +383,7 @@ async def create_weekly_manager_summary_setting(
             updated_at=datetime.utcnow()
         )
         db.add(new_setting)
-        db.commit()
-        db.refresh(new_setting)
+        await db.commit()
+        await db.refresh(new_setting)
     
-    return {"success": True, "message": "Weekly manager summary setting updated successfully"} 
+    return {"success": True, "message": "Weekly manager summary setting updated successfully"}

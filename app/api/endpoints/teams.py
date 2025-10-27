@@ -1,10 +1,9 @@
 from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, and_ # Import func for count and or_ for OR conditions
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, or_, and_, select
 
-# Import the new dependency
 from app.api.dependencies import get_current_active_user, get_current_active_admin_or_manager
 from app.database.session import get_db
 from app.models.team import Team, TeamMember
@@ -19,76 +18,80 @@ router = APIRouter()
 
 @router.get("/", response_model=List[TeamSchema])
 async def read_teams(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     skip: int = 0,
     limit: int = 100,
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
     Retrieve teams for the current user's workspace with ticket counts.
-    Includes tickets directly assigned to the team AND tickets from mailboxes assigned to the team.
-    Admin/Manager users can see ALL teams with ALL tickets. Regular agents see teams based on membership.
     """
     teams_with_counts = []
-    teams_query = db.query(Team).filter(
-        Team.workspace_id == current_user.workspace_id
-    ).order_by(Team.name).offset(skip).limit(limit).all()
+    result = await db.execute(
+        select(Team).filter(
+            Team.workspace_id == current_user.workspace_id
+        ).order_by(Team.name).offset(skip).limit(limit)
+    )
+    teams_query = result.scalars().all()
     
-    # Check if user is admin or manager
     is_admin_or_manager = current_user.role in ['admin', 'manager']
 
     for team in teams_query:
+        total_ticket_count = 0
         if is_admin_or_manager:
-            # Admin/Manager: Count ALL tickets for this team without team membership restrictions
-            total_ticket_count = db.query(func.count(Task.id.distinct())).filter(
+            subquery = select(mailbox_team_assignments.c.mailbox_connection_id).filter(
+                mailbox_team_assignments.c.team_id == team.id
+            )
+            count_query = select(func.count(Task.id.distinct())).filter(
                 or_(
-                    # Direct team assignment
                     Task.team_id == team.id,
-                    # Mailbox team assignment (only for tickets without direct team assignment)
                     and_(
-                        Task.team_id.is_(None),  # Only count mailbox tickets that don't have team_id
+                        Task.team_id.is_(None),
                         Task.mailbox_connection_id.isnot(None),
-                        Task.mailbox_connection_id.in_(
-                            db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                                mailbox_team_assignments.c.team_id == team.id
-                            )
-                        )
+                        Task.mailbox_connection_id.in_(subquery)
                     )
                 ),
                 Task.status != 'Closed',
                 Task.is_deleted == False,
-                Task.workspace_id == current_user.workspace_id  # Ensure workspace filtering
-            ).scalar() or 0
-            
-        else:
-            # Regular agent: Count tickets directly assigned to team + mailbox tickets if user is team member
-            direct_ticket_count = db.query(func.count(Task.id)).filter(
-                Task.team_id == team.id,
-                Task.status != 'Closed',
-                Task.is_deleted == False,
                 Task.workspace_id == current_user.workspace_id
-            ).scalar() or 0
-            
-            # Count mailbox tickets only if current user is a member of this team
-            is_team_member = db.query(TeamMember).filter(
-                TeamMember.team_id == team.id,
-                TeamMember.agent_id == current_user.id
-            ).first() is not None
-            
-            if is_team_member:
-                mailbox_ticket_count = db.query(func.count(Task.id)).join(
-                    MailboxConnection, Task.mailbox_connection_id == MailboxConnection.id
-                ).join(
-                    mailbox_team_assignments, MailboxConnection.id == mailbox_team_assignments.c.mailbox_connection_id
-                ).filter(
-                    mailbox_team_assignments.c.team_id == team.id,
-                    Task.team_id.is_(None),  # Only count mailbox tickets without direct team assignment
+            )
+            count_result = await db.execute(count_query)
+            total_ticket_count = count_result.scalar() or 0
+        else:
+            direct_count_result = await db.execute(
+                select(func.count(Task.id)).filter(
+                    Task.team_id == team.id,
                     Task.status != 'Closed',
                     Task.is_deleted == False,
                     Task.workspace_id == current_user.workspace_id
-                ).scalar() or 0
-            else:
-                mailbox_ticket_count = 0
+                )
+            )
+            direct_ticket_count = direct_count_result.scalar() or 0
+            
+            member_result = await db.execute(
+                select(TeamMember).filter(
+                    TeamMember.team_id == team.id,
+                    TeamMember.agent_id == current_user.id
+                )
+            )
+            is_team_member = member_result.scalars().first() is not None
+            
+            mailbox_ticket_count = 0
+            if is_team_member:
+                mailbox_count_result = await db.execute(
+                    select(func.count(Task.id)).join(
+                        MailboxConnection, Task.mailbox_connection_id == MailboxConnection.id
+                    ).join(
+                        mailbox_team_assignments, MailboxConnection.id == mailbox_team_assignments.c.mailbox_connection_id
+                    ).filter(
+                        mailbox_team_assignments.c.team_id == team.id,
+                        Task.team_id.is_(None),
+                        Task.status != 'Closed',
+                        Task.is_deleted == False,
+                        Task.workspace_id == current_user.workspace_id
+                    )
+                )
+                mailbox_ticket_count = mailbox_count_result.scalar() or 0
             
             total_ticket_count = direct_ticket_count + mailbox_ticket_count
         
@@ -102,7 +105,7 @@ async def read_teams(
 @router.post("/", response_model=TeamSchema)
 async def create_team(
     team_in: TeamCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin_or_manager),
 ) -> Any:
     """
@@ -110,8 +113,8 @@ async def create_team(
     """
     team = Team(**team_in.dict())
     db.add(team)
-    db.commit()
-    db.refresh(team)
+    await db.commit()
+    await db.refresh(team)
     
     return team
 
@@ -119,13 +122,14 @@ async def create_team(
 @router.get("/{team_id}", response_model=TeamSchema)
 async def read_team(
     team_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
     Get team by ID
     """
-    team = db.query(Team).filter(Team.id == team_id).first()
+    result = await db.execute(select(Team).filter(Team.id == team_id))
+    team = result.scalars().first()
     if not team:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -138,13 +142,14 @@ async def read_team(
 async def update_team(
     team_id: int,
     team_in: TeamUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin_or_manager), 
 ) -> Any:
     """
     Update a team
     """
-    team = db.query(Team).filter(Team.id == team_id).first()
+    result = await db.execute(select(Team).filter(Team.id == team_id))
+    team = result.scalars().first()
     if not team:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -155,8 +160,8 @@ async def update_team(
     for field, value in update_data.items():
         setattr(team, field, value)
     
-    db.commit()
-    db.refresh(team)
+    await db.commit()
+    await db.refresh(team)
     
     return team
 
@@ -164,41 +169,44 @@ async def update_team(
 @router.delete("/{team_id}", response_model=TeamSchema)
 async def delete_team(
     team_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin_or_manager), 
 ) -> Any:
     """
     Delete a team
     """
-    team = db.query(Team).filter(Team.id == team_id).first()
+    result = await db.execute(select(Team).filter(Team.id == team_id))
+    team = result.scalars().first()
     if not team:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Team not found",
         )
     
-    db.delete(team)
-    db.commit()
+    await db.delete(team)
+    await db.commit()
     
     return team
 
 @router.get("/{team_id}/members", response_model=List[TeamMemberSchema])
 async def read_team_members(
     team_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
     Retrieve all members of a team
     """
-    team = db.query(Team).filter(Team.id == team_id).first()
+    result = await db.execute(select(Team).filter(Team.id == team_id))
+    team = result.scalars().first()
     if not team:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Team not found",
         )
     
-    members = db.query(TeamMember).filter(TeamMember.team_id == team_id).all()
+    result = await db.execute(select(TeamMember).filter(TeamMember.team_id == team_id))
+    members = result.scalars().all()
     return members
 
 
@@ -206,37 +214,33 @@ async def read_team_members(
 async def add_team_member(
     team_id: int,
     member_in: TeamMemberCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin_or_manager), 
 ) -> Any:
     """
     Add a member to a team
     """
-    team = db.query(Team).filter(Team.id == team_id).first()
-    if not team:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Team not found",
+    team_result = await db.execute(select(Team).filter(Team.id == team_id))
+    if not team_result.scalars().first():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    agent_result = await db.execute(select(Agent).filter(Agent.id == member_in.agent_id))
+    if not agent_result.scalars().first():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+    existing_member_result = await db.execute(
+        select(TeamMember).filter(
+            TeamMember.team_id == team_id,
+            TeamMember.agent_id == member_in.agent_id
         )
-    agent = db.query(Agent).filter(Agent.id == member_in.agent_id).first()
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
-        )
-    existing_member = db.query(TeamMember).filter(
-        TeamMember.team_id == team_id,
-        TeamMember.agent_id == member_in.agent_id
-    ).first()
-    if existing_member:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Agent is already a member of this team",
-        )
+    )
+    if existing_member_result.scalars().first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent is already a member of this team")
+
     member = TeamMember(team_id=team_id, agent_id=member_in.agent_id)
     db.add(member)
-    db.commit()
-    db.refresh(member)
+    await db.commit()
+    await db.refresh(member)
     
     return member
 
@@ -245,99 +249,75 @@ async def add_team_member(
 async def remove_team_member(
     team_id: int,
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_admin_or_manager), 
 ) -> Any:
     """
     Remove a member from a team
     """
-    member = db.query(TeamMember).filter(
-        TeamMember.team_id == team_id,
-        TeamMember.agent_id == agent_id
-    ).first()
+    result = await db.execute(
+        select(TeamMember).filter(
+            TeamMember.team_id == team_id,
+            TeamMember.agent_id == agent_id
+        )
+    )
+    member = result.scalars().first()
     if not member:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Team member not found",
         )
     
-    db.delete(member)
-    db.commit()
+    await db.delete(member)
+    await db.commit()
     
     return member
 
 @router.get("/agent/{agent_id}", response_model=List[TeamSchema])
 async def read_agent_teams(
     agent_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
     Retrieve teams for a specific agent with ticket counts.
-    Admin/Manager users get ALL teams with ALL tickets. Regular agents get only their teams.
     """
-    # Check if user is admin or manager
     is_admin_or_manager = current_user.role in ['admin', 'manager']
     
     if is_admin_or_manager:
-        # Admin/Manager: Get ALL teams in workspace (same as /teams/ endpoint)
-        agent_teams_query = db.query(Team).filter(
-            Team.workspace_id == current_user.workspace_id
-        ).order_by(Team.name).all()
+        query = select(Team).filter(Team.workspace_id == current_user.workspace_id).order_by(Team.name)
     else:
-        # Regular agent: Get only teams the agent belongs to
-        agent_teams_query = db.query(Team).join(
+        query = select(Team).join(
             TeamMember, Team.id == TeamMember.team_id
         ).filter(
             TeamMember.agent_id == agent_id,
             Team.workspace_id == current_user.workspace_id
-        ).order_by(Team.name).all()
+        ).order_by(Team.name)
+    
+    result = await db.execute(query)
+    agent_teams_query = result.scalars().all()
     
     teams_with_counts = []
     
     for team in agent_teams_query:
-        if is_admin_or_manager:
-            # Admin/Manager: Count ALL tickets for this team without restrictions
-            total_ticket_count = db.query(func.count(Task.id.distinct())).filter(
-                or_(
-                    # Direct team assignment
-                    Task.team_id == team.id,
-                    # Mailbox team assignment (only for tickets without direct team assignment)
-                    and_(
-                        Task.team_id.is_(None),  # Only count mailbox tickets that don't have team_id
-                        Task.mailbox_connection_id.isnot(None),
-                        Task.mailbox_connection_id.in_(
-                            db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                                mailbox_team_assignments.c.team_id == team.id
-                            )
-                        )
-                    )
-                ),
-                Task.status != 'Closed',
-                Task.is_deleted == False,
-                Task.workspace_id == current_user.workspace_id
-            ).scalar() or 0
-        else:
-            # Regular agent: Use existing logic with team membership filtering
-            total_ticket_count = db.query(func.count(Task.id.distinct())).filter(
-                or_(
-                    # Direct team assignment
-                    Task.team_id == team.id,
-                    # Mailbox team assignment (only for tickets without direct team assignment)
-                    and_(
-                        Task.team_id.is_(None),  # Only count mailbox tickets that don't have team_id
-                        Task.mailbox_connection_id.isnot(None),
-                        Task.mailbox_connection_id.in_(
-                            db.query(mailbox_team_assignments.c.mailbox_connection_id).filter(
-                                mailbox_team_assignments.c.team_id == team.id
-                            )
-                        )
-                    )
-                ),
-                Task.status != 'Closed',
-                Task.is_deleted == False,
-                Task.workspace_id == current_user.workspace_id
-            ).scalar() or 0
+        subquery = select(mailbox_team_assignments.c.mailbox_connection_id).filter(
+            mailbox_team_assignments.c.team_id == team.id
+        )
+        count_query = select(func.count(Task.id.distinct())).filter(
+            or_(
+                Task.team_id == team.id,
+                and_(
+                    Task.team_id.is_(None),
+                    Task.mailbox_connection_id.isnot(None),
+                    Task.mailbox_connection_id.in_(subquery)
+                )
+            ),
+            Task.status != 'Closed',
+            Task.is_deleted == False,
+            Task.workspace_id == current_user.workspace_id
+        )
+        count_result = await db.execute(count_query)
+        total_ticket_count = count_result.scalar() or 0
         
         team_data = TeamSchema.from_orm(team)
         team_data.ticket_count = total_ticket_count

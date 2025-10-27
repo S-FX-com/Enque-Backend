@@ -324,7 +324,7 @@ async def update_task_endpoint(
     
     workspace_id = task.workspace_id
     origin = request.headers.get("origin") or settings.FRONTEND_URL
-    updated_task_dict = update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
+    updated_task_dict = await update_task(db=db, task_id=task_id, task_in=task_in, request_origin=origin)
     
     if not updated_task_dict:
         raise HTTPException(
@@ -369,8 +369,8 @@ async def update_task_endpoint(
             'user_id': updated_task_obj.user_id,
             'updated_at': updated_task_obj.updated_at.isoformat() if updated_task_obj.updated_at else None
         }
-        from app.core.socketio import emit_ticket_update_sync
-        emit_ticket_update_sync(updated_task_obj.workspace_id, task_data)
+        from app.core.socketio import emit_ticket_update
+        await emit_ticket_update(updated_task_obj.workspace_id, task_data)
     except Exception as e:
         logger.error(f"Failed to emit ticket_updated event for task {task_id}: {str(e)}")
     return updated_task_obj

@@ -1,17 +1,21 @@
 from typing import List, Optional, Dict, Any, Tuple
-from sqlalchemy.orm import Session, joinedload 
+from typing import List, Optional, Dict, Any, Tuple
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+from sqlalchemy.future import select
 from datetime import datetime
 import threading
 import re
 import asyncio
+import logging
 from uuid import UUID
 
-from app.models.task import Task, TicketBody  
+from app.models.task import Task, TicketBody
 from app.models.microsoft import EmailTicketMapping
 from app.schemas.task import TicketCreate, TicketUpdate
 from app.schemas.microsoft import EmailInfo
 from app.utils.logger import logger, log_important
-from app.database.session import SessionLocal
+from app.database.session import AsyncSessionLocal, get_background_db_session
 from app.core.exceptions import DatabaseException, MicrosoftAPIException
 from app.models.agent import Agent
 from app.models.microsoft import MailboxConnection, MicrosoftToken
@@ -20,19 +24,36 @@ from app.services.email_service import send_ticket_assignment_email, send_team_t
 from app.services.microsoft_service import MicrosoftGraphService
 
 
-def get_tasks(db: Session, skip: int = 0, limit: int = 100) -> List[Task]:
+def _run_async_in_new_loop(coro_func, *args):
+    """
+    Wrapper to run a coroutine in a new thread with its own event loop.
+    This is a synchronous function intended to be the target of a threading.Thread.
+    """
+    try:
+        asyncio.run(coro_func(*args))
+    except Exception as e:
+        # Using a generic logger as this is a top-level function
+        logging.getLogger(__name__).error(f"Error in background task {coro_func.__name__}: {e}", exc_info=True)
+
+
+async def get_tasks(db: AsyncSession, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get all tasks"""
-    return db.query(Task).options(joinedload(Task.user)).filter(Task.is_deleted == False).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    stmt = select(Task).options(joinedload(Task.user)).filter(Task.is_deleted == False).order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
-def get_task_by_id(db: Session, task_id: int) -> Optional[Dict[str, Any]]:
+async def get_task_by_id(db: AsyncSession, task_id: int) -> Optional[Dict[str, Any]]:
     """Get a task by ID with email info if available"""
-    task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
+    stmt = select(Task).filter(Task.id == task_id, Task.is_deleted == False)
+    result = await db.execute(stmt)
+    task = result.scalars().first()
     if not task:
         return None
-    email_mapping = db.query(EmailTicketMapping).filter(
-        EmailTicketMapping.ticket_id == task.id
-    ).first()
+    
+    stmt = select(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == task.id)
+    result = await db.execute(stmt)
+    email_mapping = result.scalars().first()
     
     task_dict = task.__dict__.copy()
     task_dict['is_from_email'] = email_mapping is not None
@@ -52,7 +73,7 @@ def get_task_by_id(db: Session, task_id: int) -> Optional[Dict[str, Any]]:
     return task_dict
 
 
-def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None) -> Task: 
+async def create_task(db: AsyncSession, task_in: TicketCreate, current_user_id: int = None) -> Task: 
     """Create a new task"""
     task_data = task_in.dict()
 
@@ -65,16 +86,18 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
     
     task = Task(**task_data)
     db.add(task)
-    db.commit()
-    db.refresh(task) 
-    db.refresh(task, attribute_names=['user']) 
+    await db.commit()
+    await db.refresh(task) 
+    await db.refresh(task, attribute_names=['user']) 
     
-    # Ejecutar workflows para el evento 'ticket.created'
+    # TODO: Refactor WorkflowService to be async
+    # For now, we run it synchronously but this will block the event loop.
     try:
         from app.services.workflow_service import WorkflowService
         context = {'ticket': task}
-        executed_workflows = WorkflowService.execute_workflows(
-            db=db,
+        # This is a synchronous call and will block. It needs to be refactored.
+        executed_workflows = await WorkflowService.execute_workflows(
+            db=db, # Passing async session to sync function, might need adjustment
             trigger='ticket.created',
             workspace_id=task.workspace_id,
             context=context
@@ -89,37 +112,32 @@ def create_task(db: Session, task_in: TicketCreate, current_user_id: int = None)
         )
     return task
 
-def _mark_email_read_bg(task_id: int):
+async def _mark_email_read_bg(task_id: int):
     """Mark email as read in the background using a new DB session."""
-    db: Session = None
-    try:
-        db = SessionLocal()
-        if db is None:
-            logger.error(f"Failed to create DB session for background task (ticket #{task_id})")
-            return
-
-        from app.services.microsoft_service import mark_email_as_read_by_task_id
-        mark_email_as_read_by_task_id(db, task_id)
-    except (DatabaseException, MicrosoftAPIException) as e:
-        logger.error(
-            f"Error in background email marking for ticket #{task_id}: {e}",
-            extra={"task_id": task_id, "error_type": type(e).__name__},
-            exc_info=True
-        )
-    except Exception as e:
-        logger.error(
-            f"Unexpected error in background email marking for ticket #{task_id}: {e}",
-            extra={"task_id": task_id},
-            exc_info=True
-        )
-    finally:
-        if db:
-            db.close()
+    async with AsyncSessionLocal() as db:
+        try:
+            from app.services.microsoft_service import mark_email_as_read_by_task_id
+            # Assuming mark_email_as_read_by_task_id will also be refactored to be async
+            await mark_email_as_read_by_task_id(db, task_id)
+        except (DatabaseException, MicrosoftAPIException) as e:
+            logger.error(
+                f"Error in background email marking for ticket #{task_id}: {e}",
+                extra={"task_id": task_id, "error_type": type(e).__name__},
+                exc_info=True
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in background email marking for ticket #{task_id}: {e}",
+                extra={"task_id": task_id},
+                exc_info=True
+            )
 
 
-def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin: Optional[str] = None) -> Optional[Dict[str, Any]]: 
+async def update_task(db: AsyncSession, task_id: int, task_in: TicketUpdate, request_origin: Optional[str] = None) -> Optional[Dict[str, Any]]: 
     """Update a task - optimizada para respuesta rápida"""
-    task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
+    stmt = select(Task).filter(Task.id == task_id, Task.is_deleted == False)
+    result = await db.execute(stmt)
+    task = result.scalars().first()
     if not task:
         return None
     old_assignee_id = task.assignee_id
@@ -131,42 +149,26 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         setattr(task, field, value)
 
     # ✅ OPTIMIZACIÓN: Commit inmediato para respuesta rápida
-    db.commit()
-    db.refresh(task)
-    db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
+    await db.commit()
+    await db.refresh(task)
+    await db.refresh(task, attribute_names=['user', 'assignee', 'sent_from', 'sent_to', 'team', 'company', 'workspace', 'body', 'category']) 
     
-    # ✅ OPTIMIZACIÓN: Ejecutar procesos pesados en background usando threading
+    # ✅ OPTIMIZACIÓN: Ejecutar procesos pesados en background usando threading.Thread
     try:
-        # Ejecutar workflows en background thread
-        threading.Thread(
-            target=_execute_workflows_thread,
-            args=(task_id, task.workspace_id, old_assignee_id, old_status, old_priority, update_data),
-            daemon=True
-        ).start()
-        
-        # Enviar notificaciones en background thread
+        # Ejecutar workflows en un hilo separado
+        threading.Thread(target=_run_async_in_new_loop, args=(_execute_workflows_thread, task_id, task.workspace_id, old_assignee_id, old_status, old_priority, update_data)).start()
+
+        # Las notificaciones también pueden ser pesadas, las movemos a hilos
         if 'assignee_id' in update_data and old_assignee_id != task.assignee_id and task.assignee_id is not None:
-            threading.Thread(
-                target=_send_assignment_notification_thread,
-                args=(task_id, request_origin),
-                daemon=True
-            ).start()
+            threading.Thread(target=_run_async_in_new_loop, args=(_send_assignment_notification_thread, task_id, request_origin)).start()
         
         if ('team_id' in update_data or 'assignee_id' in update_data) and task.team_id and not task.assignee_id:
-            threading.Thread(
-                target=_send_team_notification_thread,
-                args=(task_id, request_origin),
-                daemon=True
-            ).start()
+            threading.Thread(target=_run_async_in_new_loop, args=(_send_team_notification_thread, task_id, request_origin)).start()
         
         if 'status' in update_data and old_status != task.status and task.status == 'Closed':
-            threading.Thread(
-                target=_send_closure_notification_thread,
-                args=(task_id,),
-                daemon=True
-            ).start()
+            threading.Thread(target=_run_async_in_new_loop, args=(_send_closure_notification_thread, task_id)).start()
             
-        logger.info(f"🚀 Background processes queued for ticket {task_id}")
+        logger.info(f"🚀 Background workflow processes queued for ticket {task_id}")
             
     except Exception as e:
         logger.error(
@@ -176,9 +178,10 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
         )
     
     # ✅ RESPUESTA RÁPIDA: Procesar solo la información esencial para la respuesta
-    email_mapping = db.query(EmailTicketMapping).filter(
-        EmailTicketMapping.ticket_id == task.id
-    ).first()
+    stmt = select(EmailTicketMapping).filter(EmailTicketMapping.ticket_id == task.id)
+    result = await db.execute(stmt)
+    email_mapping = result.scalars().first()
+    
     task_dict = task.__dict__.copy()
     task_dict['is_from_email'] = email_mapping is not None
     
@@ -197,71 +200,47 @@ def update_task(db: Session, task_id: int, task_in: TicketUpdate, request_origin
     return task_dict
 
 
-def _execute_workflows_thread(task_id: int, workspace_id: int, old_assignee_id, old_status, old_priority, update_data):
-    """Ejecutar workflows en background thread"""
+async def _execute_workflows_thread(task_id: int, workspace_id: int, old_assignee_id, old_status, old_priority, update_data):
+    """Ejecutar workflows en background"""
     try:
         from app.services.workflow_service import WorkflowService
-        # Crear nueva sesión para background task
-        background_db = SessionLocal()
-        
-        try:
-            # Reload task for background processing
-            task = background_db.query(Task).filter(Task.id == task_id).first()
+        async with get_background_db_session() as background_db:
+            stmt = select(Task).filter(Task.id == task_id)
+            result = await background_db.execute(stmt)
+            task = result.scalars().first()
             if not task:
                 return
                 
             context = {'ticket': task, 'old_values': {'assignee_id': old_assignee_id, 'status': old_status, 'priority': old_priority}}
             executed_workflows = []
             
-            # Workflow general de actualización
-            executed_workflows.extend(WorkflowService.execute_workflows(
-                db=background_db,
-                trigger='ticket.updated',
-                workspace_id=workspace_id,
-                context=context
+            # Execute workflows for ticket updates
+            executed_workflows.extend(await WorkflowService.execute_workflows(
+                db=background_db, trigger='ticket.updated', workspace_id=workspace_id, context=context
             ))
-            
-            # Workflows específicos según el tipo de cambio
             if 'status' in update_data and old_status != task.status:
-                executed_workflows.extend(WorkflowService.execute_workflows(
-                    db=background_db,
-                    trigger='ticket.status_changed',
-                    workspace_id=workspace_id,
-                    context=context
+                executed_workflows.extend(await WorkflowService.execute_workflows(
+                    db=background_db, trigger='ticket.status_changed', workspace_id=workspace_id, context=context
                 ))
-            
             if 'priority' in update_data and old_priority != task.priority:
-                executed_workflows.extend(WorkflowService.execute_workflows(
-                    db=background_db,
-                    trigger='ticket.priority_changed',
-                    workspace_id=workspace_id,
-                    context=context
+                executed_workflows.extend(await WorkflowService.execute_workflows(
+                    db=background_db, trigger='ticket.priority_changed', workspace_id=workspace_id, context=context
                 ))
-            
             if 'assignee_id' in update_data:
                 if old_assignee_id != task.assignee_id:
                     if task.assignee_id is not None:
-                        executed_workflows.extend(WorkflowService.execute_workflows(
-                            db=background_db,
-                            trigger='ticket.assigned',
-                            workspace_id=workspace_id,
-                            context=context
+                        executed_workflows.extend(await WorkflowService.execute_workflows(
+                            db=background_db, trigger='ticket.assigned', workspace_id=workspace_id, context=context
                         ))
                     else:
-                        executed_workflows.extend(WorkflowService.execute_workflows(
-                            db=background_db,
-                            trigger='ticket.unassigned',
-                            workspace_id=workspace_id,
-                            context=context
+                        executed_workflows.extend(await WorkflowService.execute_workflows(
+                            db=background_db, trigger='ticket.unassigned', workspace_id=workspace_id, context=context
                         ))
             
             if executed_workflows:
                 logger.info(f"✅ Background workflows executed for ticket {task_id}: {executed_workflows}")
-                background_db.commit()
+                await background_db.commit()
                 
-        finally:
-            background_db.close()
-            
     except Exception as e:
         logger.error(
             f"Error in background workflows for ticket {task_id}: {e}",
@@ -270,47 +249,32 @@ def _execute_workflows_thread(task_id: int, workspace_id: int, old_assignee_id, 
         )
 
 
-def _send_closure_notification_thread(task_id: int):
-    """Enviar notificación de cierre en background thread"""
+async def _send_closure_notification_thread(task_id: int):
+    """Enviar notificación de cierre en background"""
     try:
         from app.services.notification_service import send_notification
-        import asyncio
-        # Crear nueva sesión para background task
-        background_db = SessionLocal()
-        
-        try:
-            # Reload task with user relationship
-            task_with_user = background_db.query(Task).options(joinedload(Task.user)).filter(Task.id == task_id).first()
+        async with get_background_db_session() as background_db:
+            stmt = select(Task).options(joinedload(Task.user)).filter(Task.id == task_id)
+            result = await background_db.execute(stmt)
+            task_with_user = result.scalars().first()
             
             if task_with_user and task_with_user.user and task_with_user.user.email:
-                # Preparar variables de plantilla
                 template_vars = {
                     "user_name": task_with_user.user.name,
                     "ticket_id": task_with_user.id,
                     "ticket_title": task_with_user.title
                 }
-                
-                # Crear event loop para la función async
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    # Ejecutar la función async de notificación
-                    loop.run_until_complete(send_notification(
-                        db=background_db,
-                        workspace_id=task_with_user.workspace_id,
-                        category="users",
-                        notification_type="ticket_closed",
-                        recipient_email=task_with_user.user.email,
-                        recipient_name=task_with_user.user.name,
-                        template_vars=template_vars,
-                        task_id=task_with_user.id
-                    ))
-                    logger.info(f"✅ Background notification sent for closed ticket {task_id} to user {task_with_user.user.name}")
-                finally:
-                    loop.close()
-        finally:
-            background_db.close()
-            
+                await send_notification(
+                    db=background_db,
+                    workspace_id=task_with_user.workspace_id,
+                    category="users",
+                    notification_type="ticket_closed",
+                    recipient_email=task_with_user.user.email,
+                    recipient_name=task_with_user.user.name,
+                    template_vars=template_vars,
+                    task_id=task_with_user.id
+                )
+                logger.info(f"✅ Background notification sent for closed ticket {task_id} to user {task_with_user.user.name}")
     except Exception as e:
         logger.error(
             f"Error sending background closure notification for ticket {task_id}: {e}",
@@ -319,31 +283,17 @@ def _send_closure_notification_thread(task_id: int):
         )
 
 
-def _send_assignment_notification_thread(task_id: int, request_origin: Optional[str] = None):
-    """Enviar notificación de asignación en background thread"""
+async def _send_assignment_notification_thread(task_id: int, request_origin: Optional[str] = None):
+    """Enviar notificación de asignación en background"""
     try:
-        import asyncio
-        # Crear nueva sesión para background task
-        background_db = SessionLocal()
-        
-        try:
-            # Reload task
-            task = background_db.query(Task).filter(Task.id == task_id).first()
+        async with get_background_db_session() as background_db:
+            stmt = select(Task).options(joinedload(Task.assignee)).filter(Task.id == task_id)
+            result = await background_db.execute(stmt)
+            task = result.scalars().first()
             if not task:
                 return
-                
-            # Crear event loop para la función async
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                # Ejecutar la función async de notificación
-                loop.run_until_complete(send_assignment_notification(background_db, task, request_origin))
-                logger.info(f"✅ Background assignment notification sent for ticket {task_id}")
-            finally:
-                loop.close()
-        finally:
-            background_db.close()
-            
+            await send_assignment_notification(background_db, task, request_origin)
+            logger.info(f"✅ Background assignment notification sent for ticket {task_id}")
     except Exception as e:
         logger.error(
             f"Error sending background assignment notification for ticket {task_id}: {e}",
@@ -352,31 +302,17 @@ def _send_assignment_notification_thread(task_id: int, request_origin: Optional[
         )
 
 
-def _send_team_notification_thread(task_id: int, request_origin: Optional[str] = None):
-    """Enviar notificación de equipo en background thread"""
+async def _send_team_notification_thread(task_id: int, request_origin: Optional[str] = None):
+    """Enviar notificación de equipo en background"""
     try:
-        import asyncio
-        # Crear nueva sesión para background task
-        background_db = SessionLocal()
-        
-        try:
-            # Reload task
-            task = background_db.query(Task).filter(Task.id == task_id).first()
+        async with get_background_db_session() as background_db:
+            stmt = select(Task).filter(Task.id == task_id)
+            result = await background_db.execute(stmt)
+            task = result.scalars().first()
             if not task:
                 return
-                
-            # Crear event loop para la función async
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                # Ejecutar la función async de notificación
-                loop.run_until_complete(send_team_notification(background_db, task, request_origin))
-                logger.info(f"✅ Background team notification sent for ticket {task_id}")
-            finally:
-                loop.close()
-        finally:
-            background_db.close()
-            
+            await send_team_notification(background_db, task, request_origin)
+            logger.info(f"✅ Background team notification sent for ticket {task_id}")
     except Exception as e:
         logger.error(
             f"Error sending background team notification for ticket {task_id}: {e}",
@@ -385,70 +321,76 @@ def _send_team_notification_thread(task_id: int, request_origin: Optional[str] =
         )
 
 
-def delete_task(db: Session, task_id: int) -> Optional[Task]:
+async def delete_task(db: AsyncSession, task_id: int) -> Optional[Task]:
     """Soft delete a task"""
-    task = db.query(Task).filter(Task.id == task_id, Task.is_deleted == False).first()
+    stmt = select(Task).filter(Task.id == task_id, Task.is_deleted == False)
+    result = await db.execute(stmt)
+    task = result.scalars().first()
     if not task:
         return None
     task.is_deleted = True
     task.deleted_at = datetime.utcnow()
     
-    db.commit()
-    db.refresh(task)
+    await db.commit()
+    await db.refresh(task)
     
     return task
 
 
-def get_user_tasks(db: Session, user_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
+async def get_user_tasks(db: AsyncSession, user_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get tasks for a specific user"""
-    return db.query(Task).filter(
+    stmt = select(Task).filter(
         Task.user_id == user_id,
         Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    ).order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
-def get_assigned_tasks(db: Session, agent_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
+async def get_assigned_tasks(db: AsyncSession, agent_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get tasks assigned to a specific agent"""
-    return db.query(Task).filter(
+    stmt = select(Task).filter(
         Task.assignee_id == agent_id,
         Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    ).order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
-def get_team_tasks(db: Session, team_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
+async def get_team_tasks(db: AsyncSession, team_id: int, skip: int = 0, limit: int = 100) -> List[Task]:
     """Get tasks for a specific team"""
-    return db.query(Task).filter(
+    stmt = select(Task).filter(
         Task.team_id == team_id,
         Task.is_deleted == False
-    ).order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    ).order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
-async def send_assignment_notification(db: Session, task: Task, request_origin: Optional[str] = None):
+async def send_assignment_notification(db: AsyncSession, task: Task, request_origin: Optional[str] = None):
     """
     Envía una notificación por correo al agente asignado a un ticket.
     Usa el mailbox específico del ticket si está disponible.
     """
     try:
-        if not task.assignee_id or not task.assignee:
-            logger.warning(f"No se pudo enviar notificación para el ticket {task.id}: No hay asignado")
+        if not task.assignee_id:
+            logger.warning(f"Could not send notification for the ticket {task.id}")
             return
 
-        # Intentar usar el mailbox específico del ticket primero
         preferred_mailbox = None
         preferred_token = None
         
         if task.mailbox_connection_id:
-            # El ticket tiene un mailbox específico, intentar usarlo
             logger.info(f"Ticket {task.id} tiene mailbox específico ID: {task.mailbox_connection_id}")
-            
-            # Buscar el token válido para este mailbox específico
-            mailbox_token_info = db.query(MailboxConnection, MicrosoftToken)\
+            stmt = select(MailboxConnection, MicrosoftToken)\
                 .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
                 .filter(
                     MailboxConnection.id == task.mailbox_connection_id,
                     MailboxConnection.is_active == True,
                     MicrosoftToken.access_token.isnot(None)
-                ).first()
+                )
+            result = await db.execute(stmt)
+            mailbox_token_info = result.first()
             
             if mailbox_token_info:
                 preferred_mailbox, preferred_token = mailbox_token_info
@@ -456,10 +398,9 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             else:
                 logger.warning(f"No se encontró token válido para el mailbox específico del ticket {task.id}")
 
-        # Si no hay mailbox específico o no tiene token válido, usar fallback
         if not preferred_mailbox or not preferred_token:
             logger.info(f"Buscando mailbox fallback para ticket {task.id}")
-            admin_sender_info = db.query(Agent, MailboxConnection, MicrosoftToken)\
+            stmt = select(Agent, MailboxConnection, MicrosoftToken)\
                 .join(MailboxConnection, Agent.id == MailboxConnection.created_by_agent_id)\
                 .join(MicrosoftToken, MicrosoftToken.mailbox_connection_id == MailboxConnection.id)\
                 .filter(
@@ -467,7 +408,9 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
                     Agent.role.in_(['admin', 'manager']),
                     MailboxConnection.is_active == True,
                     MicrosoftToken.access_token.isnot(None)
-                ).order_by(Agent.role.desc()).first()
+                ).order_by(Agent.role.desc())
+            result = await db.execute(stmt)
+            admin_sender_info = result.first()
             
             if not admin_sender_info:
                 logger.warning(f"No hay administradores con buzón conectado para enviar notificación del ticket {task.id}")
@@ -476,12 +419,13 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             admin, preferred_mailbox, preferred_token = admin_sender_info
             logger.info(f"Usando mailbox fallback: {preferred_mailbox.email}")
 
-        # Determinar el origen de la solicitud
         if not request_origin:
-            workspace_domain_info = db.query(Agent).filter(
+            stmt = select(Agent).filter(
                 Agent.workspace_id == task.workspace_id,
                 Agent.last_login_origin.isnot(None)
-            ).order_by(Agent.last_login.desc()).first()
+            ).order_by(Agent.last_login.desc())
+            result = await db.execute(stmt)
+            workspace_domain_info = result.scalars().first()
             
             if workspace_domain_info and workspace_domain_info.last_login_origin:
                 request_origin = workspace_domain_info.last_login_origin
@@ -490,7 +434,6 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
                 request_origin = settings.FRONTEND_URL
                 logger.info(f"Usando dominio predeterminado para la notificación: {request_origin}")
 
-        # Verificar y refrescar token si es necesario
         current_access_token = preferred_token.access_token
         if preferred_token.expires_at < datetime.utcnow():
             try:
@@ -499,14 +442,9 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
                 refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
                 current_access_token = refreshed_ms_token.access_token
             except Exception as e:
-                logger.error(
-                    f"Error refreshing token for notification: {e}",
-                    extra={"task_id": task.id, "mailbox_email": preferred_mailbox.email},
-                    exc_info=True
-                )
+                logger.error(f"Error refreshing token for notification: {e}", exc_info=True)
                 return
 
-        # Enviar la notificación usando el mailbox correcto
         sent = await send_ticket_assignment_email(
             db=db,
             to_email=task.assignee.email,
@@ -514,7 +452,7 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             ticket_id=task.id,
             ticket_title=task.title,
             sender_mailbox_email=preferred_mailbox.email,
-            sender_mailbox_display_name=preferred_mailbox.display_name,  # Nuevo parámetro
+            sender_mailbox_display_name=preferred_mailbox.display_name,
             user_access_token=current_access_token,
             request_origin=request_origin
         )
@@ -525,65 +463,63 @@ async def send_assignment_notification(db: Session, task: Task, request_origin: 
             logger.error(f"Error al enviar notificación para el ticket {task.id} al agente {task.assignee.email}")
             
     except Exception as e:
-        logger.error(
-            f"Unexpected error sending assignment notification for ticket {task.id}: {e}",
-            extra={"task_id": task.id, "assignee_id": task.assignee_id},
-            exc_info=True
-        )
+        logger.error(f"Unexpected error sending assignment notification for ticket {task.id}: {e}", exc_info=True)
 
 
-async def send_team_notification(db: Session, task: Task, request_origin: Optional[str] = None):
+async def send_team_notification(db: AsyncSession, task: Task, request_origin: Optional[str] = None):
     """
     Envía notificación a todos los miembros de un equipo cuando se crea un ticket 
     asignado al equipo pero sin agente específico asignado.
     """
     try:
-        # Solo enviar si el ticket tiene team_id pero NO tiene assignee_id
         if not task.team_id or task.assignee_id:
             return
             
-        # Verificar si las notificaciones de equipo están habilitadas
         from app.services.notification_service import is_team_notification_enabled
-        if not is_team_notification_enabled(db, task.workspace_id):
+        if not await is_team_notification_enabled(db, task.workspace_id): # Assuming this becomes async
             logger.info(f"Team notifications are disabled for workspace {task.workspace_id}, skipping notification for ticket {task.id}")
             return
             
-        # Obtener todos los miembros del equipo
         from app.models.team import TeamMember
-        team_members = db.query(TeamMember).join(Agent).filter(
+        stmt = select(TeamMember).join(Agent).filter(
             TeamMember.team_id == task.team_id,
             Agent.is_active == True,
             Agent.email.isnot(None),
             Agent.email != ""
-        ).all()
+        )
+        result = await db.execute(stmt)
+        team_members = result.scalars().all()
         
         if not team_members:
             logger.info(f"No active team members found for team {task.team_id}")
             return
             
-        # Obtener información del equipo
         from app.models.team import Team
-        team = db.query(Team).filter(Team.id == task.team_id).first()
+        stmt = select(Team).filter(Team.id == task.team_id)
+        result = await db.execute(stmt)
+        team = result.scalars().first()
         team_name = team.name if team else f"Team {task.team_id}"
         
         logger.info(f"Sending team notification for ticket {task.id} to {len(team_members)} members of team '{team_name}'")
         
-        # Obtener el primer mailbox disponible para enviar notificaciones
         from app.models.microsoft import MailboxConnection
-        preferred_mailbox = db.query(MailboxConnection).filter(
+        stmt = select(MailboxConnection).filter(
             MailboxConnection.workspace_id == task.workspace_id,
             MailboxConnection.is_active == True
-        ).first()
+        )
+        result = await db.execute(stmt)
+        preferred_mailbox = result.scalars().first()
         
         if not preferred_mailbox:
             logger.error(f"No active mailbox found for workspace {task.workspace_id}")
             return
             
-        # Obtener el token más reciente para el mailbox
         from app.models.microsoft import MicrosoftToken
-        preferred_token = db.query(MicrosoftToken).filter(
+        stmt = select(MicrosoftToken).filter(
             MicrosoftToken.mailbox_connection_id == preferred_mailbox.id
-        ).order_by(MicrosoftToken.created_at.desc()).first()
+        ).order_by(MicrosoftToken.created_at.desc())
+        result = await db.execute(stmt)
+        preferred_token = result.scalars().first()
         
         if not preferred_token:
             logger.error(f"No token found for mailbox {preferred_mailbox.email}")
@@ -591,7 +527,6 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
             
         current_access_token = preferred_token.access_token
         
-        # Refrescar token si está expirado
         if preferred_token.expires_at < datetime.utcnow():
             try:
                 logger.info(f"Refrescando token para el buzón {preferred_mailbox.email}")
@@ -599,14 +534,9 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
                 refreshed_ms_token = await graph_service.refresh_token_async(preferred_token)
                 current_access_token = refreshed_ms_token.access_token
             except Exception as e:
-                logger.error(
-                    f"Error refreshing token for team notification: {e}",
-                    extra={"task_id": task.id, "mailbox_email": preferred_mailbox.email},
-                    exc_info=True
-                )
+                logger.error(f"Error refreshing token for team notification: {e}", exc_info=True)
                 return
         
-        # Enviar notificación a cada miembro del equipo
         for team_member in team_members:
             try:
                 sent = await send_team_ticket_notification_email(
@@ -628,15 +558,7 @@ async def send_team_notification(db: Session, task: Task, request_origin: Option
                     logger.error(f"Failed to send team notification to {team_member.agent.email} for ticket {task.id}")
                     
             except Exception as e:
-                logger.error(
-                    f"Error sending team notification to {team_member.agent.email}: {e}",
-                    extra={"task_id": task.id, "team_id": task.team_id, "agent_email": team_member.agent.email},
-                    exc_info=True
-                )
+                logger.error(f"Error sending team notification to {team_member.agent.email}: {e}", exc_info=True)
                 
     except Exception as e:
-        logger.error(
-            f"Unexpected error sending team notifications for ticket {task.id}: {e}",
-            extra={"task_id": task.id, "team_id": task.team_id},
-            exc_info=True
-        )
+        logger.error(f"Unexpected error sending team notifications for ticket {task.id}: {e}", exc_info=True)
