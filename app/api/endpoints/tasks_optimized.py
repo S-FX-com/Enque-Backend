@@ -522,12 +522,18 @@ async def search_tickets(
     """
     Search for tickets containing the search term in title, description, body, or by ticket ID.
     If the search query is numeric, it will search by ticket ID first, then by text.
+
+    NOTE: Ticket body content is NOT loaded in search results to save memory.
+    The search can find text IN the body, but the full body is not returned.
+    Use GET /tasks/{task_id}/body to fetch body content for specific tickets.
+
+    Memory savings: Up to 30 MB per search request (30 tickets × ~1MB avg body size)
     """
     base_query = select(Task).filter(
         Task.workspace_id == current_user.workspace_id,
         Task.is_deleted == False
     )
-    
+
     if q.strip().isdigit():
         ticket_id = int(q.strip())
         id_query = base_query.filter(Task.id == ticket_id).options(
@@ -538,19 +544,19 @@ async def search_tickets(
             joinedload(Task.team),
             joinedload(Task.company),
             joinedload(Task.category),
-            joinedload(Task.body)
+            noload(Task.body)  # 🚀 OPTIMIZED: Don't load body in search results
         )
         result = await db.execute(id_query.order_by(Task.created_at.desc()).offset(skip).limit(limit))
         tickets = result.scalars().all()
         if tickets:
             return tickets
-    
+
     search_term = f"%{q}%"
     query = base_query.join(TicketBody, Task.id == TicketBody.ticket_id, isouter=True).filter(
         or_(
             Task.title.ilike(search_term),
             Task.description.ilike(search_term),
-            TicketBody.email_body.ilike(search_term)
+            TicketBody.email_body.ilike(search_term)  # Search IN body but don't load it
         )
     ).options(
         joinedload(Task.sent_from),
@@ -560,9 +566,9 @@ async def search_tickets(
         joinedload(Task.team),
         joinedload(Task.company),
         joinedload(Task.category),
-        joinedload(Task.body)
+        noload(Task.body)  # 🚀 OPTIMIZED: Don't load body in search results
     )
-    
+
     result = await db.execute(query.order_by(Task.created_at.desc()).offset(skip).limit(limit))
     tickets = result.scalars().all()
     return tickets
@@ -680,7 +686,12 @@ async def read_task(
     db: AsyncSession = Depends(get_db)
 ) -> Any:
     """
-    Get a single ticket with ultra-smart optimization.
+    Get a single ticket with optimized loading.
+
+    NOTE: The ticket body (email HTML) is NOT loaded by default to save memory.
+    Use GET /tasks/{task_id}/body to fetch the body content separately if needed.
+
+    Memory savings: ~500KB-2MB per request
     """
     query = select(Task).filter(
         Task.id == task_id,
@@ -688,11 +699,11 @@ async def read_task(
         Task.is_deleted == False
     ).options(
         joinedload(Task.assignee),
-        joinedload(Task.user), 
+        joinedload(Task.user),
         joinedload(Task.category),
         joinedload(Task.workspace),
         joinedload(Task.sent_from),
-        joinedload(Task.body),
+        noload(Task.body),  # 🚀 OPTIMIZED: Don't load body (can be 500KB-2MB)
         joinedload(Task.team),
         joinedload(Task.company),
         joinedload(Task.email_mappings)
@@ -701,6 +712,59 @@ async def read_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskWithDetails.from_orm(task)
+
+
+@router.get("/{task_id}/body")
+async def get_ticket_body(
+    task_id: int,
+    current_user: Agent = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+) -> dict:
+    """
+    Get the body content of a ticket (lazy loaded).
+
+    This endpoint loads the ticket body (email HTML) separately from the ticket details
+    to optimize memory usage. The body can be large (500KB - 2MB for email tickets).
+
+    Returns:
+        dict: {
+            "ticket_id": int,
+            "has_body": bool,
+            "body": str | null,
+            "body_size": int (bytes),
+            "body_preview": str (first 200 chars)
+        }
+
+    Memory savings: Only loads body when explicitly requested instead of on every ticket fetch
+    """
+    # Query only for the body
+    query = select(Task).filter(
+        Task.id == task_id,
+        Task.workspace_id == current_user.workspace_id,
+        Task.is_deleted == False
+    ).options(
+        joinedload(Task.body),  # Only load the body
+        noload("*")  # Don't load any other relations
+    )
+
+    task = (await db.execute(query)).scalars().first()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Extract body info
+    has_body = task.body is not None
+    body_content = task.body.email_body if has_body and task.body else None
+    body_size = len(body_content) if body_content else 0
+    body_preview = body_content[:200] if body_content else None
+
+    return {
+        "ticket_id": task_id,
+        "has_body": has_body,
+        "body": body_content,
+        "body_size": body_size,
+        "body_preview": body_preview
+    }
 
 
 @router.put("/{task_id}/refresh", response_model=TaskWithDetails)
