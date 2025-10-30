@@ -918,6 +918,10 @@ class MicrosoftEmailService:
         return None, None
 
     def _extract_recipients_from_body(self, email_body: str, header: str) -> List[str]:
+        """
+        Extract recipient emails from forwarded email body.
+        Supports multiple recipients separated by semicolons or commas.
+        """
         if not email_body or not header:
             return []
 
@@ -925,17 +929,29 @@ class MicrosoftEmailService:
         from html import unescape
         decoded_body = unescape(email_body)
 
-        pattern = re.compile(rf"<b>{header}:</b>\s*(.*?)\s*<br>", re.IGNORECASE)
-        match = pattern.search(decoded_body)
+        # Try multiple patterns for different email client formats
+        patterns = [
+            re.compile(rf"<b>{header}:</b>\s*(.*?)\s*<br>", re.IGNORECASE),
+            re.compile(rf"<strong>{header}:</strong>\s*(.*?)\s*<br>", re.IGNORECASE),
+            re.compile(rf"<font[^>]*><b>{header}:</b>(.*?)</font>", re.IGNORECASE | re.DOTALL),
+        ]
 
-        if not match:
+        recipients_str = None
+        for pattern in patterns:
+            match = pattern.search(decoded_body)
+            if match:
+                recipients_str = match.group(1)
+                break
+
+        if not recipients_str:
             return []
 
-        recipients_str = match.group(1)
-
+        # Extract all email addresses from the matched string
+        # This handles multiple recipients separated by ; or ,
         email_pattern = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
         emails = email_pattern.findall(recipients_str)
 
+        logger.info(f"[FORWARD EXTRACTION] Found {len(emails)} {header} recipient(s): {emails}")
         return emails
 
     def _clean_email_address(self, email_string: str) -> Optional[str]:
@@ -1169,12 +1185,19 @@ class MicrosoftEmailService:
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
-                user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
+                user_id=user.id, company_id=company_id, workspace_id=workspace.id,
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
                 email_message_id=email.id, email_internet_message_id=email.internet_message_id, email_conversation_id=email.conversation_id,
                 email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str,
                 last_update=datetime.utcnow())
             self.db.add(task); await self.db.flush()
+
+            # 🔍 DEBUG: Log the ticket recipients after creation
+            logger.info(f"[TICKET CREATED] Ticket #{task.id} saved with recipients:")
+            logger.info(f"  📧 Email Sender: {task.email_sender}")
+            logger.info(f"  📨 TO recipients: {task.to_recipients}")
+            logger.info(f"  📬 CC recipients: {task.cc_recipients}")
+            logger.info(f"  📮 BCC recipients: {task.bcc_recipients}")
             
             # Use original email sender name for forwarded emails, otherwise use direct sender
             activity_sender_name = original_name if original_name else email.sender.name

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, distinct, select, delete
+from sqlalchemy import func, distinct, select
 from app.models.automation import Automation, AutomationCondition, AutomationAction, ConditionType, ConditionOperator, ActionType, LogicalOperator
 from app.schemas.automation import AutomationCreate, AutomationUpdate
 from app.models.task import Task
@@ -46,7 +46,14 @@ async def create(db: AsyncSession, *, obj_in: AutomationCreate, created_by_agent
 
 async def get_by_id(db: AsyncSession, *, id: int) -> Optional[Automation]:
     """Get automation by ID."""
-    result = await db.execute(select(Automation).filter(Automation.id == id))
+    from sqlalchemy.orm import selectinload
+
+    result = await db.execute(
+        select(Automation)
+        .options(selectinload(Automation.conditions))
+        .options(selectinload(Automation.actions))
+        .filter(Automation.id == id)
+    )
     return result.scalars().first()
 
 
@@ -54,8 +61,12 @@ async def get_by_workspace_id(
     db: AsyncSession, *, workspace_id: int, skip: int = 0, limit: int = 100
 ) -> List[Automation]:
     """Get all automations by workspace ID with pagination."""
+    from sqlalchemy.orm import selectinload
+
     result = await db.execute(
         select(Automation)
+        .options(selectinload(Automation.conditions))
+        .options(selectinload(Automation.actions))
         .filter(Automation.workspace_id == workspace_id)
         .offset(skip)
         .limit(limit)
@@ -67,8 +78,12 @@ async def get_active_by_workspace_id(
     db: AsyncSession, *, workspace_id: int, skip: int = 0, limit: int = 100
 ) -> List[Automation]:
     """Get active automations by workspace ID with pagination."""
+    from sqlalchemy.orm import selectinload
+
     result = await db.execute(
         select(Automation)
+        .options(selectinload(Automation.conditions))
+        .options(selectinload(Automation.actions))
         .filter(
             Automation.workspace_id == workspace_id,
             Automation.is_active == True
@@ -84,15 +99,17 @@ async def update(
 ) -> Automation:
     """Update automation in the database."""
     update_data = obj_in.model_dump(exclude_unset=True)
-    
+
     conditions_data = update_data.pop("conditions", None)
     actions_data = update_data.pop("actions", None)
-    
+
     for field, value in update_data.items():
         setattr(db_obj, field, value)
-    
+
     if conditions_data is not None:
-        await db.execute(delete(AutomationCondition).where(AutomationCondition.automation_id == db_obj.id))
+        # Clear existing conditions (cascade will delete them)
+        db_obj.conditions.clear()
+        # Add new conditions
         for condition_data in conditions_data:
             condition = AutomationCondition(
                 automation_id=db_obj.id,
@@ -100,18 +117,20 @@ async def update(
                 condition_operator=condition_data.get('condition_operator') if isinstance(condition_data, dict) else condition_data.condition_operator,
                 condition_value=condition_data.get('condition_value') if isinstance(condition_data, dict) else condition_data.condition_value,
             )
-            db.add(condition)
-    
+            db_obj.conditions.append(condition)
+
     if actions_data is not None:
-        await db.execute(delete(AutomationAction).where(AutomationAction.automation_id == db_obj.id))
+        # Clear existing actions (cascade will delete them)
+        db_obj.actions.clear()
+        # Add new actions
         for action_data in actions_data:
             action = AutomationAction(
                 automation_id=db_obj.id,
                 action_type=action_data.get('action_type') if isinstance(action_data, dict) else action_data.action_type,
                 action_value=action_data.get('action_value') if isinstance(action_data, dict) else action_data.action_value,
             )
-            db.add(action)
-    
+            db_obj.actions.append(action)
+
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
@@ -156,15 +175,29 @@ async def get_stats(db: AsyncSession, *, workspace_id: int) -> Dict[str, Any]:
 
 async def get_automations(db: AsyncSession, workspace_id: int, skip: int = 0, limit: int = 100) -> List[Automation]:
     """Get all automations for a workspace"""
+    from sqlalchemy.orm import selectinload
+
     result = await db.execute(
-        select(Automation).filter(Automation.workspace_id == workspace_id).offset(skip).limit(limit)
+        select(Automation)
+        .options(selectinload(Automation.conditions))
+        .options(selectinload(Automation.actions))
+        .filter(Automation.workspace_id == workspace_id)
+        .offset(skip)
+        .limit(limit)
     )
     return result.scalars().all()
 
 
 async def get_automation(db: AsyncSession, automation_id: int) -> Optional[Automation]:
     """Get a specific automation by ID"""
-    result = await db.execute(select(Automation).filter(Automation.id == automation_id))
+    from sqlalchemy.orm import selectinload
+
+    result = await db.execute(
+        select(Automation)
+        .options(selectinload(Automation.conditions))
+        .options(selectinload(Automation.actions))
+        .filter(Automation.id == automation_id)
+    )
     return result.scalars().first()
 
 

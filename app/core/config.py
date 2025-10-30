@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     EMAIL_SYNC_CONCURRENT_CONNECTIONS: int = 2  # 🚑 REDUCED: From 3 to 2 max concurrent syncs
     EMAIL_SYNC_FREQUENCY_SECONDS: int = 180  # 🚑 INCREASED: From 120 to 180 seconds (3 min intervals)
 
+    # 🗜️ HTTP Compression Configuration
+    # Ahorro estimado: $8-10/mes en network egress (50-70% reducción)
+    ENABLE_COMPRESSION: bool = True  # Enable HTTP response compression
+    COMPRESSION_MINIMUM_SIZE: int = 500  # Minimum bytes to compress (500 bytes = 0.5 KB)
+    COMPRESSION_GZIP_LEVEL: int = 6  # Gzip level 1-9 (1=fast, 9=best compression, 6=balanced)
+    COMPRESSION_BROTLI_QUALITY: int = 4  # Brotli quality 0-11 (0=fast, 11=best, 4=balanced)
+
     class Config:
         # Leer variables de entorno directamente, sin depender de archivos .env
         env_file = None

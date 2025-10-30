@@ -14,6 +14,7 @@ from app.core.rate_limiter import limiter
 from app.api.api import api_router
 from app.core.config import settings
 from app.core.socketio import sio
+from app.core.compression import SmartCompressionMiddleware, compression_stats
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,6 +115,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if settings.ENABLE_COMPRESSION:
+    app.add_middleware(
+        SmartCompressionMiddleware,
+        minimum_size=settings.COMPRESSION_MINIMUM_SIZE,
+        gzip_level=settings.COMPRESSION_GZIP_LEVEL,
+        brotli_quality=settings.COMPRESSION_BROTLI_QUALITY,
+    )
+    logger.info(f"✅ HTTP Compression enabled (min size: {settings.COMPRESSION_MINIMUM_SIZE} bytes)")
+else:
+    logger.warning("⚠️ HTTP Compression is DISABLED - network egress costs will be higher")
+
 app.add_middleware(HealthMiddleware)
 app.include_router(api_router, prefix=settings.API_V1_STR)
 socket_app = socketio.ASGIApp(sio, app)
@@ -136,7 +148,43 @@ async def health_check_detailed():
         health_status["status"] = "degraded"
     return health_status
 
+@app.get("/compression-stats")
+async def compression_statistics():
+
+    if not settings.ENABLE_COMPRESSION:
+        return {
+            "enabled": False,
+            "message": "HTTP compression is disabled"
+        }
+
+    stats = compression_stats.get_stats()
+
+    # Calcular ahorro estimado en $ (Railway: ~$0.10 por GB egress)
+    savings_gb = stats["savings_bytes"] / (1024 ** 3)
+    estimated_monthly_savings = savings_gb * 0.10
+
+    return {
+        "enabled": True,
+        "configuration": {
+            "minimum_size": settings.COMPRESSION_MINIMUM_SIZE,
+            "gzip_level": settings.COMPRESSION_GZIP_LEVEL,
+            "brotli_quality": settings.COMPRESSION_BROTLI_QUALITY,
+        },
+        "statistics": stats,
+        "cost_analysis": {
+            "total_savings_gb": round(savings_gb, 4),
+            "estimated_monthly_savings_usd": round(estimated_monthly_savings, 2),
+            "note": "Calculated at $0.10/GB egress (Railway pricing)"
+        }
+    }
+
 @app.get("/")
 def read_root():
     """Root endpoint"""
-    return {"message": "Enque API is running"}
+    return {
+        "message": "Enque API is running",
+        "version": "1.0.0",
+        "optimizations": {
+            "http_compression": settings.ENABLE_COMPRESSION
+        }
+    }

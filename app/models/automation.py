@@ -52,12 +52,12 @@ class Automation(Base):
     created_by = Column(Integer, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
-    conditions = relationship("AutomationCondition", back_populates="automation", cascade="all, delete-orphan")
-    actions = relationship("AutomationAction", back_populates="automation", cascade="all, delete-orphan")
-    
+    conditions = relationship("AutomationCondition", back_populates="automation", cascade="all, delete-orphan", lazy="selectin")
+    actions = relationship("AutomationAction", back_populates="automation", cascade="all, delete-orphan", lazy="selectin")
+
     # Foreign key relationships
-    workspace = relationship("Workspace")
-    creator = relationship("Agent", foreign_keys=[created_by])
+    workspace = relationship("Workspace", lazy="selectin")
+    creator = relationship("Agent", foreign_keys=[created_by], lazy="selectin")
 
 
 class AutomationCondition(Base):

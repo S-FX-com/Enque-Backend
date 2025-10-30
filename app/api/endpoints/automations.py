@@ -1,6 +1,6 @@
 from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.api.dependencies import get_current_active_user, get_current_active_admin, get_current_workspace
@@ -41,7 +41,7 @@ class AutomationToggleRequest(BaseModel):
 
 @router.get("/", response_model=List[AutomationSchema])
 async def read_automations(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
     active_only: bool = Query(False, description="Filter only active automations"),
@@ -52,16 +52,16 @@ async def read_automations(
     Retrieve automations for the current workspace with pagination.
     """
     logger.info(f"Fetching automations for workspace {current_workspace.id} with skip={skip}, limit={limit}")
-    
+
     if active_only:
-        automations = automation_service.get_active_by_workspace_id(
+        automations = await automation_service.get_active_by_workspace_id(
             db=db, workspace_id=current_workspace.id, skip=skip, limit=limit
         )
     else:
-        automations = automation_service.get_by_workspace_id(
+        automations = await automation_service.get_by_workspace_id(
             db=db, workspace_id=current_workspace.id, skip=skip, limit=limit
         )
-    
+
     logger.info(f"Retrieved {len(automations)} automations.")
     return automations
 
@@ -69,7 +69,7 @@ async def read_automations(
 @router.post("/", response_model=AutomationSchema)
 async def create_automation(
     automation_in: AutomationCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
@@ -77,14 +77,14 @@ async def create_automation(
     Create a new automation.
     """
     logger.info(f"Creating automation '{automation_in.name}' for workspace {current_workspace.id}")
-    
+
     # Set the workspace_id from the current workspace
     automation_in.workspace_id = current_workspace.id
-    
-    automation = automation_service.create(
+
+    automation = await automation_service.create(
         db=db, obj_in=automation_in, created_by_agent_id=current_user.id
     )
-    
+
     logger.info(f"Created automation with ID {automation.id}")
     return automation
 
@@ -92,27 +92,27 @@ async def create_automation(
 @router.get("/{automation_id}", response_model=AutomationSchema)
 async def read_automation(
     automation_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Get automation by ID.
     """
-    automation = automation_service.get_by_id(db=db, id=automation_id)
+    automation = await automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
+
     # Check if automation belongs to current workspace
     if automation.workspace_id != current_workspace.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
+
     return automation
 
 
@@ -120,28 +120,28 @@ async def read_automation(
 async def update_automation(
     automation_id: int,
     automation_in: AutomationUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Update an automation.
     """
-    automation = automation_service.get_by_id(db=db, id=automation_id)
+    automation = await automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
+
     # Check if automation belongs to current workspace
     if automation.workspace_id != current_workspace.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
-    automation = automation_service.update(db=db, db_obj=automation, obj_in=automation_in)
+
+    automation = await automation_service.update(db=db, db_obj=automation, obj_in=automation_in)
     logger.info(f"Updated automation {automation_id}")
     return automation
 
@@ -149,49 +149,49 @@ async def update_automation(
 @router.delete("/{automation_id}", response_model=AutomationSchema)
 async def delete_automation(
     automation_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Delete an automation.
     """
-    automation = automation_service.get_by_id(db=db, id=automation_id)
+    automation = await automation_service.get_by_id(db=db, id=automation_id)
     if not automation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
+
     # Check if automation belongs to current workspace
     if automation.workspace_id != current_workspace.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Automation not found",
         )
-    
-    automation_service.delete(db=db, db_obj=automation)
+
+    await automation_service.delete(db=db, db_obj=automation)
     logger.info(f"Deleted automation {automation_id}")
     return automation
 
 
 @router.get("/stats/summary")
 async def get_automation_stats(
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
     current_workspace: Workspace = Depends(get_current_workspace),
 ) -> Any:
     """
     Get automation statistics for the current workspace.
     """
-    stats = automation_service.get_stats(db=db, workspace_id=current_workspace.id)
+    stats = await automation_service.get_stats(db=db, workspace_id=current_workspace.id)
     return stats 
 
 
 @router.get("/{workspace_id}", response_model=AutomationsResponse)
 async def get_workspace_automation_settings(
     workspace_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -238,7 +238,7 @@ async def toggle_automation_setting_endpoint(
     toggle_data: AutomationToggleRequest,
     workspace_id: int = Path(...),
     setting_id: int = Path(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: Agent = Depends(get_current_active_user),
 ) -> Any:
     """

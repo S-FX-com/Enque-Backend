@@ -303,25 +303,38 @@ async def create_comment(
             db.add(task)
 
     # Update TO recipients on ticket
+    # 🔒 FIX: Only update if recipients are actually provided (not empty)
+    # This prevents overwriting original email recipients with empty values
     if comment_in.to_recipients is not None and not comment_in.is_private:
-        # Overwrite the existing to_recipients with the new list from the frontend
-        task.to_recipients = ", ".join(to_recipients)
-        logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
-        db.add(task)
+        if to_recipients and len(to_recipients) > 0:
+            # Only overwrite if there are actual recipients to set
+            task.to_recipients = ", ".join(to_recipients)
+            logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
+            db.add(task)
+        else:
+            logger.info(f"Keeping existing TO recipients for ticket {task_id}: {task.to_recipients}")
 
     # Update CC recipients on ticket
+    # 🔒 FIX: Only update if recipients are actually provided (not empty)
     if comment_in.other_destinaries is not None and not comment_in.is_private:
-        # Overwrite the existing cc_recipients with the new list from the frontend
-        task.cc_recipients = ", ".join(cc_recipients)
-        logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
-        db.add(task)
+        if cc_recipients and len(cc_recipients) > 0:
+            # Only overwrite if there are actual recipients to set
+            task.cc_recipients = ", ".join(cc_recipients)
+            logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
+            db.add(task)
+        else:
+            logger.info(f"Keeping existing CC recipients for ticket {task_id}: {task.cc_recipients}")
 
     # Update BCC recipients on ticket
+    # 🔒 FIX: Only update if recipients are actually provided (not empty)
     if comment_in.bcc_recipients is not None and not comment_in.is_private:
-        # Overwrite the existing bcc_recipients with the new list from the frontend
-        task.bcc_recipients = ", ".join(bcc_recipients)
-        logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
-        db.add(task)
+        if bcc_recipients and len(bcc_recipients) > 0:
+            # Only overwrite if there are actual recipients to set
+            task.bcc_recipients = ", ".join(bcc_recipients)
+            logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
+            db.add(task)
+        else:
+            logger.info(f"Keeping existing BCC recipients for ticket {task_id}: {task.bcc_recipients}")
 
     content_to_store = comment_in.content
     s3_html_url = None
