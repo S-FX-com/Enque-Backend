@@ -2097,7 +2097,9 @@ class MicrosoftEmailService:
                         logger.info(f"Using content_bytes for attachment {attachment.file_name} (ID: {attachment_id}) in new email")
                     elif attachment.s3_url:
                         logger.info(f"Downloading attachment {attachment.file_name} from S3: {attachment.s3_url} for new email")
-                        # file_content = self._download_file_from_s3(attachment.s3_url)
+                        from app.services.s3_service import get_s3_service
+                        s3_service = get_s3_service()
+                        file_content = s3_service._download_file_from_s3(attachment.s3_url)
                         if not file_content:
                             logger.error(f"Failed to download attachment {attachment.file_name} from S3 for new email")
                             continue
@@ -2275,13 +2277,34 @@ class MicrosoftEmailService:
                 try:
                     for attachment_id in attachment_ids:
                         attachment = self.db.query(TicketAttachment).filter(TicketAttachment.id == attachment_id).first()
-                        if attachment and attachment.file_content:
+                        if attachment:
+                            file_content = None
+                            if attachment.content_bytes:
+                                file_content = attachment.content_bytes
+                                logger.info(f"Using content_bytes for attachment {attachment.file_name} (ID: {attachment_id}) in reply")
+                            elif attachment.s3_url:
+                                logger.info(f"Downloading attachment {attachment.file_name} from S3: {attachment.s3_url} for reply")
+                                from app.services.s3_service import get_s3_service
+                                s3_service = get_s3_service()
+                                file_content = s3_service._download_file_from_s3(attachment.s3_url)
+                                if not file_content:
+                                    logger.error(f"Failed to download attachment {attachment.file_name} from S3 for reply")
+                                    continue
+                            else:
+                                logger.error(f"Attachment {attachment.file_name} (ID: {attachment_id}) has no content_bytes or s3_url for reply")
+                                continue
+
+                            content_b64 = base64.b64encode(file_content).decode('utf-8')
                             attachment_data = {
                                 "@odata.type": "#microsoft.graph.fileAttachment",
-                                "name": attachment.filename,
-                                "contentBytes": attachment.file_content
+                                "name": attachment.file_name,
+                                "contentType": attachment.content_type,
+                                "contentBytes": content_b64
                             }
                             attachments_data.append(attachment_data)
+                            logger.info(f"Added attachment {attachment.file_name} ({attachment.id}) to reply email")
+                        else:
+                            logger.warning(f"Attachment ID {attachment_id} not found when preparing reply")
                 except Exception as attach_error:
                     logger.error(f"Error processing attachments: {str(attach_error)}")
             
