@@ -1,0 +1,39 @@
+{
+  "name": "enque-cloudflare",
+  "version": "1.0.0",
+  "description": "Enque customer service platform - Cloudflare Workers backend",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:staging": "wrangler dev --config wrangler.staging.toml",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --config wrangler.staging.toml",
+    "db:generate": "drizzle-kit generate:sqlite",
+    "db:migrate": "wrangler d1 execute enque-db --file=./migrations/0001_initial.sql",
+    "db:migrate:staging": "wrangler d1 execute enque-db-staging --file=./migrations/0001_initial.sql",
+    "db:studio": "drizzle-kit studio",
+    "type-check": "tsc --noEmit",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "@hono/zod-validator": "^0.2.0",
+    "zod": "^3.22.4",
+    "drizzle-orm": "^0.29.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "@azure/msal-node": "^2.6.0",
+    "jose": "^5.2.0",
+    "bcryptjs": "^2.4.3",
+    "nanoid": "^5.0.4",
+    "date-fns": "^3.0.0",
+    "date-fns-tz": "^2.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20231218.0",
+    "@types/bcryptjs": "^2.4.6",
+    "drizzle-kit": "^0.20.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.22.0",
+    "vitest": "^1.0.0"
+  }
+}

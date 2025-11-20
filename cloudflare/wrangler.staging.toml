@@ -1,0 +1,60 @@
+name = "enque-api-staging"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+node_compat = true
+
+# Staging environment
+workers_dev = true
+
+# Custom domain for staging
+routes = [
+  { pattern = "stg.enque.cc", custom_domain = true }
+]
+
+# Bindings
+[[d1_databases]]
+binding = "DB"
+database_name = "enque-db-staging"
+database_id = "" # Add your staging D1 database ID here
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "enque-storage-staging"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "" # Add your staging KV namespace ID here
+
+[[durable_objects.bindings]]
+name = "REALTIME"
+class_name = "RealtimeHandler"
+script_name = "enque-api-staging"
+
+# Durable Object migrations
+[[migrations]]
+tag = "v1"
+new_classes = ["RealtimeHandler"]
+
+# Cron triggers for email sync (more frequent in staging for testing)
+[triggers.crons]
+crons = ["*/5 * * * *"]  # Every 5 minutes in staging
+
+# Secrets (set via: wrangler secret put SECRET_NAME --env staging)
+# - JWT_SECRET
+# - MICROSOFT_CLIENT_ID
+# - MICROSOFT_CLIENT_SECRET
+# - MICROSOFT_TENANT_ID
+# - DATABASE_ENCRYPTION_KEY
+
+# Environment variables
+[vars]
+ENVIRONMENT = "staging"
+FRONTEND_URL = "https://stg.enque.cc"
+API_BASE_URL = "https://stg.enque.cc"
+MICROSOFT_REDIRECT_URI = "https://stg.enque.cc/v1/auth/microsoft/callback"
+MICROSOFT_GRAPH_URL = "https://graph.microsoft.com/v1.0"
+MICROSOFT_SCOPE = "offline_access Mail.Read Mail.ReadWrite Mail.Send User.Read"
+EMAIL_SYNC_ENABLED = true
+EMAIL_SYNC_BATCH_SIZE = 5
+ENABLE_RATE_LIMITING = false
+LOG_LEVEL = "debug"
