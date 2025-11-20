@@ -1,21 +1,51 @@
-# Entornos virtuales
-venv/
-.venv/
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+.mf/
+worker-configuration.d.ts
 
-# Archivos de entorno
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Environment variables
 .env
 .env.*
 !.env.example
 
-# Archivos de log
+# TypeScript
+*.tsbuildinfo
+dist/
+build/
+
+# Logs
 logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Cachés de Python
-**/__pycache__/
-
-# Base de datos SQLite
-*.sqlite3
-
-# Archivos específicos del sistema
+# OS
 .DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Drizzle
+drizzle/
+
+# Testing
+coverage/
+
+# Temporary files
+*.tmp
+.cache/
+
+# SQLite
+*.sqlite3
