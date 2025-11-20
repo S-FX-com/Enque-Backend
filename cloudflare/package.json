@@ -16,24 +16,24 @@
     "test": "vitest"
   },
   "dependencies": {
-    "hono": "^4.0.0",
-    "@hono/zod-validator": "^0.2.0",
-    "zod": "^3.22.4",
-    "drizzle-orm": "^0.29.0",
-    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@azure/msal-node": "^2.6.0",
-    "jose": "^5.2.0",
+    "@hono/zod-validator": "^0.2.0",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "bcryptjs": "^2.4.3",
-    "nanoid": "^5.0.4",
     "date-fns": "^3.0.0",
-    "date-fns-tz": "^2.0.0"
+    "date-fns-tz": "^2.0.0",
+    "drizzle-orm": "^0.29.0",
+    "hono": "^4.0.0",
+    "jose": "^5.2.0",
+    "nanoid": "^5.0.4",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20231218.0",
     "@types/bcryptjs": "^2.4.6",
     "drizzle-kit": "^0.20.0",
     "typescript": "^5.3.3",
-    "wrangler": "^3.22.0",
-    "vitest": "^1.0.0"
+    "vitest": "^1.0.0",
+    "wrangler": "^3.22.0"
   }
 }

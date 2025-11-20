@@ -1,0 +1,13 @@
+{
+  "version": "5",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1763656601372,
+      "tag": "0000_supreme_lilandra",
+      "breakpoints": true
+    }
+  ]
+}

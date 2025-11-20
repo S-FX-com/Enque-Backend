@@ -1,7 +1,6 @@
 name = "enque-api-staging"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
-node_compat = true
 
 # Staging environment
 workers_dev = true
@@ -13,17 +12,17 @@ routes = [
 
 # Bindings
 [[d1_databases]]
-binding = "DB"
+binding = "enque_db_staging"
 database_name = "enque-db-staging"
-database_id = "" # Add your staging D1 database ID here
+database_id = "b05b6c8c-fbe9-4d73-a4dc-5931d9cf1cd9"
 
 [[r2_buckets]]
-binding = "STORAGE"
+binding = "enque_storage_staging"
 bucket_name = "enque-storage-staging"
 
 [[kv_namespaces]]
-binding = "CACHE"
-id = "" # Add your staging KV namespace ID here
+binding = "enque_cache_staging"
+id = "9efcfb6361a143cf88366f9f52ab300e"
 
 [[durable_objects.bindings]]
 name = "REALTIME"
@@ -33,10 +32,10 @@ script_name = "enque-api-staging"
 # Durable Object migrations
 [[migrations]]
 tag = "v1"
-new_classes = ["RealtimeHandler"]
+new_sqlite_classes = ["RealtimeHandler"]
 
 # Cron triggers for email sync (more frequent in staging for testing)
-[triggers.crons]
+[triggers]
 crons = ["*/5 * * * *"]  # Every 5 minutes in staging
 
 # Secrets (set via: wrangler secret put SECRET_NAME --env staging)

@@ -1,7 +1,6 @@
 name = "enque-api"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
-node_compat = true
 
 # Production environment
 [env.production]
@@ -16,17 +15,17 @@ route = ""
 
 # Bindings
 [[env.production.d1_databases]]
-binding = "DB"
+binding = "enque_db"
 database_name = "enque-db"
-database_id = "" # Add your D1 database ID here
+database_id = "ca370dea-c6be-4865-8201-094b59c24dc7" # Add your D1 database ID here
 
 [[env.production.r2_buckets]]
-binding = "STORAGE"
+binding = "enque_storage"
 bucket_name = "enque-storage"
 
 [[env.production.kv_namespaces]]
-binding = "CACHE"
-id = "" # Add your KV namespace ID here
+binding = "enque_cache"
+id = "1853412f085744bb8fd3d3e15585b7e8" # Add your KV namespace ID here
 
 [[env.production.durable_objects.bindings]]
 name = "REALTIME"
@@ -36,7 +35,7 @@ script_name = "enque-api-production"
 # Durable Object migrations
 [[migrations]]
 tag = "v1"
-new_classes = ["RealtimeHandler"]
+new_sqlite_classes = ["RealtimeHandler"]
 
 # Cron triggers for email sync
 [env.production.triggers.crons]

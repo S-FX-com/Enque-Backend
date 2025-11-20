@@ -1,11 +1,11 @@
-import { Hono } from 'hono';
-import { Env, Context } from './types/env';
-import { cors Middleware } from './middleware/cors';
-import { errorMiddleware } from './middleware/error';
-import { loggingMiddleware } from './middleware/logging';
+import { Hono } from "hono";
+import { Env, Context } from "./types/env";
+import { corsMiddleware } from "./middleware/cors";
+import { errorMiddleware } from "./middleware/error";
+import { loggingMiddleware } from "./middleware/logging";
 
 // Import routes
-import auth from './routes/auth';
+import auth from "./routes/auth";
 // Additional routes will be imported as they're created
 // import workspaces from './routes/workspaces';
 // import tickets from './routes/tickets';
@@ -22,23 +22,23 @@ import auth from './routes/auth';
 const app = new Hono<{ Bindings: Env; Variables: Context }>();
 
 // Global middleware
-app.use('*', errorMiddleware);
-app.use('*', loggingMiddleware);
-app.use('*', corsMiddleware());
+app.use("*", errorMiddleware);
+app.use("*", loggingMiddleware);
+app.use("*", corsMiddleware());
 
 // Health check
-app.get('/health', (c) => {
-  return c.json({
-    status: 'healthy',
-    timestamp: Date.now(),
-    environment: c.env.ENVIRONMENT,
-  });
+app.get("/health", (c) => {
+	return c.json({
+		status: "healthy",
+		timestamp: Date.now(),
+		environment: c.env.ENVIRONMENT,
+	});
 });
 
 // API v1 routes
-const v1 = app.basePath('/v1');
+const v1 = app.basePath("/v1");
 
-v1.route('/auth', auth);
+v1.route("/auth", auth);
 // v1.route('/workspaces', workspaces);
 // v1.route('/tickets', tickets);
 // v1.route('/users', users);
@@ -52,39 +52,39 @@ v1.route('/auth', auth);
 // v1.route('/attachments', attachments);
 
 // Root route
-app.get('/', (c) => {
-  return c.json({
-    name: 'Enque API',
-    version: '1.0.0',
-    environment: c.env.ENVIRONMENT,
-    message: 'Welcome to Enque customer service platform API',
-  });
+app.get("/", (c) => {
+	return c.json({
+		name: "Enque API",
+		version: "1.0.0",
+		environment: c.env.ENVIRONMENT,
+		message: "Welcome to Enque customer service platform API",
+	});
 });
 
 // 404 handler
 app.notFound((c) => {
-  return c.json(
-    {
-      success: false,
-      error: {
-        code: 'NOT_FOUND',
-        message: 'Route not found',
-      },
-    },
-    404
-  );
+	return c.json(
+		{
+			success: false,
+			error: {
+				code: "NOT_FOUND",
+				message: "Route not found",
+			},
+		},
+		404
+	);
 });
 
 export default app;
 
 // Durable Object for real-time WebSocket connections
-export { RealtimeHandler } from './durable-objects/realtime';
+export { RealtimeHandler } from "./durable-objects/realtime";
 
 // Scheduled event handler for email sync
 export async function scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-  // Email sync logic will be implemented here
-  console.log('Email sync triggered at:', new Date(event.scheduledTime).toISOString());
+	// Email sync logic will be implemented here
+	console.log("Email sync triggered at:", new Date(event.scheduledTime).toISOString());
 
-  // This will call the email sync service
-  // await syncEmails(env);
+	// This will call the email sync service
+	// await syncEmails(env);
 }
