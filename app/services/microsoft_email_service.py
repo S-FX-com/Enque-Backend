@@ -851,6 +851,11 @@ class MicrosoftEmailService:
 
         # 🔒 FIX: Enhanced patterns to handle HTML and plain text formats
         original_sender_patterns = [
+            # ✅ NEW: Outlook/Microsoft format with nested spans and HTML entities
+            # Format: <b><span>From: </span></b><span>Name &lt;email@domain.com&gt;
+            r"<b>\s*<span[^>]*>\s*From:\s*</span>\s*</b>\s*<span[^>]*>\s*(.*?)\s*&lt;(.*?)&gt;",
+            r"<b>\s*<span[^>]*>\s*De:\s*</span>\s*</b>\s*<span[^>]*>\s*(.*?)\s*&lt;(.*?)&gt;",
+
             # HTML formats with <b> tags and <span>
             r"<b>\s*From:\s*</b>\s*<span[^>]*>\s*(.*?)\s*<(.*?)>\s*<",
             r"<b>\s*From:\s*</b>\s*(.*?)\s*<(.*?)>",
@@ -880,11 +885,23 @@ class MicrosoftEmailService:
                     name = match.group(1).strip().strip('"').strip("'")
                     email = match.group(2).strip()
 
+                    # ✅ Clean up HTML entities first (before removing tags)
+                    from html import unescape
+                    name = unescape(name)
+                    email = unescape(email)
+
                     # Clean up HTML tags from name if present
                     name = re.sub(r'<[^>]+>', '', name).strip()
+
+                    # ✅ Remove any remaining HTML entities and special chars from email
+                    email = re.sub(r'<[^>]+>', '', email).strip()
+
                 elif len(match.groups()) == 1:
                     # Solo email
+                    from html import unescape
                     email = match.group(1).strip()
+                    email = unescape(email)
+                    email = re.sub(r'<[^>]+>', '', email).strip()
                     name = email.split('@')[0]  # Usar la parte antes del @ como nombre
                 else:
                     continue
@@ -931,6 +948,11 @@ class MicrosoftEmailService:
 
         # Try multiple patterns for different email client formats
         patterns = [
+            # ✅ NEW: Outlook/Microsoft format with nested spans
+            # Format: <b><span>To: </span></b><span>email1, email2<br>
+            re.compile(rf"<b>\s*<span[^>]*>\s*{header}:\s*</span>\s*</b>\s*<span[^>]*>\s*(.*?)\s*<br>", re.IGNORECASE | re.DOTALL),
+
+            # Original patterns
             re.compile(rf"<b>{header}:</b>\s*(.*?)\s*<br>", re.IGNORECASE),
             re.compile(rf"<strong>{header}:</strong>\s*(.*?)\s*<br>", re.IGNORECASE),
             re.compile(rf"<font[^>]*><b>{header}:</b>(.*?)</font>", re.IGNORECASE | re.DOTALL),
@@ -945,6 +967,10 @@ class MicrosoftEmailService:
 
         if not recipients_str:
             return []
+
+        # ✅ Clean up HTML entities and tags from the recipients string
+        recipients_str = unescape(recipients_str)
+        recipients_str = re.sub(r'<[^>]+>', '', recipients_str)
 
         # Extract all email addresses from the matched string
         # This handles multiple recipients separated by ; or ,

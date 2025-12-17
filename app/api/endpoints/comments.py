@@ -303,38 +303,49 @@ async def create_comment(
             db.add(task)
 
     # Update TO recipients on ticket
-    # 🔒 FIX: Only update if recipients are actually provided (not empty)
-    # This prevents overwriting original email recipients with empty values
+    # ✅ FIXED: Allow explicit clearing of TO recipients when user removes them
+    # Distinguish between "not provided" (None) vs "intentionally cleared" (empty string)
     if comment_in.to_recipients is not None and not comment_in.is_private:
+        # If user provided TO field (even if empty), update the ticket
+        # This allows users to intentionally remove all TO recipients
         if to_recipients and len(to_recipients) > 0:
-            # Only overwrite if there are actual recipients to set
             task.to_recipients = ", ".join(to_recipients)
-            logger.info(f"Updated ticket {task_id} TO recipients: {task.to_recipients}")
-            db.add(task)
+            logger.info(f"✅ Updated ticket {task_id} TO recipients: {task.to_recipients}")
         else:
-            logger.info(f"Keeping existing TO recipients for ticket {task_id}: {task.to_recipients}")
+            # User explicitly sent empty TO list - clear the TO recipients
+            task.to_recipients = None
+            logger.info(f"✅ Cleared TO recipients for ticket {task_id} (user removed all)")
+        db.add(task)
 
     # Update CC recipients on ticket
-    # 🔒 FIX: Only update if recipients are actually provided (not empty)
+    # ✅ FIXED: Allow explicit clearing of CC recipients when user removes them
+    # Distinguish between "not provided" (None) vs "intentionally cleared" (empty string)
     if comment_in.other_destinaries is not None and not comment_in.is_private:
+        # If user provided CC field (even if empty), update the ticket
+        # This allows users to intentionally remove all CC recipients
         if cc_recipients and len(cc_recipients) > 0:
-            # Only overwrite if there are actual recipients to set
             task.cc_recipients = ", ".join(cc_recipients)
-            logger.info(f"Updated ticket {task_id} CC recipients: {task.cc_recipients}")
-            db.add(task)
+            logger.info(f"✅ Updated ticket {task_id} CC recipients: {task.cc_recipients}")
         else:
-            logger.info(f"Keeping existing CC recipients for ticket {task_id}: {task.cc_recipients}")
+            # User explicitly sent empty CC list - clear the CC recipients
+            task.cc_recipients = None
+            logger.info(f"✅ Cleared CC recipients for ticket {task_id} (user removed all)")
+        db.add(task)
 
     # Update BCC recipients on ticket
-    # 🔒 FIX: Only update if recipients are actually provided (not empty)
+    # ✅ FIXED: Allow explicit clearing of BCC recipients when user removes them
+    # Distinguish between "not provided" (None) vs "intentionally cleared" (empty string)
     if comment_in.bcc_recipients is not None and not comment_in.is_private:
+        # If user provided BCC field (even if empty), update the ticket
+        # This allows users to intentionally remove all BCC recipients
         if bcc_recipients and len(bcc_recipients) > 0:
-            # Only overwrite if there are actual recipients to set
             task.bcc_recipients = ", ".join(bcc_recipients)
-            logger.info(f"Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
-            db.add(task)
+            logger.info(f"✅ Updated ticket {task_id} BCC recipients: {task.bcc_recipients}")
         else:
-            logger.info(f"Keeping existing BCC recipients for ticket {task_id}: {task.bcc_recipients}")
+            # User explicitly sent empty BCC list - clear the BCC recipients
+            task.bcc_recipients = None
+            logger.info(f"✅ Cleared BCC recipients for ticket {task_id} (user removed all)")
+        db.add(task)
 
     content_to_store = comment_in.content
     s3_html_url = None
