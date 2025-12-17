@@ -1490,6 +1490,20 @@ class MicrosoftGraphService:
                 if cc_emails:
                     cc_recipients_str = ", ".join(cc_emails)
                     logger.info(f"Ticket from email will have CC recipients: {cc_recipients_str}")
+
+            bcc_recipients_str = None
+            if email.bcc_recipients:
+                bcc_emails = []
+                for bcc in email.bcc_recipients:
+                    if bcc.address:
+                        if bcc.name and bcc.name.strip():
+                            bcc_emails.append(f"{bcc.name} <{bcc.address}>")
+                        else:
+                            bcc_emails.append(bcc.address)
+                if bcc_emails:
+                    bcc_recipients_str = ", ".join(bcc_emails)
+                    logger.info(f"Ticket from email will have BCC recipients: {bcc_recipients_str}")
+
             if original_email and original_name:
                 forwarded_by_email = email.sender.address
                 forwarded_by_name = email.sender.name
@@ -1509,11 +1523,11 @@ class MicrosoftGraphService:
             task = Task(
                 title=email.subject or "No Subject", description=None, status="Unread", priority=priority,
                 assignee_id=assigned_agent.id if assigned_agent else None, due_date=due_date, sent_from_id=system_agent.id,
-                user_id=user.id, company_id=company_id, workspace_id=workspace.id, 
+                user_id=user.id, company_id=company_id, workspace_id=workspace.id,
                 mailbox_connection_id=config.mailbox_connection_id, team_id=team_id,
                 email_message_id=email.id, email_internet_message_id=email.internet_message_id, email_conversation_id=email.conversation_id,
                 email_sender=email_sender_field, to_recipients=to_recipients_str, cc_recipients=cc_recipients_str,
-                last_update=datetime.utcnow())
+                bcc_recipients=bcc_recipients_str, last_update=datetime.utcnow())
             self.db.add(task); self.db.flush()
             
             # Use original email sender name for forwarded emails, otherwise use direct sender
